@@ -1,4 +1,5 @@
 # BlindSite: High-Risk Investigation Platform & Forensic Browser
+<img width="2305" height="1397" alt="image" src="https://github.com/user-attachments/assets/e95c6f29-61da-4ee0-9d95-9a2dc4627404" />
 
 **Preserve what investigators should not have to see.**
 

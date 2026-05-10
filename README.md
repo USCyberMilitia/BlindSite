@@ -1,5 +1,6 @@
 # BlindSite
 BlindSite: High-Risk Investigations Platform &amp; Forensic Browser
+<img width="2305" height="1397" alt="image" src="https://github.com/user-attachments/assets/b78835d9-9679-490a-9d08-c492b7c6e95c" />
 
 ````markdown
 # BlindSite: Investigation Vault & Forensic Browser

@@ -5,9 +5,7 @@ BlindSite: High-Risk Investigations Platform &amp; Forensic Browser
 ````markdown
 # BlindSite: Investigation Vault & Forensic Browser
 
-**Preserve what investigators should not have to see.**
-
-BlindSite is a forensic browser and encrypted evidence vault built for high-risk digital investigations. It can capture modern web pages, preserve images/videos/audio as encrypted evidence, block dangerous media from the investigator’s screen, and create sealed evidence packages for authorized reviewers or law enforcement.
+BlindSite is a forensic browser and encrypted evidence vault built for high-risk digital investigations. The type of investigations where just going to the site can leave you legally liable or psychologically traumatized. We tried to capture many of the features of Hunchly and then make it even better. It can capture modern web pages, preserve images/videos/audio as encrypted evidence, block dangerous media from the investigator’s screen or from being downloaded, work on both clear and darknet websites, and create sealed evidence packages for authorized reviewers or law enforcement.
 
 Most tools force investigators into a bad choice:
 
@@ -121,7 +119,7 @@ python -m playwright install-deps
 ## Run BlindSite
 
 ```bash
-python blindsite.py
+python BlindSite.py
 ```
 
 Default local address:

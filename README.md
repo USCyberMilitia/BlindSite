@@ -1,4 +1,4 @@
-# BlindSite: High-Risk Investigation Platform & Forensic Browser
+# BlindSite: High-Risk Investigations Platform & Forensic Browser
 <img width="2305" height="1397" alt="image" src="https://github.com/user-attachments/assets/e95c6f29-61da-4ee0-9d95-9a2dc4627404" />
 
 **Preserve what investigators should not have to see.**
@@ -7,7 +7,7 @@ BlindSite is a forensic browser and encrypted evidence vault for high-risk digit
 
 It is built for situations where simply visiting a site, viewing media, or manually saving content could create legal, psychological, or operational risk.
 
-BlindSite can capture modern web pages, preserve images/videos/audio as encrypted evidence, block dangerous media from the investigator’s screen, support clear web and darknet workflows, and create sealed evidence packages for authorized reviewers or law enforcement.
+BlindSite can capture modern web pages, preserve images/videos/audio as encrypted evidence, block dangerous media from the investigator’s screen, support clear web and darknet workflows, and create sealed evidence packages for authorized reviewers or law enforcement. Think Hunchly but open-source and with more features.
 
 Most tools force investigators into a bad choice:
 

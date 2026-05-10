@@ -158,7 +158,22 @@ Best for:
 
 ### Civilian Unknown Master Key
 
-Use this when the collector should not know or possess the reveal key.
+Use this when the collector should not know or possess the reveal key. Simply enter the below public key in form.
+
+-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAz/WNWKXWO4DekWR/h3SC
++e7XFKQJezoe6MjQder8dv45j/f3/xy+Qnfk/ojfPn04D12iL3oy1sa98vwpiMY1
++EuGkiutjm0w/3mgzF8DU2wP71eL/Jt1z+6OANzNRGb/WU3nFiqMaPiBW911iRsk
+lWAov+kKT6IUF7cTE12f9PuFatjOLIa5rXUShfsiaKSpHWxiLHI1tfBYo+cZw8UH
+tf0JW1Ff7gdy+9g6bMf9WGRhxKkdF0hTzhfg7Ol47T8WHy4jqcjtUV2vD41CNtvM
+k1N/uGTdYTV0H71gFkLxft/unXB5K5hu4xCQUiyZFx8VUJREy9RKresEX9bsqZ/x
+fkKFly1EwxDsHKwVr6PZ7eG+fCs62Q5VzzrM99k0R0vlPEFE0EE1BiIIuGCCA877
+6jHBcYudRK8kMFJe68nghAaVzjHjyczLeTr/KfesDTgSwuAYpmYKNaiZNytsmdml
+mH3BxBGoOj3TtbI4X8YEtWRROvgKslhy5ctMWkKcWFwKL2jPVICC9vSwUbkH+/wI
+XyGnhQjiam67kqy0DZfVzvQu8ACWNzxjblVt0AVXFc6kBrwV+Agz0fTcNeetOP0I
+X+dFQEOZXhMVjstoL+UIKK60D7pUPhE0/Na6XDrI8qTBKSJN9lSyoW5groL9mu5S
+P6ySgUcZiWET2NW9qQzMKP0CAwEAAQ==
+-----END PUBLIC KEY-----
 
 Best for:
 
@@ -197,29 +212,6 @@ The tool is designed so dangerous media can be:
 * saved encrypted;
 * included in sealed export;
 * reviewed later by someone with proper authority and keys.
-
----
-
-## Public release warning
-
-Do not commit real case data, vault files, keys, logs, or sealed evidence packages to a public repository.
-
-Keep these private:
-
-```text
-data/
-vault.sqlite3
-vault.key
-app_secret.key
-escrow_private_key.pem
-*.zip
-*.log
-reviewed_case/
-escrow_keys/
-.env
-```
-
-Use fake sample data only.
 
 ---
 

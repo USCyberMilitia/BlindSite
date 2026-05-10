@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+
+data/
+vault.sqlite3
+vault.key
+app_secret.key
+escrow_private_key.pem
+*.zip
+*.log
+reviewed_case/
+escrow_keys/
+.env

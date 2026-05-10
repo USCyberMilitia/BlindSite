@@ -1,11 +1,12 @@
-# BlindSite: High-Risk Investigations Platform &amp; Forensic Browser
-BlindSite: High-Risk Investigations Platform &amp; Forensic Browser
-<img width="2305" height="1397" alt="image" src="https://github.com/user-attachments/assets/b78835d9-9679-490a-9d08-c492b7c6e95c" />
+# BlindSite: High-Risk Investigation Platform & Forensic Browser
 
-````markdown
-# BlindSite: Investigation Vault & Forensic Browser
+**Preserve what investigators should not have to see.**
 
-BlindSite is a forensic browser and encrypted evidence vault built for high-risk digital investigations. The type of investigations where just going to the site can leave you legally liable or psychologically traumatized. We tried to capture many of the features of Hunchly and then make it even better. It can capture modern web pages, preserve images/videos/audio as encrypted evidence, block dangerous media from the investigator’s screen or from being downloaded, work on both clear and darknet websites, and create sealed evidence packages for authorized reviewers or law enforcement.
+BlindSite is a forensic browser and encrypted evidence vault for high-risk digital investigations.
+
+It is built for situations where simply visiting a site, viewing media, or manually saving content could create legal, psychological, or operational risk.
+
+BlindSite can capture modern web pages, preserve images/videos/audio as encrypted evidence, block dangerous media from the investigator’s screen, support clear web and darknet workflows, and create sealed evidence packages for authorized reviewers or law enforcement.
 
 Most tools force investigators into a bad choice:
 
@@ -23,10 +24,11 @@ BlindSite is designed for journalists, attorneys, investigators, nonprofits, age
 
 It helps protect:
 
-- the investigator from unnecessary exposure;
-- the evidence from being lost;
-- the case from weak custody records;
-- the review process from remote callbacks and unsafe browsing.
+- investigators from unnecessary exposure;
+- evidence from being lost;
+- cases from weak custody records;
+- review workflows from unsafe remote callbacks;
+- organizations from uncontrolled access to sensitive material.
 
 ---
 
@@ -44,7 +46,9 @@ That means investigators can capture high-risk pages without casually viewing or
 
 In this custody mode, the civilian user does **not** possess the master reveal key.
 
-They can preserve evidence, but they cannot locally reveal, export, or casually view dangerous originals. The evidence can later be handed off as a sealed package to an authorized reviewer.
+They can preserve evidence, but they cannot locally reveal, export, or casually view dangerous originals.
+
+The evidence can later be handed off as a sealed package to an authorized reviewer.
 
 ---
 
@@ -52,13 +56,27 @@ They can preserve evidence, but they cannot locally reveal, export, or casually 
 
 Organizations can control their own master key and decide who can unlock, review, export, or preserve evidence.
 
-This is useful for agencies, law firms, nonprofits, newsrooms, and investigation teams that need internal access controls.
+This is useful for:
+
+- agencies;
+- law firms;
+- nonprofits;
+- newsrooms;
+- internal investigation teams.
 
 ---
 
 ### 4. Sealed evidence export
 
-BlindSite can export a sealed case package containing encrypted evidence objects, metadata, hashes, audit records, page captures, blocked-media records, and wrapped keys.
+BlindSite can export a sealed case package containing:
+
+- encrypted evidence objects;
+- metadata;
+- hashes;
+- audit records;
+- page captures;
+- blocked-media records;
+- wrapped keys.
 
 The ZIP does **not** include plaintext originals by default.
 
@@ -82,13 +100,21 @@ Recovered pages can be rendered locally using saved evidence objects instead of 
 
 ### 7. Tor-aware controlled browser sessions
 
-BlindSite supports controlled live browsing workflows, including Tor-based modes, manual capture, automatic capture, and media-blocking policies.
+BlindSite supports controlled live browsing workflows, including:
+
+- Tor-based modes;
+- manual capture;
+- automatic capture;
+- media-blocking policies;
+- encrypted media preservation.
 
 ---
 
 ### 8. Audit chain and audit seals
 
-Important actions are logged into an audit chain. BlindSite can also create audit/storage seals: cryptographic checkpoints showing what the audit log and evidence vault looked like at a specific moment.
+Important actions are logged into an audit chain.
+
+BlindSite can also create audit/storage seals: cryptographic checkpoints showing what the audit log and evidence vault looked like at a specific moment.
 
 This makes later tampering easier to detect.
 
@@ -99,7 +125,16 @@ This makes later tampering easier to detect.
 Use Python 3.10+.
 
 ```bash
-python -m pip install --upgrade fastapi "uvicorn[standard]" "requests[socks]" beautifulsoup4 cryptography itsdangerous pillow playwright python-multipart
+python -m pip install --upgrade \
+  fastapi \
+  "uvicorn[standard]" \
+  "requests[socks]" \
+  beautifulsoup4 \
+  cryptography \
+  itsdangerous \
+  pillow \
+  playwright \
+  python-multipart
 ```
 
 Install Playwright browsers:
@@ -143,17 +178,21 @@ Change the password during setup.
 
 On first run, BlindSite lets you choose a custody mode.
 
+---
+
 ### Organization-Controlled Key
 
 Use this when an organization controls the master reveal key.
 
 Best for:
 
-* agencies;
-* legal teams;
-* nonprofits;
-* newsrooms;
-* internal investigation teams.
+- agencies;
+- legal teams;
+- nonprofits;
+- newsrooms;
+- internal investigation teams.
+
+---
 
 ### Civilian Unknown Master Key
 
@@ -161,7 +200,9 @@ Use this when the investigator should not know or possess the reveal key.
 
 This is critical if you are a civilian and need to preserve evidence while proving you never had local access to the reveal key or the ability to decrypt the original evidence yourself.
 
-For USCM handoff workflows, you may use the USCM escrow public key below. For independent deployments, generate your own escrow key pair and use your own public key.
+For USCM handoff workflows, you may use the USCM escrow public key below.
+
+For independent deployments, generate your own escrow key pair and use your own public key.
 
 **Never publish or upload your private key.**
 
@@ -186,10 +227,10 @@ When you create a **Sealed LEO Export**, agencies or cleared reviewers can reque
 
 Best for:
 
-* civilian handoff workflows;
-* sensitive investigations;
-* sealed evidence preservation;
-* cases where the collector should preserve evidence without being able to reveal it locally.
+- civilian handoff workflows;
+- sensitive investigations;
+- sealed evidence preservation;
+- cases where the collector should preserve evidence without being able to reveal it locally.
 
 ---
 
@@ -217,10 +258,33 @@ It is built around a custody principle:
 
 The tool is designed so dangerous media can be:
 
-* blocked from the investigator;
-* saved encrypted;
-* included in sealed export;
-* reviewed later by someone with proper authority and keys.
+- blocked from the investigator;
+- saved encrypted;
+- included in sealed export;
+- reviewed later by someone with proper authority and keys.
+
+---
+
+## Public release warning
+
+Do not commit real case data, vault files, keys, logs, or sealed evidence packages to a public repository.
+
+Keep these private:
+
+```text
+data/
+vault.sqlite3
+vault.key
+app_secret.key
+escrow_private_key.pem
+escrow_keys/
+reviewed_case/
+*.zip
+*.log
+.env
+```
+
+Use fake sample data only.
 
 ---
 

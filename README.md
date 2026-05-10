@@ -1,4 +1,4 @@
-# BlindSite
+# BlindSite: High-Risk Investigations Platform &amp; Forensic Browser
 BlindSite: High-Risk Investigations Platform &amp; Forensic Browser
 <img width="2305" height="1397" alt="image" src="https://github.com/user-attachments/assets/b78835d9-9679-490a-9d08-c492b7c6e95c" />
 
@@ -100,7 +100,6 @@ Use Python 3.10+.
 
 ```bash
 python -m pip install --upgrade fastapi "uvicorn[standard]" "requests[socks]" beautifulsoup4 cryptography itsdangerous pillow playwright python-multipart
-```
 
 Install Playwright browsers:
 

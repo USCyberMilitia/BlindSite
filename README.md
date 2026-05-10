@@ -100,7 +100,7 @@ Use Python 3.10+.
 
 ```bash
 python -m pip install --upgrade fastapi "uvicorn[standard]" "requests[socks]" beautifulsoup4 cryptography itsdangerous pillow playwright python-multipart
-````
+```
 
 Install Playwright browsers:
 
@@ -157,7 +157,8 @@ Best for:
 
 ### Civilian Unknown Master Key
 
-Use this when the collector should not know or possess the reveal key. Simply enter the below public key in form.
+Use this when the investigator should not know or possess the reveal key. THIS IS CRITICAL IF YOU ARE A CIVILIAN AND NEED TO PROVE YOU NEVER HAD ACCESS TO THE DATA OR THE ABILITY TO DECRYPT IT!
+Simply enter the below public key in setup form. Then when you do a Sealed LEO Export agencies can request the decryption/view key from us.
 
 -----BEGIN PUBLIC KEY-----
 MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAz/WNWKXWO4DekWR/h3SC

@@ -100,6 +100,7 @@ Use Python 3.10+.
 
 ```bash
 python -m pip install --upgrade fastapi "uvicorn[standard]" "requests[socks]" beautifulsoup4 cryptography itsdangerous pillow playwright python-multipart
+```
 
 Install Playwright browsers:
 
@@ -140,7 +141,7 @@ Change the password during setup.
 
 ## First-run setup
 
-On first run, BlindSite lets you choose a custody mode:
+On first run, BlindSite lets you choose a custody mode.
 
 ### Organization-Controlled Key
 
@@ -156,9 +157,15 @@ Best for:
 
 ### Civilian Unknown Master Key
 
-Use this when the investigator should not know or possess the reveal key. THIS IS CRITICAL IF YOU ARE A CIVILIAN AND NEED TO PROVE YOU NEVER HAD ACCESS TO THE DATA OR THE ABILITY TO DECRYPT IT!
-Simply enter the below public key in setup form. Then when you do a Sealed LEO Export agencies can request the decryption/view key from us.
+Use this when the investigator should not know or possess the reveal key.
 
+This is critical if you are a civilian and need to preserve evidence while proving you never had local access to the reveal key or the ability to decrypt the original evidence yourself.
+
+For USCM handoff workflows, you may use the USCM escrow public key below. For independent deployments, generate your own escrow key pair and use your own public key.
+
+**Never publish or upload your private key.**
+
+```text
 -----BEGIN PUBLIC KEY-----
 MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAz/WNWKXWO4DekWR/h3SC
 +e7XFKQJezoe6MjQder8dv45j/f3/xy+Qnfk/ojfPn04D12iL3oy1sa98vwpiMY1
@@ -173,6 +180,9 @@ XyGnhQjiam67kqy0DZfVzvQu8ACWNzxjblVt0AVXFc6kBrwV+Agz0fTcNeetOP0I
 X+dFQEOZXhMVjstoL+UIKK60D7pUPhE0/Na6XDrI8qTBKSJN9lSyoW5groL9mu5S
 P6ySgUcZiWET2NW9qQzMKP0CAwEAAQ==
 -----END PUBLIC KEY-----
+```
+
+When you create a **Sealed LEO Export**, agencies or cleared reviewers can request the decryption/review key from USCM if the USCM escrow public key was used.
 
 Best for:
 
@@ -223,6 +233,3 @@ It is intended for lawful, authorized investigations, evidence preservation, leg
 The goal is simple:
 
 > **Investigators should not have to be harmed by the evidence they are trying to preserve.**
-
-```
-

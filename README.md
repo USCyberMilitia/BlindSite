@@ -213,9 +213,7 @@ Use this when the investigator should not know or possess the reveal key.
 
 This is critical if you are a civilian and need to preserve evidence while proving you never had local access to the reveal key or the ability to decrypt the original evidence yourself.
 
-For USCM handoff workflows, you may use the USCM escrow public key below.
-
-For independent deployments, generate your own escrow key pair and use your own public key.
+For USCM handoff workflows, you may use the USCM escrow public key below. The only way to safely use this with potential legal protections is to use our key. DO NOT USE YOUR OWN KEY!
 
 **Never publish or upload your private key.**
 

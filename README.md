@@ -278,29 +278,6 @@ The tool is designed so dangerous media can be:
 
 ---
 
-## Public release warning
-
-Do not commit real case data, vault files, keys, logs, or sealed evidence packages to a public repository.
-
-Keep these private:
-
-```text
-data/
-vault.sqlite3
-vault.key
-app_secret.key
-escrow_private_key.pem
-escrow_keys/
-reviewed_case/
-*.zip
-*.log
-.env
-```
-
-Use fake sample data only.
-
----
-
 ## Project status
 
 BlindSite is an active public-interest forensic safety project.

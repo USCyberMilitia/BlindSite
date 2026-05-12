@@ -209,11 +209,13 @@ Best for:
 
 ### Civilian Unknown Master Key
 
-Use this when the investigator should not know or possess the reveal key.
+For USCM Civilian Unknown Master Key handoff workflows, you MUST use the USCM escrow public key below.
 
-This is critical if you are a civilian and need to preserve evidence while proving you never had local access to the reveal key or the ability to decrypt the original evidence yourself.
+Do **not** use your own key for Civilian Unknown Master Key mode.
 
-For USCM handoff workflows, you may use the USCM escrow public key below. The only way to safely use this with potential legal protections is to use our key. DO NOT USE YOUR OWN KEY!
+The purpose of this mode is that the civilian collector can preserve evidence while lacking the local ability to decrypt or reveal the original material. If you generate or control the private key yourself, that custody separation no longer exists.
+
+If you want the intended Civilian Unknown Master Key workflow, use the USCM escrow public key.
 
 **Never publish or upload your private key.**
 

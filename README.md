@@ -3,6 +3,20 @@
 
 **Preserve what investigators should not have to see.**
 
+## Major update: security + performance hardening
+
+BlindSite has received a major security and performance hardening update.
+
+The live capture engine has been reworked so blocked media is no longer processed directly in the browser’s hot request path. Instead, risky media is blocked from display immediately and preserved in the background when enabled. In testing, this improved page-load performance by up to **70%** on media-heavy dynamic sites.
+
+This update also strengthens the custody model with hard-sealed evidence workflows for both Civilian Unknown Master Key mode and Organization hard-sealed media preservation. Sensitive originals can be preserved encrypted in a way that the local vault key cannot decrypt, requiring the correct escrow/reviewer private key for authorized recovery.
+
+A new standalone validation suite is also available to test core technical claims around encrypted storage, hard-sealed custody, wrong-key failure, sealed exports, reviewer recovery, audit-chain tamper detection, and storage-hash tamper detection.
+
+A secure key generator for organizations and those testing BlindSite. It is critical this generator is used only by organization or individuals that understand the risks or those wanting to test out BlindSite. For normal Civilian workflows please use Civilian Unknown Master Key Mode with the prefilled key.
+
+This is still early-access software, but this update is a major step toward making BlindSite faster, safer, and easier to verify.
+
 > [!WARNING]
 > **Early Access / Use at Your Own Risk**
 >

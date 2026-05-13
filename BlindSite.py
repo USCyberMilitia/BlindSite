@@ -43,8 +43,8 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from PIL import Image, ImageFilter
 from starlette.middleware.sessions import SessionMiddleware
 
-APP_NAME = "Forensic Tor Vault"
-APP_VERSION = "5.6-org-sealed-media-preservation"
+APP_NAME = "US Cyber Militia / BlindSite"
+APP_VERSION = "5.12.1-preservation-queue-setting"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "vault.sqlite3"
@@ -84,11 +84,26 @@ USER_AGENT_PROFILES: dict[str, tuple[str, str]] = {
     "firefox_android": ("Firefox on Android", "Mozilla/5.0 (Android 14; Mobile; rv:125.0) Gecko/125.0 Firefox/125.0"),
     "tor_browser_windows": ("Tor Browser compatible Firefox on Windows", "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0"),
     "tor_browser_linux": ("Tor Browser compatible Firefox on Linux", "Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0"),
-    "forensic_tool": ("Forensic Tor Vault explicit UA", f"{APP_NAME}/{APP_VERSION} metadata-safe"),
+    "forensic_tool": ("BlindSite explicit UA", f"BlindSite/{APP_VERSION} metadata-safe"),
     "custom": ("Custom user agent", ""),
 }
 
-BUNDLED_ESCROW_PUBLIC_KEY_PEM = """""".strip()
+BUNDLED_ESCROW_PUBLIC_KEY_PEM = """
+-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA1y8+WnLXjlnuV+HqL/yM
+/pGqYkbYzYf0AkoxtUdb8nOjfUPtiDq0dcvMqXkAuHK625lyf1Bq0j8wJai766XG
+04ZnZCcK1m4Yw0WMkQEjcn2qlWZB7vniQs07i92pd4EswK9SkCLzCAvDXq3n2xE3
+FTLuqGKnjZcr/1uFpUWcsVGUqZ7fYnPIjNtRPiOCUs/i9kJ6ryKsLoOMx7PgvI8f
+6HHWwcbh5bdeHXi/P+ntri4EbBPqlnMWdYUeF6SuvlhgLwTt1wSzO9ZHic1iCF4G
+hNIoNhbxolBSD41BsuvntXUfebqymWskGbiITLE8plHyrUminzqnZXAkSnOEBqaF
+duDHHCiqLxI71KO+rUZ73IbOBy0a0cJCIJ/qeYh7G8NMyW6PfcCw+TTbsXLZkHI6
+Vl6hfZaoJvZ43/SPt/YwL7FOq+Aef3GHTqHoX/HTR5txHzvH+gApIDs3kFKjwd7D
+yElca3eFGGQM4cijcSpazFVHycZYGOL/DbKxHUjsnYBR5yhPYgDvAz0o+RsKK5ws
+SspvPQ4+DFUDQK4zkj/ZAbrsrdsZtQn51yRXcFfNCUrhUCoEivTmJzq8WGOTsIqA
+taLsgBIqjLIc+fWr4+CNKSGRnkXAWCe+ebmokCZeDAHpwgX/BrLnjr62v+jJnJ46
+cyO7zcKE0wuSAXZ1+tPKP+UCAwEAAQ==
+-----END PUBLIC KEY-----
+""".strip()
 
 LIVE: dict[str, "LiveBrowserSession"] = {}
 LIVE_LOCK = threading.RLock()
@@ -301,6 +316,22 @@ def load_bundled_escrow_public_key() -> str:
     return BUNDLED_ESCROW_PUBLIC_KEY_PEM
 
 
+def load_uscm_escrow_public_key() -> str:
+    """Return the embedded USCM escrow public key for Civilian Unknown Master Key mode.
+
+    Civilian Unknown Master Key mode is intentionally not a user-controlled key
+    workflow. The civilian collector must not possess/control the private reveal
+    key, so this mode uses the embedded USCM escrow public key instead of a
+    user-supplied key. Organization-Controlled Key mode remains available for
+    organizations that need to control their own keys.
+    """
+    return BUNDLED_ESCROW_PUBLIC_KEY_PEM
+
+
+def uscm_escrow_public_fingerprint() -> str:
+    return escrow_public_fingerprint(load_uscm_escrow_public_key())
+
+
 def escrow_public_fingerprint(pem: str) -> str:
     try:
         key = serialization.load_pem_public_key(pem.encode("utf-8"))
@@ -316,6 +347,72 @@ def escrow_wrap(pem: str, payload: bytes) -> str:
     return b64e(wrapped)
 
 
+HARD_SEALED_ENCRYPTED_FLAG = 2
+HARD_SEALED_CONTAINER_TYPE = "blindsite_hard_sealed_escrow_object"
+
+
+def escrow_hard_seal_bytes(public_key_pem: str, payload: bytes, *, meta: dict[str, Any] | None = None) -> bytes:
+    """Encrypt bytes so only the escrow private key can recover them.
+
+    This is used for sensitive/original evidence in Civilian Unknown Master Key
+    mode. Unlike the normal local vault encryption, no reusable local decrypt key
+    is stored on disk for these objects. The payload is encrypted with a random
+    per-object Fernet key, and that object key is RSA-wrapped to the escrow
+    public key.
+    """
+    if not public_key_pem or not escrow_public_fingerprint(public_key_pem):
+        raise HTTPException(500, "Hard-sealed civilian storage requires a valid escrow public key")
+    object_key = Fernet.generate_key()
+    encrypted_payload = Fernet(object_key).encrypt(payload).decode("ascii")
+    container = {
+        "container_type": HARD_SEALED_CONTAINER_TYPE,
+        "format_version": 1,
+        "algorithm": "Fernet-per-object-key + RSA-OAEP-SHA256-wrapped-object-key",
+        "escrow_public_key_fingerprint": escrow_public_fingerprint(public_key_pem),
+        "wrapped_object_key": escrow_wrap(public_key_pem, object_key),
+        "payload_sha256": sha256_bytes(payload),
+        "payload_size": len(payload),
+        "encrypted_payload": encrypted_payload,
+        "created_at": utcnow(),
+        "meta": meta or {},
+    }
+    return canonical(container).encode("utf-8")
+
+
+def parse_hard_sealed_container(data: bytes) -> dict[str, Any] | None:
+    try:
+        obj = json.loads(data.decode("utf-8"))
+        if isinstance(obj, dict) and obj.get("container_type") == HARD_SEALED_CONTAINER_TYPE:
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def escrow_hard_unseal_bytes(private_key: Any, sealed_data: bytes) -> bytes:
+    container = parse_hard_sealed_container(sealed_data)
+    if not container:
+        raise HTTPException(400, "Object is not a BlindSite hard-sealed escrow container")
+    object_key = escrow_unwrap(private_key, str(container.get("wrapped_object_key") or ""))
+    try:
+        payload = Fernet(object_key).decrypt(str(container.get("encrypted_payload") or "").encode("ascii"))
+    except Exception as exc:
+        raise HTTPException(400, f"Could not decrypt hard-sealed object payload: {exc}") from exc
+    expected_sha = str(container.get("payload_sha256") or "")
+    expected_size = container.get("payload_size")
+    if expected_sha and sha256_bytes(payload) != expected_sha:
+        raise HTTPException(400, "Hard-sealed object payload hash verification failed")
+    if expected_size is not None:
+        try:
+            if len(payload) != int(expected_size):
+                raise HTTPException(400, "Hard-sealed object payload size verification failed")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+    return payload
+
+
 def custody_mode() -> str:
     mode = get_setting("custody_mode", "organization")
     return mode if mode in {"organization", "civilian_unknown_master"} else "organization"
@@ -323,6 +420,28 @@ def custody_mode() -> str:
 
 def civilian_unknown_master_mode() -> bool:
     return custody_mode() == "civilian_unknown_master"
+
+
+def organization_controlled_mode() -> bool:
+    return custody_mode() == "organization"
+
+
+def organization_hard_seal_public_key() -> tuple[str, str]:
+    """Return the organization escrow public key used for hard-sealed media.
+
+    This is separate from the local BlindSite vault key and separate from the
+    organization master reveal key. When enabled, preserved blocked media is
+    sealed to this public key at capture time so the capture installation's
+    local vault key cannot decrypt those preserved originals.
+    """
+    pem = get_setting("organization_hard_seal_public_key_pem", "").strip()
+    fp = escrow_public_fingerprint(pem) if pem else ""
+    return pem, fp
+
+
+def organization_hard_seal_media_configured() -> bool:
+    pem, fp = organization_hard_seal_public_key()
+    return organization_controlled_mode() and setting_bool("organization_hard_seal_media_enabled", "0") and bool(pem and fp)
 
 
 def custody_label() -> str:
@@ -463,6 +582,17 @@ def init_db() -> None:
         "sealed_media_preserve_max_total_bytes": "209715200",
         "sealed_media_preserve_max_items_per_session": "250",
         "sealed_media_preserve_mime_allowlist": "image/\nvideo/\naudio/",
+        "sealed_media_preserve_fetch_timeout_ms": "3500",
+        "sealed_media_preserve_mode": "balanced",
+        "sealed_media_preserve_background_timeout_ms": "18000",
+        "sealed_media_preserve_flush_before_capture_ms": "0",
+        "sealed_media_preserve_max_pending_tasks": "12",
+        "sealed_media_preserve_skip_decorative_fast": "1",
+        "live_response_logging": "0",
+        "live_blocked_event_logging": "0",
+        "organization_hard_seal_media_enabled": "0",
+        "organization_hard_seal_public_key_pem": "",
+        "organization_hard_seal_public_key_fingerprint": "",
         "edition": "lockdown",
         "default_case_mode": "lockdown",
         "default_media_policy": "block_images_video",
@@ -518,7 +648,13 @@ def init_db() -> None:
         "live_initial_navigation_timeout_ms": "60000",
         "live_auto_capture_delay_ms": "2500",
         "reviewer_enabled": "1",
-        "reviewer_default_render_mode": "safe",
+        "reviewer_default_render_mode": "auto",
+        "capture_chat_profile_enabled": "1",
+        "capture_chat_url_keywords": "chat\nchatroom\nrooms",
+        "capture_chat_settle_timeout_ms": "10000",
+        "capture_chat_network_idle_timeout_ms": "1200",
+        "capture_chat_wait_after_load_ms": "500",
+        "capture_chat_auto_scroll_max_steps": "8",
     }
     for k, v in defaults.items():
         if fetchone("SELECT 1 FROM settings WHERE key=?", (k,)) is None:
@@ -527,6 +663,20 @@ def init_db() -> None:
         execute("INSERT INTO users(username,password_hash,role,image_policy,require_master_key,require_approval,created_at) VALUES(?,?,?,?,?,?,?)", ("admin", hash_password("change-me-now"), "admin", "full", 0, 0, utcnow()))
     ensure_secret_file(SECRET_FILE, 48)
     fernet()
+    # If an older Civilian Unknown Master Key installation already has
+    # sensitive/original evidence stored with the normal local vault key,
+    # upgrade it in-place to hard-sealed escrow storage so the local vault key
+    # can no longer decrypt those objects.
+    try:
+        if get_setting("custody_mode", "organization") == "civilian_unknown_master":
+            migrate_existing_civilian_sensitive_evidence_to_hard_sealed()
+        elif get_setting("custody_mode", "organization") == "organization" and setting_bool("organization_hard_seal_media_enabled", "0"):
+            migrate_existing_organization_preserved_media_to_hard_sealed()
+    except NameError:
+        # Function is defined later; this only matters for unusual import-time
+        # calls before the module has finished loading. Normal app startup and
+        # CLI paths call init_db after definitions are loaded.
+        pass
 
 
 def log_event(actor: str, action: str, *, case_id: int | None = None, evidence_id: int | None = None, blocked_media_id: int | None = None, session_id: str | None = None, details: dict[str, Any] | None = None) -> str:
@@ -584,7 +734,7 @@ async def lifespan(app_obj: FastAPI):
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=app_secret(), same_site="lax", https_only=False)
-serializer = URLSafeTimedSerializer(app_secret(), salt="forensic-tor-vault-view-token")
+serializer = URLSafeTimedSerializer(app_secret(), salt="blindsite-view-token")
 
 
 def current_user(request: Request) -> dict[str, Any] | None:
@@ -992,6 +1142,21 @@ def kind_for(mime_type: str, filename: str = "") -> str:
 
 
 SEALED_PRESERVED_STORAGE_MODE = "sealed_preserved_blocked_media"
+SEALED_PRESERVED_PAGE_SNAPSHOT_STORAGE_MODE = "sealed_preserved_page_snapshot"
+
+
+def chat_profile_url(url: str) -> bool:
+    """Return True for chat/room style pages that should use faster DOM-stable capture.
+
+    These sites commonly keep background polling/websockets alive forever, so
+    capture should not wait on full load/networkidle the way static pages can.
+    """
+    if not setting_bool("capture_chat_profile_enabled", "1"):
+        return False
+    text = ((url or "") + " " + host_of(url or "")).lower()
+    raw = get_setting("capture_chat_url_keywords", "chat\nchatroom\nrooms")
+    keywords = [x.strip().lower() for x in raw.replace(",", "\n").splitlines() if x.strip()]
+    return any(k and k in text for k in keywords)
 
 
 def safe_int(value: Any, default: int, *, min_value: int = 0, max_value: int | None = None) -> int:
@@ -1006,6 +1171,73 @@ def safe_int(value: Any, default: int, *, min_value: int = 0, max_value: int | N
     return out
 
 
+def sealed_media_preserve_mode() -> str:
+    mode = (get_setting("sealed_media_preserve_mode", "balanced") or "balanced").strip().lower()
+    return mode if mode in {"fast", "balanced", "complete"} else "balanced"
+
+
+def decorative_asset_url(url: str) -> bool:
+    """Return True for common low-value decorative assets that should not stall capture.
+
+    The asset can still be logged as a blocked media reference. In fast/balanced
+    preservation modes, these should not be allowed to hold a Playwright route open
+    for many seconds each.
+    """
+    path = urlparse(url or "").path.lower()
+    name = Path(path).name.lower()
+    hay = (path + " " + name).replace("%20", " ")
+    terms = [
+        "favicon", "logo", "logos", "badge", "rating", "trustpilot", "capterra",
+        "g2-rating", "star", "sprite", "icon", "iso-", "soc2", "forrester",
+        "contact-us-", "banner-logo", "lufthansa-logo", "youtube-",
+    ]
+    if any(t in hay for t in terms):
+        return True
+    ext = Path(path).suffix.lower()
+    # SVGs are often logos/icons/badges on marketing pages. They are still
+    # preserved in complete mode, but should not be allowed to slow ordinary
+    # high-risk/chat captures by default.
+    return ext == ".svg" and any(t in hay for t in ["logo", "icon", "badge", "rating", "star", "iso", "soc", "banner"])
+
+
+def cleaned_preserve_headers(headers: dict[str, Any] | None, *, fallback_user_agent: str = "", referer: str = "") -> dict[str, str]:
+    """Sanitize browser request headers before background preservation fetches.
+
+    Some browser/Playwright route logs show values like accept-language: undefined.
+    We also remove hop-by-hop / browser-internal headers that can confuse normal
+    requests-based fallback downloads.
+    """
+    out: dict[str, str] = {}
+    skip = {"host", "connection", "content-length", "accept-encoding"}
+    for k, v in (headers or {}).items():
+        lk = str(k).lower().strip()
+        if not lk or lk in skip or lk.startswith("sec-"):
+            continue
+        sv = "" if v is None else str(v)
+        if not sv or sv.lower() == "undefined":
+            continue
+        out[lk] = sv
+    out.setdefault("user-agent", fallback_user_agent or selected_user_agent())
+    out.setdefault("accept-language", "en-US,en;q=0.9")
+    if referer and "referer" not in out:
+        out["referer"] = referer
+    return out
+
+
+def preserve_timeout_for(logical: str, url: str, *, background: bool = False) -> int:
+    mode = sealed_media_preserve_mode()
+    if background:
+        default = 18000 if mode != "fast" else 8000
+        return max(2000, safe_int(get_setting("sealed_media_preserve_background_timeout_ms", str(default)), default, min_value=1000, max_value=120000))
+    if mode == "complete":
+        default = 12000
+    elif mode == "fast":
+        default = 1800 if decorative_asset_url(url) else 2500
+    else:
+        default = 1200 if decorative_asset_url(url) else 3500
+    return max(500, safe_int(get_setting("sealed_media_preserve_fetch_timeout_ms", str(default)), default, min_value=500, max_value=60000))
+
+
 def sealed_preserved_media_evidence(ev: dict[str, Any] | sqlite3.Row | None) -> bool:
     if not ev:
         return False
@@ -1014,6 +1246,143 @@ def sealed_preserved_media_evidence(ev: dict[str, Any] | sqlite3.Row | None) -> 
     except Exception:
         storage = str((ev or {}).get("storage_mode") or "")  # type: ignore[union-attr]
     return storage == SEALED_PRESERVED_STORAGE_MODE
+
+
+def evidence_meta_dict(ev: dict[str, Any] | sqlite3.Row | None) -> dict[str, Any]:
+    if not ev:
+        return {}
+    try:
+        raw = ev["meta_json"]  # sqlite3.Row compatible
+    except Exception:
+        raw = (ev or {}).get("meta_json") if isinstance(ev, dict) else None  # type: ignore[union-attr]
+    return jloads(raw, {}) if isinstance(raw, str) else (raw or {})
+
+
+def hard_sealed_escrow_evidence(ev: dict[str, Any] | sqlite3.Row | None) -> bool:
+    if not ev:
+        return False
+    try:
+        encrypted_flag = int(ev["encrypted"] or 0)
+    except Exception:
+        encrypted_flag = int((ev or {}).get("encrypted") or 0) if isinstance(ev, dict) else 0  # type: ignore[union-attr]
+    meta = evidence_meta_dict(ev)
+    return (
+        encrypted_flag == HARD_SEALED_ENCRYPTED_FLAG
+        or bool(meta.get("hard_sealed_civilian_evidence"))
+        or bool(meta.get("hard_sealed_organization_media"))
+        or bool(meta.get("hard_sealed_escrow_evidence"))
+    )
+
+
+def hard_sealed_civilian_evidence(ev: dict[str, Any] | sqlite3.Row | None) -> bool:
+    """True for Civilian Unknown Master Key hard-sealed objects.
+
+    Older civilian hard-sealed rows may only have encrypted flag 2, so if no
+    organization hard-seal marker exists we treat flag-2 objects as civilian for
+    backward compatibility.
+    """
+    if not ev:
+        return False
+    meta = evidence_meta_dict(ev)
+    if meta.get("hard_sealed_organization_media") or meta.get("organization_hard_sealed_media_preservation"):
+        return False
+    if meta.get("hard_sealed_civilian_evidence"):
+        return True
+    try:
+        encrypted_flag = int(ev["encrypted"] or 0)
+    except Exception:
+        encrypted_flag = int((ev or {}).get("encrypted") or 0) if isinstance(ev, dict) else 0  # type: ignore[union-attr]
+    return encrypted_flag == HARD_SEALED_ENCRYPTED_FLAG
+
+
+def hard_sealed_organization_media_evidence(ev: dict[str, Any] | sqlite3.Row | None) -> bool:
+    if not ev:
+        return False
+    meta = evidence_meta_dict(ev)
+    return bool(meta.get("hard_sealed_organization_media") or meta.get("organization_hard_sealed_media_preservation"))
+
+
+def civilian_hard_seal_required(*, source_type: str, storage_mode: str, kind: str, mime_type: str, raw_persisted: bool, meta: dict[str, Any] | None = None) -> bool:
+    """Return True when evidence should not be decryptable by the local civilian install.
+
+    Civilian Unknown Master Key mode still stores safe summaries/metadata with the
+    normal local vault key so the collector can manage the case. Sensitive or
+    original material is hard-sealed to the USCM escrow public key at capture
+    time, so the local vault key cannot decrypt it.
+    """
+    if not civilian_unknown_master_mode():
+        return False
+    meta = meta or {}
+    st = (storage_mode or "").lower()
+    src = (source_type or "").lower()
+    k = (kind or "").lower()
+    mt = (mime_type or "").lower()
+    if meta.get("hard_sealed_civilian_evidence"):
+        return True
+    if meta.get("sealed_media_preservation"):
+        return True
+    if st in {SEALED_PRESERVED_STORAGE_MODE, SEALED_PRESERVED_PAGE_SNAPSHOT_STORAGE_MODE}:
+        return True
+    if src == "sealed_page_snapshot" or meta.get("sealed_page_snapshot"):
+        return True
+    original_storage_modes = {
+        "uploaded_original",
+        "allowed_media_original",
+        "captured_asset_local",
+        "materialized_original",
+        "raw_root",
+        "live_browser_raw_html",
+    }
+    original_source_types = {
+        "upload",
+        "allowed_media_download",
+        "captured_asset",
+        "live_captured_asset",
+        "blocked_media_materialization",
+        "sealed_preserved_blocked_media",
+    }
+    if st in original_storage_modes or src in original_source_types:
+        return True
+    if raw_persisted and (k in {"image", "video", "audio", "media"} or mt.startswith(("image/", "video/", "audio/"))):
+        return True
+    return False
+
+
+def organization_hard_seal_media_required(*, source_type: str, storage_mode: str, kind: str, mime_type: str, raw_persisted: bool, meta: dict[str, Any] | None = None) -> bool:
+    """Return True when organization preserved media should be reviewer-key sealed.
+
+    This intentionally applies only to Sealed Media Preservation objects in
+    Organization-Controlled Key mode. Normal organization evidence keeps the
+    existing local vault encryption/reveal workflow unless this specific
+    hard-seal preservation path is used.
+    """
+    if not organization_controlled_mode():
+        return False
+    if not setting_bool("organization_hard_seal_media_enabled", "0"):
+        return False
+    meta = meta or {}
+    st = (storage_mode or "").lower()
+    src = (source_type or "").lower()
+    if meta.get("hard_sealed_organization_media") or meta.get("hard_sealed_escrow_evidence"):
+        return True
+    if meta.get("sealed_media_preservation") or st == SEALED_PRESERVED_STORAGE_MODE or src == "sealed_preserved_blocked_media":
+        return True
+    if meta.get("sealed_page_snapshot") or st == SEALED_PRESERVED_PAGE_SNAPSHOT_STORAGE_MODE or src == "sealed_page_snapshot":
+        return True
+    return False
+
+
+def sealed_page_snapshot_allowed(case_id: int | None) -> tuple[bool, str]:
+    """Whether to save a reviewer-only rendered DOM snapshot for full-page review.
+
+    This is intentionally limited to hard-sealed custody paths so safe-mode local
+    users do not gain a local-vault-decryptable copy of the page HTML.
+    """
+    if civilian_unknown_master_mode():
+        return True, "civilian_unknown_master_hard_seal"
+    if organization_controlled_mode() and organization_hard_seal_media_configured():
+        return True, "organization_hard_sealed_reviewer_key"
+    return False, "no hard-sealed page snapshot key configured"
 
 
 def media_kind_from_resource(*, url: str = "", resource_type: str = "", mime_type: str = "", browser_resource_type: str = "") -> str:
@@ -1059,13 +1428,17 @@ def mime_allowed_by_sealed_preservation(mime_type: str, url: str = "") -> bool:
 
 def sealed_media_preservation_policy(case: dict[str, Any] | None) -> dict[str, Any]:
     # Available in both custody modes. In Civilian Unknown Master Key mode the
-    # local user still cannot reveal preserved media; in Organization mode,
-    # reveal remains gated by role/approval/master-key controls.
+    # local user cannot reveal preserved media. In Organization mode, preserved
+    # media may either use the existing local vault/master-key workflow or, if
+    # enabled below, hard-seal to an organization escrow public key so the local
+    # vault key cannot decrypt it.
     global_enabled = setting_bool("sealed_media_preservation_enabled", "0")
     case_enabled = bool(case and truthy(case.get("sealed_media_preservation_enabled", 0)))
     max_each_global = safe_int(get_setting("sealed_media_preserve_max_bytes", "52428800"), 52428800, min_value=0)
     max_each_case = safe_int((case or {}).get("sealed_media_preserve_max_bytes", max_each_global), max_each_global, min_value=0)
     max_each = min(x for x in [max_each_global, max_each_case] if x > 0) if (max_each_global > 0 or max_each_case > 0) else 0
+    org_hard_pem, org_hard_fp = organization_hard_seal_public_key()
+    org_hard_enabled = organization_controlled_mode() and setting_bool("organization_hard_seal_media_enabled", "0")
     return {
         "enabled": bool(global_enabled and case_enabled),
         "global_enabled": bool(global_enabled),
@@ -1073,6 +1446,10 @@ def sealed_media_preservation_policy(case: dict[str, Any] | None) -> dict[str, A
         "custody_mode": custody_mode(),
         "organization_mode": custody_mode() == "organization",
         "civilian_unknown_master_key_mode": civilian_unknown_master_mode(),
+        "organization_hard_seal_media_enabled": bool(org_hard_enabled),
+        "organization_hard_seal_media_configured": bool(org_hard_enabled and org_hard_pem and org_hard_fp),
+        "organization_hard_seal_public_key_fingerprint": org_hard_fp if org_hard_enabled else "",
+        "hard_sealed_storage_for_preserved_media": bool(civilian_unknown_master_mode() or (org_hard_enabled and org_hard_pem and org_hard_fp)),
         "images": setting_bool("sealed_media_preserve_images", "1") and bool((case or {}).get("sealed_media_preserve_images", 1)),
         "video": setting_bool("sealed_media_preserve_video", "1") and bool((case or {}).get("sealed_media_preserve_video", 1)),
         "audio": setting_bool("sealed_media_preserve_audio", "1") and bool((case or {}).get("sealed_media_preserve_audio", 1)),
@@ -1090,6 +1467,8 @@ def sealed_media_preservation_allowed(case_id: int | None, *, url: str, resource
         if not policy["global_enabled"]:
             return False, "sealed media preservation is disabled globally", policy
         return False, "sealed media preservation is disabled for this case", policy
+    if policy.get("organization_hard_seal_media_enabled") and not policy.get("organization_hard_seal_media_configured"):
+        return False, "organization hard-sealed media preservation is enabled but no valid organization escrow public key is configured", policy
     kind = media_kind_from_resource(url=url, resource_type=resource_type, mime_type=mime_type, browser_resource_type=browser_resource_type)
     if kind == "image" and not policy["images"]:
         return False, "sealed preservation disabled for images", policy
@@ -1127,7 +1506,10 @@ def persist_sealed_preserved_media(*, actor: str, case_id: int | None, session_i
         "blocked_from_local_display": True,
         "blocked_from_local_civilian_viewing": True,
         "clear_reviewer_required": True,
-        "master_key_required_for_local_org_reveal": custody_mode() == "organization",
+        "master_key_required_for_local_org_reveal": custody_mode() == "organization" and not organization_hard_seal_media_configured(),
+        "organization_hard_seal_media_enabled": organization_controlled_mode() and setting_bool("organization_hard_seal_media_enabled", "0"),
+        "organization_hard_seal_media_configured": organization_hard_seal_media_configured(),
+        "hard_sealed_reviewer_key_required": civilian_unknown_master_mode() or organization_hard_seal_media_configured(),
         "page_url": page_url or "",
         "page_url_sha256": sha256_text(page_url or ""),
         "media_url": media_url,
@@ -1194,13 +1576,52 @@ def persist_evidence(*, case_id: int | None, actor: str, kind: str, source_type:
         disable_plaintext = bool(case and case.get("no_plaintext_export")) or lockdown()
     if never_materialize is None:
         never_materialize = bool(case and case.get("never_materialize_originals")) or lockdown()
+    meta = dict(meta or {})
     sha = sha256_bytes(payload)
-    stored = encrypt_bytes(payload) if encrypt else payload
+    civilian_hard_seal = civilian_hard_seal_required(source_type=source_type, storage_mode=storage_mode, kind=kind, mime_type=mime_type, raw_persisted=raw_persisted, meta=meta)
+    organization_hard_seal = organization_hard_seal_media_required(source_type=source_type, storage_mode=storage_mode, kind=kind, mime_type=mime_type, raw_persisted=raw_persisted, meta=meta)
+    hard_seal = civilian_hard_seal or organization_hard_seal
+    if hard_seal:
+        if civilian_hard_seal:
+            pem = load_uscm_escrow_public_key().strip()
+            fp = escrow_public_fingerprint(pem)
+            if not pem or not fp:
+                raise HTTPException(500, "Civilian Unknown Master Key mode requires the embedded USCM escrow public key for hard-sealed storage")
+            meta.update({
+                "hard_sealed_civilian_evidence": True,
+                "hard_sealed_escrow_evidence": True,
+                "hard_sealed_storage_version": 1,
+                "hard_sealed_decrypt_with": "USCM escrow private key / cleared reviewer workflow",
+                "hard_sealed_local_vault_key_cannot_decrypt": True,
+                "escrow_public_key_fingerprint": fp,
+                "local_civilian_decrypt_available": False,
+            })
+            hard_seal_context = "civilian_unknown_master"
+        else:
+            pem, fp = organization_hard_seal_public_key()
+            if not pem or not fp:
+                raise HTTPException(500, "Organization hard-sealed media preservation requires a valid organization escrow public key")
+            meta.update({
+                "hard_sealed_organization_media": True,
+                "hard_sealed_escrow_evidence": True,
+                "hard_sealed_storage_version": 1,
+                "hard_sealed_decrypt_with": "organization escrow private key / cleared reviewer workflow",
+                "hard_sealed_local_vault_key_cannot_decrypt": True,
+                "escrow_public_key_fingerprint": fp,
+                "local_organization_decrypt_available": False,
+                "organization_hard_sealed_media_preservation": True,
+            })
+            hard_seal_context = "organization_hard_sealed_media"
+        stored = escrow_hard_seal_bytes(pem, payload, meta={"evidence_sha256": sha, "source_type": source_type, "storage_mode": storage_mode, "filename": clean_filename(filename), "mime_type": mime_type, "hard_seal_context": hard_seal_context})
+        encrypted_flag = HARD_SEALED_ENCRYPTED_FLAG
+    else:
+        stored = encrypt_bytes(payload) if encrypt else payload
+        encrypted_flag = 1 if encrypt else 0
     path = object_path(EVIDENCE_DIR, ".fvault")
     path.write_bytes(stored)
     eid = execute("""INSERT INTO evidence(case_id,parent_evidence_id,kind,source_type,source_ref,filename,mime_type,sha256,size,object_path,encrypted,storage_mode,raw_persisted,meta_json,status,quarantined,lock_direct_original_access,disable_plaintext_export,never_materialize_blocked_originals,created_at)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (case_id, parent_id, kind, source_type, source_ref or "", clean_filename(filename), mime_type or "application/octet-stream", sha, len(payload), relative(path), 1 if encrypt else 0, storage_mode, 1 if raw_persisted else 0, json.dumps(meta or {}, ensure_ascii=False), "unviewed", 1 if quarantined else 0, 1 if lock_original else 0, 1 if disable_plaintext else 0, 1 if never_materialize else 0, utcnow()))
-    log_event(actor, "EVIDENCE_STORED", case_id=case_id, evidence_id=eid, details={"kind": kind, "source_type": source_type, "sha256": sha, "storage_mode": storage_mode, "raw_persisted": raw_persisted, "encrypted": encrypt})
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (case_id, parent_id, kind, source_type, source_ref or "", clean_filename(filename), mime_type or "application/octet-stream", sha, len(payload), relative(path), encrypted_flag, storage_mode, 1 if raw_persisted else 0, json.dumps(meta or {}, ensure_ascii=False), "unviewed", 1 if quarantined else 0, 1 if lock_original else 0, 1 if disable_plaintext else 0, 1 if never_materialize else 0, utcnow()))
+    log_event(actor, "EVIDENCE_STORED", case_id=case_id, evidence_id=eid, details={"kind": kind, "source_type": source_type, "sha256": sha, "storage_mode": storage_mode, "raw_persisted": raw_persisted, "encrypted": encrypted_flag, "hard_sealed_escrow_evidence": hard_seal, "hard_sealed_civilian_evidence": civilian_hard_seal, "hard_sealed_organization_media": organization_hard_seal})
     return eid
 
 
@@ -1209,12 +1630,128 @@ def read_evidence(eid: int) -> bytes:
     if not ev:
         raise HTTPException(404, "Evidence not found")
     data = data_path(ev["object_path"]).read_bytes()
+    if hard_sealed_escrow_evidence(ev):
+        meta = evidence_meta_dict(ev)
+        if meta.get("hard_sealed_organization_media"):
+            raise HTTPException(403, "This evidence object is hard-sealed to the organization escrow public key and cannot be decrypted by the local vault key. Use sealed export/reviewer decrypt with the matching escrow private key.")
+        raise HTTPException(403, "This evidence object is hard-sealed for Civilian Unknown Master Key custody and cannot be decrypted by the local installation. Use sealed export/reviewer decrypt with the escrow private key.")
     if ev.get("encrypted"):
         try:
             return decrypt_bytes(data)
         except InvalidToken as exc:
             raise HTTPException(500, "Stored evidence cannot be decrypted with current key") from exc
     return data
+
+
+def migrate_existing_civilian_sensitive_evidence_to_hard_sealed() -> dict[str, Any]:
+    """Upgrade older Civilian Unknown Master Key evidence to hard-sealed storage.
+
+    Earlier builds encrypted evidence at rest with the local vault key. That was
+    safe from plaintext-at-rest storage, but it still meant the local vault key
+    could decrypt sensitive originals outside the UI. In Civilian Unknown Master
+    Key mode, sensitive/original objects should instead be encrypted to the USCM
+    escrow public key with no local decrypt key. This migration only affects
+    objects that the same policy would hard-seal on new captures.
+    """
+    if not civilian_unknown_master_mode():
+        return {"migrated": 0, "skipped": "not civilian_unknown_master"}
+    pem = load_uscm_escrow_public_key().strip()
+    fp = escrow_public_fingerprint(pem)
+    if not pem or not fp:
+        return {"migrated": 0, "error": "missing/invalid USCM escrow public key"}
+    rows = fetchall("SELECT * FROM evidence ORDER BY id")
+    migrated = 0
+    failed: list[dict[str, Any]] = []
+    for r in rows:
+        ev = dict(r)
+        if hard_sealed_civilian_evidence(ev):
+            continue
+        meta = jloads(ev.get("meta_json"), {})
+        should = civilian_hard_seal_required(source_type=ev.get("source_type") or "", storage_mode=ev.get("storage_mode") or "", kind=ev.get("kind") or "", mime_type=ev.get("mime_type") or "", raw_persisted=bool(ev.get("raw_persisted")), meta=meta)
+        if not should:
+            continue
+        try:
+            path = data_path(ev["object_path"])
+            stored = path.read_bytes()
+            if int(ev.get("encrypted") or 0) == 1:
+                plaintext = decrypt_bytes(stored)
+            elif int(ev.get("encrypted") or 0) == 0:
+                plaintext = stored
+            else:
+                continue
+            meta.update({
+                "hard_sealed_civilian_evidence": True,
+                "hard_sealed_storage_version": 1,
+                "hard_sealed_migrated_from_local_vault": True,
+                "hard_sealed_migrated_at": utcnow(),
+                "hard_sealed_decrypt_with": "USCM escrow private key / cleared reviewer workflow",
+                "hard_sealed_local_vault_key_cannot_decrypt": True,
+                "escrow_public_key_fingerprint": fp,
+                "local_civilian_decrypt_available": False,
+            })
+            hard = escrow_hard_seal_bytes(pem, plaintext, meta={"evidence_id": ev.get("id"), "migrated_from_local_vault": True, "source_type": ev.get("source_type"), "storage_mode": ev.get("storage_mode"), "filename": ev.get("filename"), "mime_type": ev.get("mime_type")})
+            path.write_bytes(hard)
+            execute("UPDATE evidence SET encrypted=?, meta_json=?, lock_direct_original_access=1, disable_plaintext_export=1, never_materialize_blocked_originals=1 WHERE id=?", (HARD_SEALED_ENCRYPTED_FLAG, json.dumps(meta, ensure_ascii=False), ev["id"]))
+            log_event("system", "CIVILIAN_EVIDENCE_HARD_SEALED_MIGRATED", case_id=ev.get("case_id"), evidence_id=ev.get("id"), details={"source_type": ev.get("source_type"), "storage_mode": ev.get("storage_mode"), "sha256": ev.get("sha256"), "escrow_public_key_fingerprint": fp})
+            migrated += 1
+        except Exception as exc:
+            failed.append({"id": ev.get("id"), "error": str(exc)[:500]})
+    return {"migrated": migrated, "failed": failed[:20]}
+
+
+def migrate_existing_organization_preserved_media_to_hard_sealed() -> dict[str, Any]:
+    """Upgrade older Organization-mode sealed-preserved media to reviewer-key storage.
+
+    This only touches Sealed Media Preservation objects. Normal organization
+    evidence remains on the existing local vault encryption path.
+    """
+    if not organization_controlled_mode():
+        return {"migrated": 0, "skipped": "not organization mode"}
+    if not setting_bool("organization_hard_seal_media_enabled", "0"):
+        return {"migrated": 0, "skipped": "organization hard-sealed media disabled"}
+    pem, fp = organization_hard_seal_public_key()
+    if not pem or not fp:
+        return {"migrated": 0, "error": "missing/invalid organization hard-seal public key"}
+    rows = fetchall("SELECT * FROM evidence WHERE storage_mode=? OR source_type='sealed_preserved_blocked_media' ORDER BY id", (SEALED_PRESERVED_STORAGE_MODE,))
+    migrated = 0
+    failed: list[dict[str, Any]] = []
+    for r in rows:
+        ev = dict(r)
+        if hard_sealed_escrow_evidence(ev):
+            continue
+        meta = jloads(ev.get("meta_json"), {})
+        should = organization_hard_seal_media_required(source_type=ev.get("source_type") or "", storage_mode=ev.get("storage_mode") or "", kind=ev.get("kind") or "", mime_type=ev.get("mime_type") or "", raw_persisted=bool(ev.get("raw_persisted")), meta=meta)
+        if not should:
+            continue
+        try:
+            path = data_path(ev["object_path"])
+            stored = path.read_bytes()
+            if int(ev.get("encrypted") or 0) == 1:
+                plaintext = decrypt_bytes(stored)
+            elif int(ev.get("encrypted") or 0) == 0:
+                plaintext = stored
+            else:
+                continue
+            meta.update({
+                "hard_sealed_organization_media": True,
+                "hard_sealed_escrow_evidence": True,
+                "hard_sealed_storage_version": 1,
+                "hard_sealed_migrated_from_local_vault": True,
+                "hard_sealed_migrated_at": utcnow(),
+                "hard_sealed_decrypt_with": "organization escrow private key / reviewer workflow",
+                "hard_sealed_local_vault_key_cannot_decrypt": True,
+                "escrow_public_key_fingerprint": fp,
+                "local_organization_decrypt_available": False,
+                "organization_hard_sealed_media_preservation": True,
+            })
+            hard = escrow_hard_seal_bytes(pem, plaintext, meta={"evidence_id": ev.get("id"), "migrated_from_local_vault": True, "source_type": ev.get("source_type"), "storage_mode": ev.get("storage_mode"), "filename": ev.get("filename"), "mime_type": ev.get("mime_type"), "hard_seal_context": "organization_hard_sealed_media"})
+            path.write_bytes(hard)
+            execute("UPDATE evidence SET encrypted=?, meta_json=?, lock_direct_original_access=1, disable_plaintext_export=1, never_materialize_blocked_originals=1 WHERE id=?", (HARD_SEALED_ENCRYPTED_FLAG, json.dumps(meta, ensure_ascii=False), ev["id"]))
+            log_event("system", "ORGANIZATION_PRESERVED_MEDIA_HARD_SEALED_MIGRATED", case_id=ev.get("case_id"), evidence_id=ev.get("id"), details={"source_type": ev.get("source_type"), "storage_mode": ev.get("storage_mode"), "sha256": ev.get("sha256"), "escrow_public_key_fingerprint": fp})
+            migrated += 1
+        except Exception as exc:
+            failed.append({"id": ev.get("id"), "error": str(exc)[:500]})
+    return {"migrated": migrated, "failed": failed[:20]}
 
 
 def update_evidence_meta(eid: int, updates: dict[str, Any]) -> dict[str, Any]:
@@ -1646,7 +2183,7 @@ def rendered_capture_html(ev: dict[str, Any], model: dict[str, Any] | None = Non
     for tag in soup.find_all(["script", "iframe", "object", "embed"]):
         placeholder = soup.new_tag("div")
         placeholder["data-ftv-removed"] = tag.name
-        placeholder.string = f"[Forensic Tor Vault removed {tag.name} from static renderer]"
+        placeholder.string = f"[BlindSite removed {tag.name} from static renderer]"
         tag.replace_with(placeholder)
 
     for meta in soup.find_all("meta"):
@@ -1737,7 +2274,7 @@ def rendered_capture_html(ev: dict[str, Any], model: dict[str, Any] | None = Non
         soup.head.append(title_tag)
     banner = soup.new_tag("div")
     banner["class"] = "ftv-banner"
-    banner.string = f"Forensic Tor Vault static renderer — saved local assets only — remote network disabled — evidence #{ev.get('id')} — source: {source_url}"
+    banner.string = f"BlindSite static renderer — saved local assets only — remote network disabled — evidence #{ev.get('id')} — source: {source_url}"
     if soup.body:
         soup.body.insert(0, banner)
     return "<!doctype html>\n" + str(soup)
@@ -1835,7 +2372,7 @@ def saved_capture_model(ev: dict[str, Any]) -> dict[str, Any]:
     """Return a normalized safe representation of a saved URL/live-browser capture.
 
     The viewer never fetches remote resources. It renders only the bytes already saved by
-    Forensic Tor Vault, and for raw HTML it uses a sanitized DOM/text reconstruction by default.
+    BlindSite, and for raw HTML it uses a sanitized DOM/text reconstruction by default.
     """
     max_text = int(get_setting("max_text_summary_chars", "20000") or "20000")
     raw = read_evidence(int(ev["id"]))
@@ -1948,7 +2485,7 @@ def saved_capture_frame_html(ev: dict[str, Any], model: dict[str, Any] | None = 
 <meta http-equiv='Content-Security-Policy' content="default-src 'none'; img-src 'none'; media-src 'none'; script-src 'none'; connect-src 'none'; frame-src 'none'; style-src 'unsafe-inline'">
 <title>{h(title)}</title><style>
 body{{font-family:Segoe UI,Arial,sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:22px}}a{{color:#38bdf8}}.card{{background:#111827;border:1px solid #334155;border-radius:12px;padding:16px;margin:14px 0}}.muted{{color:#9ca3af}}.mono,pre{{font-family:Consolas,Menlo,monospace}}pre{{white-space:pre-wrap;overflow:auto;background:#020617;border:1px solid #334155;border-radius:10px;padding:12px}}table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid #334155;padding:7px;text-align:left;vertical-align:top}}.scroll{{overflow-x:auto}}.badge{{display:inline-block;border:1px solid #475569;border-radius:99px;padding:3px 8px;margin:2px;background:#020617}}
-</style></head><body><h1>{h(title or 'Saved capture')}</h1><div class='card'><b>{h(export_note)}</b><p class='muted'>This page was reconstructed only from data already saved by Forensic Tor Vault. It does not load remote images, video, scripts, stylesheets, frames, or network resources.</p><p><span class='badge'>Evidence #{h(ev.get('id'))}</span><span class='badge'>storage: {h(ev.get('storage_mode'))}</span><span class='badge'>raw persisted: {h(ev.get('raw_persisted'))}</span></p><p><b>Source URL:</b> <span class='mono'>{h(source_url)}</span></p><p><b>Source URL SHA-256:</b> <span class='mono'>{h(model.get('source_url_sha256'))}</span></p></div><div class='card'><h2>Captured text / sanitized DOM summary</h2><pre>{h(text_block)}</pre></div><div class='card'><h2>Links preserved from page</h2><div class='scroll'><table><tr><th>Text</th><th>URL</th><th>URL SHA-256</th></tr>{link_rows or '<tr><td colspan="3" class="muted">No links in saved summary.</td></tr>'}</table></div></div><div class='card'><h2>Removed or blocked element counts</h2><table><tr><th>Element</th><th>Count</th></tr>{removed_rows or '<tr><td colspan="2" class="muted">No removed-count data.</td></tr>'}</table></div><div class='card'><h2>Blocked media associated with this capture/session</h2><div class='scroll'><table><tr><th>ID</th><th>Type</th><th>State</th><th>URL</th><th>URL SHA-256</th></tr>{bm_rows or '<tr><td colspan="5" class="muted">No blocked media records linked to this capture.</td></tr>'}</table></div></div><div class='card'><h2>Capture metadata</h2><pre>{meta_pre}</pre></div></body></html>"""
+</style></head><body><h1>{h(title or 'Saved capture')}</h1><div class='card'><b>{h(export_note)}</b><p class='muted'>This page was reconstructed only from data already saved by BlindSite. It does not load remote images, video, scripts, stylesheets, frames, or network resources.</p><p><span class='badge'>Evidence #{h(ev.get('id'))}</span><span class='badge'>storage: {h(ev.get('storage_mode'))}</span><span class='badge'>raw persisted: {h(ev.get('raw_persisted'))}</span></p><p><b>Source URL:</b> <span class='mono'>{h(source_url)}</span></p><p><b>Source URL SHA-256:</b> <span class='mono'>{h(model.get('source_url_sha256'))}</span></p></div><div class='card'><h2>Captured text / sanitized DOM summary</h2><pre>{h(text_block)}</pre></div><div class='card'><h2>Links preserved from page</h2><div class='scroll'><table><tr><th>Text</th><th>URL</th><th>URL SHA-256</th></tr>{link_rows or '<tr><td colspan="3" class="muted">No links in saved summary.</td></tr>'}</table></div></div><div class='card'><h2>Removed or blocked element counts</h2><table><tr><th>Element</th><th>Count</th></tr>{removed_rows or '<tr><td colspan="2" class="muted">No removed-count data.</td></tr>'}</table></div><div class='card'><h2>Blocked media associated with this capture/session</h2><div class='scroll'><table><tr><th>ID</th><th>Type</th><th>State</th><th>URL</th><th>URL SHA-256</th></tr>{bm_rows or '<tr><td colspan="5" class="muted">No blocked media records linked to this capture.</td></tr>'}</table></div></div><div class='card'><h2>Capture metadata</h2><pre>{meta_pre}</pre></div></body></html>"""
 
 
 def page_capture_rows(case_id: int | None = None, q: str = "", session_id: str | None = None, limit: int = 500) -> list[sqlite3.Row]:
@@ -2034,7 +2571,7 @@ def build_case_saved_pages_index(case_id: int, data: dict[str, Any]) -> str:
     for c in captures:
         fname = f"saved_pages/evidence_{c['evidence_id']}.html"
         rows.append(f"<tr><td>#{h(c['evidence_id'])}</td><td><a href='{h(fname)}'>{h(c.get('title') or c.get('filename') or 'Saved page')}</a></td><td>{h(c.get('capture_mode'))}</td><td>{'raw persisted' if c.get('raw_persisted') else 'safe summary / metadata'}</td><td>{h(c.get('created_at'))}</td><td>{h(c.get('page_url'))}</td><td><code>{h(c.get('sha256'))}</code></td></tr>")
-    return f"""<!doctype html><html><head><meta charset='utf-8'><title>Saved pages - case {h(case.get('id'))}</title><style>body{{font-family:Arial,sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}code{{word-break:break-all}}.muted{{color:#666}}</style></head><body><h1>Saved pages for case {h(case.get('name',''))}</h1><p class='muted'>These HTML viewers are reconstructed from what Forensic Tor Vault saved. They do not fetch remote images, video, scripts, stylesheets, frames, or network resources.</p><table><tr><th>Evidence</th><th>Viewer</th><th>Capture mode</th><th>Raw state</th><th>Captured</th><th>Source URL</th><th>Evidence SHA-256</th></tr>{''.join(rows) or '<tr><td colspan="7">No saved pages.</td></tr>'}</table></body></html>"""
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>Saved pages - case {h(case.get('id'))}</title><style>body{{font-family:Arial,sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}code{{word-break:break-all}}.muted{{color:#666}}</style></head><body><h1>Saved pages for case {h(case.get('name',''))}</h1><p class='muted'>These HTML viewers are reconstructed from what BlindSite saved. They do not fetch remote images, video, scripts, stylesheets, frames, or network resources.</p><table><tr><th>Evidence</th><th>Viewer</th><th>Capture mode</th><th>Raw state</th><th>Captured</th><th>Source URL</th><th>Evidence SHA-256</th></tr>{''.join(rows) or '<tr><td colspan="7">No saved pages.</td></tr>'}</table></body></html>"""
 
 
 def build_case_media_index(data: dict[str, Any]) -> str:
@@ -2055,7 +2592,7 @@ def build_case_report_html(data: dict[str, Any]) -> str:
     ev_rows = "".join(f"<tr><td>#{h(e.get('id'))}</td><td>{h(e.get('filename'))}</td><td>{h(e.get('kind'))}</td><td>{h(e.get('storage_mode'))}</td><td><code>{h(e.get('sha256'))}</code></td></tr>" for e in data.get("evidence", []))
     page_rows = "".join(f"<tr><td>#{h(c.get('evidence_id'))}</td><td><a href='saved_pages/evidence_{h(c.get('evidence_id'))}.html'>{h(c.get('title') or c.get('filename') or 'Saved page')}</a></td><td>{h(c.get('capture_mode'))}</td><td>{h(c.get('page_url'))}</td></tr>" for c in data.get("page_captures", []))
     blocked_rows = "".join(f"<tr><td>#{h(b.get('id'))}</td><td>{h(b.get('resource_type'))}</td><td>{'downloaded' if b.get('downloaded') else 'not downloaded'}</td><td><code>{h(b.get('metadata_record_hash'))}</code></td><td>{h(b.get('media_url'))}</td></tr>" for b in data.get("blocked_media", []))
-    return f"""<!doctype html><html><head><meta charset='utf-8'><title>Case report {h(case.get('id'))}</title><style>body{{font-family:Arial,sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}code{{word-break:break-all}}.good{{color:green}}.bad{{color:#b91c1c}}</style></head><body><h1>Forensic Tor Vault case report</h1><h2>{h(case.get('name',''))}</h2><p>Generated: {h(data.get('generated_at'))}</p><p>Audit chain: <b class='{'good' if data.get('audit_verification',{}).get('ok') else 'bad'}'>{'verified' if data.get('audit_verification',{}).get('ok') else 'problem detected'}</b></p><h2>Saved pages</h2><table><tr><th>Evidence</th><th>Offline viewer</th><th>Capture mode</th><th>Source URL</th></tr>{page_rows or '<tr><td colspan="4">No saved pages.</td></tr>'}</table><h2>Evidence</h2><table><tr><th>ID</th><th>Filename</th><th>Kind</th><th>Storage</th><th>SHA-256</th></tr>{ev_rows}</table><h2>Blocked media</h2><table><tr><th>ID</th><th>Type</th><th>State</th><th>Metadata hash</th><th>URL</th></tr>{blocked_rows}</table></body></html>"""
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>Case report {h(case.get('id'))}</title><style>body{{font-family:Arial,sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}code{{word-break:break-all}}.good{{color:green}}.bad{{color:#b91c1c}}</style></head><body><h1>BlindSite case report</h1><h2>{h(case.get('name',''))}</h2><p>Generated: {h(data.get('generated_at'))}</p><p>Audit chain: <b class='{'good' if data.get('audit_verification',{}).get('ok') else 'bad'}'>{'verified' if data.get('audit_verification',{}).get('ok') else 'problem detected'}</b></p><h2>Saved pages</h2><table><tr><th>Evidence</th><th>Offline viewer</th><th>Capture mode</th><th>Source URL</th></tr>{page_rows or '<tr><td colspan="4">No saved pages.</td></tr>'}</table><h2>Evidence</h2><table><tr><th>ID</th><th>Filename</th><th>Kind</th><th>Storage</th><th>SHA-256</th></tr>{ev_rows}</table><h2>Blocked media</h2><table><tr><th>ID</th><th>Type</th><th>State</th><th>Metadata hash</th><th>URL</th></tr>{blocked_rows}</table></body></html>"""
 
 
 @dataclass
@@ -2249,6 +2786,8 @@ class LiveBrowserSession:
         self.stop_flag = threading.Event()
         self.error: str | None = None
         self.page = None
+        self.active_page = None
+        self.pages: list[Any] = []
         self.context = None
         self.browser = None
         self.current_url = self.start_url
@@ -2257,6 +2796,23 @@ class LiveBrowserSession:
         self.sealed_preserved = 0
         self.sealed_preserved_bytes = 0
         self.sealed_preserve_skipped = 0
+        self.sealed_preserve_timeout_count = 0
+        self.sealed_preserve_bg_tasks: set[Any] = set()
+        self.sealed_preserve_cancel_requested = threading.Event()
+        self.sealed_preserve_cancelled = 0
+        self.sealed_preserve_lock = threading.RLock()
+        self.deferred_blocked_media: list[dict[str, Any]] = []
+        self.deferred_blocked_seen: set[str] = set()
+        self.deferred_blocked_lock = threading.RLock()
+        self.deferred_blocked_flushed = 0
+        self.deferred_blocked_dropped = 0
+        self.sealed_media_policy_cache = sealed_media_preservation_policy(case_for(case_id))
+        self.preserve_mode = sealed_media_preserve_mode()
+        self.preserve_skip_decorative_fast = setting_bool("sealed_media_preserve_skip_decorative_fast", "1")
+        self.sealed_preserve_max_pending_tasks = safe_int(get_setting("sealed_media_preserve_max_pending_tasks", "12"), 12, min_value=1, max_value=1000)
+        self.deferred_blocked_max = safe_int(get_setting("max_blocked_records", "1000"), 1000, min_value=100, max_value=20000)
+        self.log_live_responses = setting_bool("live_response_logging", "0")
+        self.log_blocked_browser_events = setting_bool("live_blocked_event_logging", "0")
         self.asset_cache: dict[str, dict[str, Any]] = {}
         self.asset_bytes_total = 0
         self.asset_skipped = 0
@@ -2284,7 +2840,7 @@ class LiveBrowserSession:
         try:
             from playwright.async_api import async_playwright  # type: ignore
         except Exception as exc:
-            self.error = "Playwright is not installed or browser binaries are missing. Run: python app.py --install-browsers"
+            self.error = "Playwright is not installed or browser binaries are missing. Run: python BlindSite.py --install-browsers"
             execute("UPDATE browser_sessions SET status='error', meta_json=? WHERE session_id=?", (pretty({"error": self.error, "exception": str(exc)}), self.session_id))
             self.ready.set()
             return
@@ -2334,11 +2890,11 @@ class LiveBrowserSession:
                     bypass_csp=False,
                 )
                 await self.context.route("**/*", self._route)
+                self.context.on("page", self._on_new_page)
                 self.page = await self.context.new_page()
-                self.page.on("framenavigated", self._on_frame_nav)
-                self.page.on("response", self._on_response)
+                await self._register_page(self.page, reason="initial")
                 execute("UPDATE browser_sessions SET status='running' WHERE session_id=?", (self.session_id,))
-                log_event(self.actor, "LIVE_SESSION_STARTED", case_id=self.case_id, session_id=self.session_id, details={"browser": self.browser_choice, "use_tor": self.use_tor, "media_policy": self.media_policy, "headless": self.headless, "download_allowed_media": self.download_allowed_media, "sealed_media_preservation": sealed_media_preservation_policy(case_for(self.case_id)), "user_agent_profile": self.user_agent_meta.get("profile"), "user_agent_sha256": self.user_agent_meta.get("user_agent_sha256")})
+                log_event(self.actor, "LIVE_SESSION_STARTED", case_id=self.case_id, session_id=self.session_id, details={"browser": self.browser_choice, "use_tor": self.use_tor, "media_policy": self.media_policy, "headless": self.headless, "download_allowed_media": self.download_allowed_media, "sealed_media_preservation": self.sealed_media_policy_cache, "user_agent_profile": self.user_agent_meta.get("profile"), "user_agent_sha256": self.user_agent_meta.get("user_agent_sha256")})
                 self.ready.set()
                 try:
                     await self.page.goto(self.start_url, wait_until="domcontentloaded", timeout=int(get_setting("live_initial_navigation_timeout_ms", "60000") or "60000"))
@@ -2348,6 +2904,10 @@ class LiveBrowserSession:
                 while not self.stop_flag.is_set():
                     await asyncio.sleep(0.4)
                 try:
+                    await self._flush_deferred_blocked_media(root_evidence_id=None, page_url=self.current_url)
+                except Exception:
+                    pass
+                try:
                     await self.context.close()
                 except Exception:
                     pass
@@ -2356,12 +2916,82 @@ class LiveBrowserSession:
                 except Exception:
                     pass
                 execute("UPDATE browser_sessions SET status='stopped', stopped_at=? WHERE session_id=?", (utcnow(), self.session_id))
-                log_event(self.actor, "LIVE_SESSION_STOPPED", case_id=self.case_id, session_id=self.session_id, details={"requests": self.requests, "blocked": self.blocked, "sealed_preserved": self.sealed_preserved, "sealed_preserved_bytes": self.sealed_preserved_bytes, "sealed_preserve_skipped": self.sealed_preserve_skipped, "current_url": self.current_url})
+                log_event(self.actor, "LIVE_SESSION_STOPPED", case_id=self.case_id, session_id=self.session_id, details={"requests": self.requests, "blocked": self.blocked, "sealed_preserved": self.sealed_preserved, "sealed_preserved_bytes": self.sealed_preserved_bytes, "sealed_preserve_skipped": self.sealed_preserve_skipped, "current_url": self.current_url, "sealed_preserve_timeouts": self.sealed_preserve_timeout_count, "sealed_preserve_pending": len(self.sealed_preserve_bg_tasks)})
         except Exception as exc:
             self.error = str(exc)
             self.ready.set()
             execute("UPDATE browser_sessions SET status='error', meta_json=? WHERE session_id=?", (pretty({"error": str(exc), "traceback": traceback.format_exc(limit=8)}), self.session_id))
             log_event(self.actor, "LIVE_SESSION_ERROR", case_id=self.case_id, session_id=self.session_id, details={"error": str(exc)})
+
+    async def _register_page(self, page, *, reason: str = "") -> None:
+        """Track a Playwright tab/page so manual capture can include more than tab #1."""
+        if page is None:
+            return
+        try:
+            new_page = page not in self.pages
+            if new_page:
+                self.pages.append(page)
+                page.on("framenavigated", lambda frame, p=page: self._on_frame_nav(p, frame))
+                page.on("response", self._on_response)
+                try:
+                    page.on("close", lambda p=page: self._on_page_close(p))
+                except Exception:
+                    pass
+            self.page = page
+            self.active_page = page
+            try:
+                self.current_url = page.url or self.current_url
+                execute("UPDATE browser_sessions SET current_url=? WHERE session_id=?", (self.current_url, self.session_id))
+            except Exception:
+                pass
+            if new_page:
+                execute("INSERT INTO browser_events(session_id,created_at,event_type,url,resource_type,method,status_code,headers_json,header_sha256,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (self.session_id, utcnow(), "tab_tracked", getattr(page, "url", "") or "", "document", "GET", None, "{}", header_hash({}), pretty({"reason": reason, "tracked_tabs": len(self.pages)})))
+        except Exception:
+            pass
+
+    def _on_new_page(self, page) -> None:
+        try:
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(self._register_page(page, reason="new_tab_or_popup"), self.loop)
+        except Exception:
+            pass
+
+    def _on_page_close(self, page=None) -> None:
+        try:
+            self.pages = [p for p in self.pages if p != page and not getattr(p, "is_closed", lambda: False)()]
+            if self.page == page or self.active_page == page:
+                self.page = self.pages[-1] if self.pages else None
+                self.active_page = self.page
+                try:
+                    if self.page is not None:
+                        self.current_url = self.page.url or self.current_url
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _live_pages_snapshot(self) -> list[Any]:
+        out = []
+        candidates = list(self.pages)
+        try:
+            if self.context is not None:
+                for p in list(getattr(self.context, "pages", []) or []):
+                    if p not in candidates:
+                        candidates.append(p)
+        except Exception:
+            pass
+        if self.page is not None and self.page not in candidates:
+            candidates.append(self.page)
+        if self.active_page is not None and self.active_page not in candidates:
+            candidates.append(self.active_page)
+        for p in candidates:
+            try:
+                if not p.is_closed() and p not in out:
+                    out.append(p)
+            except Exception:
+                pass
+        self.pages = out
+        return out
 
     def _cache_asset_response(self, *, url: str, resource_type: str, status_code: int | None, headers: dict[str, Any], body: bytes) -> None:
         if not body:
@@ -2411,7 +3041,7 @@ class LiveBrowserSession:
         if live_policy_blocks(rt, self.media_policy):
             return False
         try:
-            response = await route.fetch(timeout=30000)
+            response = await route.fetch(timeout=preserve_timeout_for(rt, request.url), headers=cleaned_preserve_headers(dict(request.headers or {}), fallback_user_agent=self.user_agent, referer=self.current_url))
             body = await response.body()
             headers = dict(response.headers or {})
             self._cache_asset_response(url=request.url, resource_type=rt, status_code=getattr(response, "status", None), headers=headers, body=body)
@@ -2425,58 +3055,369 @@ class LiveBrowserSession:
                 pass
             return False
 
-    async def _preserve_blocked_media_via_route(self, route, request, logical: str, req_headers: dict[str, Any]) -> tuple[int | None, int | None, str]:
-        """Download a blocked browser media response into encrypted evidence, then keep it blocked from display."""
-        if not self.sealed_media_preservation_session:
-            return None, None, "sealed preservation disabled for this live session"
-        ok, why, pol = sealed_media_preservation_allowed(self.case_id, url=request.url, resource_type=logical, browser_resource_type=(request.resource_type or ""))
-        if not ok:
-            return None, None, why
+    def _sealed_preserve_limits_ok(self, pol: dict[str, Any]) -> tuple[bool, str]:
         if pol.get("max_items_per_session") and self.sealed_preserved >= int(pol.get("max_items_per_session") or 0):
             self.sealed_preserve_skipped += 1
-            return None, None, "sealed preservation skipped: per-session item limit reached"
+            return False, "sealed preservation skipped: per-session item limit reached"
         if pol.get("max_total_bytes") and self.sealed_preserved_bytes >= int(pol.get("max_total_bytes") or 0):
             self.sealed_preserve_skipped += 1
-            return None, None, "sealed preservation skipped: per-session byte limit reached"
-        try:
-            response = await route.fetch(timeout=30000)
-            headers = dict(response.headers or {})
-            mt = (header_get(headers, "Content-Type") or mimetypes.guess_type(request.url)[0] or "application/octet-stream").split(";", 1)[0].strip()
-            content_len_raw = header_get(headers, "Content-Length")
+            return False, "sealed preservation skipped: per-session byte limit reached"
+        max_pending = safe_int(get_setting("sealed_media_preserve_max_pending_tasks", "40"), 40, min_value=1, max_value=1000)
+        if len(self.sealed_preserve_bg_tasks) >= max_pending:
+            self.sealed_preserve_skipped += 1
+            return False, f"sealed preservation skipped: background queue full ({len(self.sealed_preserve_bg_tasks)} >= {max_pending})"
+        return True, "ok"
+
+    def _download_preserved_media_requests(self, media_url: str, headers: dict[str, str], timeout_ms: int, max_each: int) -> dict[str, Any]:
+        sess = request_session(self.use_tor, self.user_agent_profile, self.custom_user_agent)
+        sess.headers.clear()
+        sess.headers.update(headers)
+        timeout_s = max(1.0, float(timeout_ms) / 1000.0)
+        started = time.time()
+        with sess.get(media_url, stream=True, timeout=(min(8.0, timeout_s), timeout_s), allow_redirects=True) as r:
+            response_headers = dict(r.headers or {})
+            mt = (header_get(response_headers, "Content-Type") or mimetypes.guess_type(media_url)[0] or "application/octet-stream").split(";", 1)[0].strip()
+            content_len_raw = header_get(response_headers, "Content-Length")
             content_len = safe_int(content_len_raw, -1, min_value=-1) if content_len_raw not in (None, "") else None
-            ok2, why2, pol = sealed_media_preservation_allowed(self.case_id, url=request.url, resource_type=logical, mime_type=mt, browser_resource_type=(request.resource_type or ""), content_length=content_len)
+            ok2, why2, pol2 = sealed_media_preservation_allowed(self.case_id, url=media_url, resource_type=classify_resource(media_url, mime_type=mt), mime_type=mt, content_length=content_len)
             if not ok2:
-                self.sealed_preserve_skipped += 1
-                bid = record_blocked_media(actor=self.actor, case_id=self.case_id, root_evidence_id=None, session_id=self.session_id, page_url=self.current_url, media_url=request.url, resource_type=logical, request_method=request.method + "+sealed-preserve-skip", referrer=req_headers.get("referer") or self.current_url, policy=self.media_policy, reason=why2, response_headers=headers, request_headers=req_headers, status_code=getattr(response, "status", None), content_type=mt, content_length=content_len_raw, downloaded=False, use_tor=self.use_tor, head_probe=False, user_agent_profile=self.user_agent_profile, custom_user_agent=self.custom_user_agent)
-                return None, bid, why2
-            body = await response.body()
-            if not body:
-                self.sealed_preserve_skipped += 1
-                bid = record_blocked_media(actor=self.actor, case_id=self.case_id, root_evidence_id=None, session_id=self.session_id, page_url=self.current_url, media_url=request.url, resource_type=logical, request_method=request.method + "+sealed-preserve-skip", referrer=req_headers.get("referer") or self.current_url, policy=self.media_policy, reason="sealed preservation skipped: empty response body", response_headers=headers, request_headers=req_headers, status_code=getattr(response, "status", None), content_type=mt, content_length="0", downloaded=False, use_tor=self.use_tor, head_probe=False, user_agent_profile=self.user_agent_profile, custom_user_agent=self.custom_user_agent)
-                return None, bid, "sealed preservation skipped: empty response body"
+                return {"ok": False, "reason": why2, "headers": response_headers, "status_code": r.status_code, "mime_type": mt, "content_length": content_len_raw or ""}
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in r.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if max_each and total > max_each:
+                    return {"ok": False, "reason": f"sealed preservation skipped: response exceeded per-file limit ({total} > {max_each})", "headers": response_headers, "status_code": r.status_code, "mime_type": mt, "content_length": str(total)}
+            body = b"".join(chunks)
+            return {"ok": bool(body), "reason": "ok" if body else "sealed preservation skipped: empty response body", "headers": response_headers, "status_code": r.status_code, "mime_type": mt, "content_length": str(len(body)), "body": body, "final_url": r.url, "elapsed_ms": int((time.time() - started) * 1000)}
+
+    async def _preserve_blocked_media_background(self, *, blocked_media_id: int, media_url: str, logical: str, method: str, req_headers: dict[str, Any], page_url: str, referrer: str) -> None:
+        try:
+            ok, why, pol = sealed_media_preservation_allowed(self.case_id, url=media_url, resource_type=logical)
+            if not ok:
+                execute("UPDATE blocked_media SET reason=? WHERE id=?", (why, blocked_media_id))
+                return
             max_each = int(pol.get("max_each_bytes") or 0)
             max_total = int(pol.get("max_total_bytes") or 0)
-            if max_each and len(body) > max_each:
+            if max_total and self.sealed_preserved_bytes >= max_total:
+                execute("UPDATE blocked_media SET reason=? WHERE id=?", ("sealed preservation skipped: per-session byte limit reached", blocked_media_id))
+                return
+            headers = cleaned_preserve_headers(req_headers, fallback_user_agent=self.user_agent, referer=referrer or page_url)
+            # Carry browser cookies into the background fetch when available. This improves
+            # preservation for authenticated/chat/media pages without keeping the original
+            # Playwright route open.
+            try:
+                if self.context is not None and "cookie" not in headers:
+                    cookies = await self.context.cookies([media_url])
+                    cookie_header = "; ".join(f"{c.get('name')}={c.get('value')}" for c in cookies if c.get("name"))
+                    if cookie_header:
+                        headers["cookie"] = cookie_header
+            except Exception:
+                pass
+            timeout_ms = preserve_timeout_for(logical, media_url, background=True)
+            result = await asyncio.to_thread(self._download_preserved_media_requests, media_url, headers, timeout_ms, max_each)
+            response_headers = dict(result.get("headers") or {})
+            mt = str(result.get("mime_type") or mimetypes.guess_type(media_url)[0] or "application/octet-stream").split(";", 1)[0].strip()
+            status_code = result.get("status_code")
+            if not result.get("ok"):
                 self.sealed_preserve_skipped += 1
-                bid = record_blocked_media(actor=self.actor, case_id=self.case_id, root_evidence_id=None, session_id=self.session_id, page_url=self.current_url, media_url=request.url, resource_type=logical, request_method=request.method + "+sealed-preserve-skip", referrer=req_headers.get("referer") or self.current_url, policy=self.media_policy, reason=f"sealed preservation skipped: response exceeded per-file limit ({len(body)} > {max_each})", response_headers=headers, request_headers=req_headers, status_code=getattr(response, "status", None), content_type=mt, content_length=str(len(body)), downloaded=False, use_tor=self.use_tor, head_probe=False, user_agent_profile=self.user_agent_profile, custom_user_agent=self.custom_user_agent)
-                return None, bid, "sealed preservation skipped: response exceeded per-file limit"
+                reason = str(result.get("reason") or "sealed preservation failed/skipped in background")[:500]
+                execute("""UPDATE blocked_media SET reason=?, status_code=?, content_type=?, content_length=?, headers_json=?, header_sha256=? WHERE id=?""", (reason, status_code, mt, str(result.get("content_length") or ""), json.dumps(response_headers, ensure_ascii=False), header_hash(response_headers), blocked_media_id))
+                log_event(self.actor, "SEALED_BLOCKED_MEDIA_PRESERVE_SKIPPED", case_id=self.case_id, blocked_media_id=blocked_media_id, session_id=self.session_id, details={"media_url_sha256": sha256_text(media_url), "resource_type": logical, "reason": reason})
+                return
+            body = result.get("body") or b""
+            if not isinstance(body, bytes) or not body:
+                self.sealed_preserve_skipped += 1
+                execute("UPDATE blocked_media SET reason=? WHERE id=?", ("sealed preservation skipped: empty response body", blocked_media_id))
+                return
             if max_total and self.sealed_preserved_bytes + len(body) > max_total:
                 self.sealed_preserve_skipped += 1
-                bid = record_blocked_media(actor=self.actor, case_id=self.case_id, root_evidence_id=None, session_id=self.session_id, page_url=self.current_url, media_url=request.url, resource_type=logical, request_method=request.method + "+sealed-preserve-skip", referrer=req_headers.get("referer") or self.current_url, policy=self.media_policy, reason=f"sealed preservation skipped: session byte limit would be exceeded ({self.sealed_preserved_bytes + len(body)} > {max_total})", response_headers=headers, request_headers=req_headers, status_code=getattr(response, "status", None), content_type=mt, content_length=str(len(body)), downloaded=False, use_tor=self.use_tor, head_probe=False, user_agent_profile=self.user_agent_profile, custom_user_agent=self.custom_user_agent)
-                return None, bid, "sealed preservation skipped: session byte limit would be exceeded"
-            logical2 = media_kind_from_resource(url=request.url, resource_type=logical, mime_type=mt, browser_resource_type=(request.resource_type or ""))
-            eid = persist_sealed_preserved_media(actor=self.actor, case_id=self.case_id, session_id=self.session_id, root_evidence_id=None, page_url=self.current_url, media_url=request.url, resource_type=logical2, mime_type=mt, payload=body, request_method=request.method + "+sealed-preserve", referrer=req_headers.get("referer") or self.current_url, request_headers=req_headers, response_headers=headers, status_code=getattr(response, "status", None), reason="blocked from local display by live browser; encrypted for sealed reviewer handoff", source_engine="live_browser", final_url=str(getattr(response, "url", None) or request.url))
-            bid = record_blocked_media(actor=self.actor, case_id=self.case_id, root_evidence_id=None, session_id=self.session_id, page_url=self.current_url, media_url=request.url, resource_type=logical2, request_method=request.method + "+sealed-preserve", referrer=req_headers.get("referer") or self.current_url, policy=self.media_policy, reason="blocked from local display by live browser; encrypted for sealed reviewer handoff", response_headers=headers, request_headers=req_headers, status_code=getattr(response, "status", None), content_type=mt, content_length=str(len(body)), downloaded=True, content_sha256=sha256_bytes(body), use_tor=self.use_tor, head_probe=False, user_agent_profile=self.user_agent_profile, custom_user_agent=self.custom_user_agent)
-            execute("UPDATE blocked_media SET materialized_evidence_id=? WHERE id=?", (eid, bid))
+                reason = f"sealed preservation skipped: session byte limit would be exceeded ({self.sealed_preserved_bytes + len(body)} > {max_total})"
+                execute("UPDATE blocked_media SET reason=?, content_length=? WHERE id=?", (reason, str(len(body)), blocked_media_id))
+                return
+            logical2 = media_kind_from_resource(url=media_url, resource_type=logical, mime_type=mt, browser_resource_type=logical)
+            eid = persist_sealed_preserved_media(actor=self.actor, case_id=self.case_id, session_id=self.session_id, root_evidence_id=None, page_url=page_url, media_url=media_url, resource_type=logical2, mime_type=mt, payload=body, request_method=method + "+sealed-preserve-bg", referrer=referrer or page_url, request_headers=headers, response_headers=response_headers, status_code=status_code, reason="blocked from local display by live browser; background encrypted preservation for sealed reviewer handoff", source_engine="live_browser_background", final_url=str(result.get("final_url") or media_url))
+            execute("""UPDATE blocked_media SET downloaded=1, materialized_evidence_id=?, reason=?, status_code=?, content_type=?, content_length=?, headers_json=?, header_sha256=?, content_sha256=? WHERE id=?""", (eid, "blocked from local display by live browser; background encrypted preservation complete", status_code, mt, str(len(body)), json.dumps(response_headers, ensure_ascii=False), header_hash(response_headers), sha256_bytes(body), blocked_media_id))
             self.sealed_preserved += 1
             self.sealed_preserved_bytes += len(body)
-            return eid, bid, "sealed media preserved encrypted for reviewer handoff"
+            log_event(self.actor, "SEALED_BLOCKED_MEDIA_PRESERVED_BACKGROUND", case_id=self.case_id, evidence_id=eid, blocked_media_id=blocked_media_id, session_id=self.session_id, details={"media_url_sha256": sha256_text(media_url), "resource_type": logical2, "size": len(body), "elapsed_ms": result.get("elapsed_ms")})
         except Exception as exc:
             self.sealed_preserve_skipped += 1
-            bid = record_blocked_media(actor=self.actor, case_id=self.case_id, root_evidence_id=None, session_id=self.session_id, page_url=self.current_url, media_url=request.url, resource_type=logical, request_method=request.method + "+sealed-preserve-failed", referrer=req_headers.get("referer") or self.current_url, policy=self.media_policy, reason=f"sealed preservation failed: {str(exc)[:500]}", request_headers=req_headers, use_tor=self.use_tor, head_probe=False, user_agent_profile=self.user_agent_profile, custom_user_agent=self.custom_user_agent)
-            log_event(self.actor, "SEALED_BLOCKED_MEDIA_PRESERVE_FAILED", case_id=self.case_id, blocked_media_id=bid, session_id=self.session_id, details={"media_url_sha256": sha256_text(request.url), "resource_type": logical, "error": str(exc)[:500]})
-            return None, bid, f"sealed preservation failed: {exc}"
+            if "timeout" in str(exc).lower():
+                self.sealed_preserve_timeout_count += 1
+            reason = f"sealed preservation failed in background: {str(exc)[:450]}"
+            try:
+                execute("UPDATE blocked_media SET reason=? WHERE id=?", (reason, blocked_media_id))
+            except Exception:
+                pass
+            log_event(self.actor, "SEALED_BLOCKED_MEDIA_PRESERVE_FAILED", case_id=self.case_id, blocked_media_id=blocked_media_id, session_id=self.session_id, details={"media_url_sha256": sha256_text(media_url), "resource_type": logical, "error": str(exc)[:500]})
 
+    async def _drain_sealed_preservation_tasks(self, max_wait_ms: int | None = None) -> dict[str, Any]:
+        tasks = [t for t in list(self.sealed_preserve_bg_tasks) if not t.done()]
+        if not tasks:
+            return {"pending_before": 0, "pending_after": 0, "waited_ms": 0}
+        timeout = max(0.0, float(max_wait_ms if max_wait_ms is not None else safe_int(get_setting("sealed_media_preserve_flush_before_capture_ms", "3000"), 3000, min_value=0)) / 1000.0)
+        started = time.time()
+        if timeout > 0:
+            try:
+                await asyncio.wait(tasks, timeout=timeout)
+            except Exception:
+                pass
+        pending_after = len([t for t in list(self.sealed_preserve_bg_tasks) if not t.done()])
+        return {"pending_before": len(tasks), "pending_after": pending_after, "waited_ms": int((time.time() - started) * 1000)}
+
+    def _sealed_preserve_allowed_fast(self, *, media_url: str, logical: str, browser_resource_type: str = "") -> tuple[bool, str, dict[str, Any]]:
+        """Fast, cached preservation check for the hot Playwright route path.
+
+        This intentionally avoids database/settings reads while a page is loading.
+        Full MIME/length validation still happens later in the background worker
+        after headers are available.
+        """
+        pol = self.sealed_media_policy_cache or {}
+        if not self.sealed_media_preservation_session:
+            return False, "sealed preservation disabled for this live session", pol
+        if not pol.get("enabled"):
+            return False, "sealed media preservation disabled by policy", pol
+        kind = media_kind_from_resource(url=media_url, resource_type=logical, browser_resource_type=browser_resource_type)
+        if kind == "image" and not pol.get("images"):
+            return False, "sealed preservation disabled for images", pol
+        if kind == "video" and not pol.get("video"):
+            return False, "sealed preservation disabled for video", pol
+        if kind == "audio" and not pol.get("audio"):
+            return False, "sealed preservation disabled for audio", pol
+        if kind == "media" and not (pol.get("video") or pol.get("audio")):
+            return False, "sealed preservation disabled for media", pol
+        if kind not in {"image", "video", "audio", "media"}:
+            return False, f"resource type {kind!r} is not configured for preservation", pol
+        return True, "sealed preservation allowed", pol
+
+    def _defer_blocked_media_record(self, *, media_url: str, logical: str, method: str, req_headers: dict[str, Any], page_url: str, reason: str) -> None:
+        """Keep blocked-media metadata in memory so route handling stays fast.
+
+        Records are written in a batch at capture/stop time instead of one SQLite
+        write per blocked image while the page is trying to load.
+        """
+        if not media_url:
+            return
+        key = sha256_text("|".join([self.session_id, page_url or "", method or "", logical or "", media_url]))
+        with self.deferred_blocked_lock:
+            if key in self.deferred_blocked_seen:
+                return
+            if len(self.deferred_blocked_media) >= self.deferred_blocked_max:
+                self.deferred_blocked_dropped += 1
+                return
+            self.deferred_blocked_seen.add(key)
+            self.deferred_blocked_media.append({
+                "media_url": media_url,
+                "logical": logical,
+                "method": method or "GET",
+                "page_url": page_url or self.current_url,
+                "referrer": (req_headers or {}).get("referer") or page_url or self.current_url,
+                "request_headers": cleaned_preserve_headers(req_headers or {}, fallback_user_agent=self.user_agent, referer=page_url or self.current_url),
+                "reason": reason[:500],
+            })
+
+    def _flush_deferred_blocked_media_sync(self, *, root_evidence_id: int | None = None, page_url: str | None = None, limit: int | None = None) -> dict[str, Any]:
+        with self.deferred_blocked_lock:
+            if not self.deferred_blocked_media:
+                return {"flushed": 0, "remaining": 0, "dropped": self.deferred_blocked_dropped}
+            take = len(self.deferred_blocked_media) if limit is None else max(0, min(int(limit), len(self.deferred_blocked_media)))
+            items = self.deferred_blocked_media[:take]
+            self.deferred_blocked_media = self.deferred_blocked_media[take:]
+        flushed = 0
+        for item in items:
+            try:
+                record_blocked_media(
+                    actor=self.actor,
+                    case_id=self.case_id,
+                    root_evidence_id=root_evidence_id,
+                    session_id=self.session_id,
+                    page_url=page_url or item.get("page_url") or self.current_url,
+                    media_url=item.get("media_url") or "",
+                    resource_type=item.get("logical") or "media",
+                    request_method=item.get("method") or "GET",
+                    referrer=item.get("referrer") or page_url or self.current_url,
+                    policy=self.media_policy,
+                    reason=item.get("reason") or "aborted by live browser before body download",
+                    request_headers=item.get("request_headers") or {},
+                    use_tor=self.use_tor,
+                    head_probe=False,
+                    user_agent_profile=self.user_agent_profile,
+                    custom_user_agent=self.custom_user_agent,
+                )
+                flushed += 1
+            except Exception:
+                pass
+        with self.sealed_preserve_lock:
+            self.deferred_blocked_flushed += flushed
+        return {"flushed": flushed, "remaining": len(self.deferred_blocked_media), "dropped": self.deferred_blocked_dropped}
+
+    async def _flush_deferred_blocked_media(self, *, root_evidence_id: int | None = None, page_url: str | None = None, limit: int | None = None) -> dict[str, Any]:
+        return await asyncio.to_thread(self._flush_deferred_blocked_media_sync, root_evidence_id=root_evidence_id, page_url=page_url, limit=limit)
+
+    def _preserve_blocked_media_background_sync(self, item: dict[str, Any]) -> dict[str, Any]:
+        if self.sealed_preserve_cancel_requested.is_set():
+            with self.sealed_preserve_lock:
+                self.sealed_preserve_cancelled += 1
+            return {"ok": False, "reason": "sealed preservation canceled by user"}
+        media_url = item.get("media_url") or ""
+        logical = item.get("logical") or "media"
+        method = item.get("method") or "GET"
+        page_url = item.get("page_url") or self.current_url
+        referrer = item.get("referrer") or page_url
+        headers = item.get("request_headers") or {}
+        try:
+            pol = self.sealed_media_policy_cache or {}
+            max_each = int(pol.get("max_each_bytes") or 0)
+            max_total = int(pol.get("max_total_bytes") or 0)
+            with self.sealed_preserve_lock:
+                if max_total and self.sealed_preserved_bytes >= max_total:
+                    raise RuntimeError("sealed preservation skipped: per-session byte limit reached")
+            timeout_ms = preserve_timeout_for(logical, media_url, background=True)
+            result = self._download_preserved_media_requests(media_url, headers, timeout_ms, max_each)
+            if not result.get("ok"):
+                reason = str(result.get("reason") or "sealed preservation failed/skipped in background")[:500]
+                bid = record_blocked_media(actor=self.actor, case_id=self.case_id, root_evidence_id=None, session_id=self.session_id, page_url=page_url, media_url=media_url, resource_type=logical, request_method=method + "+sealed-preserve-bg-failed", referrer=referrer, policy=self.media_policy, reason=reason, request_headers=headers, response_headers=dict(result.get("headers") or {}), status_code=result.get("status_code"), content_type=result.get("mime_type"), content_length=str(result.get("content_length") or ""), downloaded=False, use_tor=self.use_tor, head_probe=False, user_agent_profile=self.user_agent_profile, custom_user_agent=self.custom_user_agent)
+                with self.sealed_preserve_lock:
+                    self.sealed_preserve_skipped += 1
+                    if "timeout" in reason.lower():
+                        self.sealed_preserve_timeout_count += 1
+                return {"ok": False, "blocked_media_id": bid, "reason": reason}
+            body = result.get("body") or b""
+            if not isinstance(body, bytes) or not body:
+                raise RuntimeError("sealed preservation skipped: empty response body")
+            with self.sealed_preserve_lock:
+                if max_total and self.sealed_preserved_bytes + len(body) > max_total:
+                    raise RuntimeError(f"sealed preservation skipped: session byte limit would be exceeded ({self.sealed_preserved_bytes + len(body)} > {max_total})")
+            response_headers = dict(result.get("headers") or {})
+            status_code = result.get("status_code")
+            mt = str(result.get("mime_type") or mimetypes.guess_type(media_url)[0] or "application/octet-stream").split(";", 1)[0]
+            logical2 = media_kind_from_resource(url=media_url, resource_type=logical, mime_type=mt, browser_resource_type=logical)
+            eid = persist_sealed_preserved_media(actor=self.actor, case_id=self.case_id, session_id=self.session_id, root_evidence_id=None, page_url=page_url, media_url=media_url, resource_type=logical2, mime_type=mt, payload=body, request_method=method + "+sealed-preserve-bg", referrer=referrer, request_headers=headers, response_headers=response_headers, status_code=status_code, reason="blocked from local display by live browser; background encrypted preservation for sealed reviewer handoff", source_engine="live_browser_background_fast_route", final_url=str(result.get("final_url") or media_url))
+            bid = record_blocked_media(actor=self.actor, case_id=self.case_id, root_evidence_id=None, session_id=self.session_id, page_url=page_url, media_url=media_url, resource_type=logical2, request_method=method + "+sealed-preserve-bg", referrer=referrer, policy=self.media_policy, reason="blocked from local display by live browser; background encrypted preservation complete", request_headers=headers, response_headers=response_headers, status_code=status_code, content_type=mt, content_length=str(len(body)), downloaded=True, content_sha256=sha256_bytes(body), use_tor=self.use_tor, head_probe=False, user_agent_profile=self.user_agent_profile, custom_user_agent=self.custom_user_agent)
+            execute("UPDATE blocked_media SET materialized_evidence_id=? WHERE id=?", (eid, bid))
+            with self.sealed_preserve_lock:
+                self.sealed_preserved += 1
+                self.sealed_preserved_bytes += len(body)
+            log_event(self.actor, "SEALED_BLOCKED_MEDIA_PRESERVED_BACKGROUND", case_id=self.case_id, evidence_id=eid, blocked_media_id=bid, session_id=self.session_id, details={"media_url_sha256": sha256_text(media_url), "resource_type": logical2, "size": len(body), "elapsed_ms": result.get("elapsed_ms"), "fast_live_route": True})
+            return {"ok": True, "evidence_id": eid, "blocked_media_id": bid, "size": len(body)}
+        except Exception as exc:
+            reason = f"sealed preservation failed in background: {str(exc)[:450]}"
+            try:
+                bid = record_blocked_media(actor=self.actor, case_id=self.case_id, root_evidence_id=None, session_id=self.session_id, page_url=page_url, media_url=media_url, resource_type=logical, request_method=method + "+sealed-preserve-bg-error", referrer=referrer, policy=self.media_policy, reason=reason, request_headers=headers, use_tor=self.use_tor, head_probe=False, user_agent_profile=self.user_agent_profile, custom_user_agent=self.custom_user_agent)
+            except Exception:
+                bid = None
+            with self.sealed_preserve_lock:
+                self.sealed_preserve_skipped += 1
+                if "timeout" in str(exc).lower():
+                    self.sealed_preserve_timeout_count += 1
+            log_event(self.actor, "SEALED_BLOCKED_MEDIA_PRESERVE_FAILED", case_id=self.case_id, blocked_media_id=bid, session_id=self.session_id, details={"media_url_sha256": sha256_text(media_url), "resource_type": logical, "error": str(exc)[:500], "fast_live_route": True})
+            return {"ok": False, "blocked_media_id": bid, "reason": reason}
+
+    async def _preserve_blocked_media_background_fast(self, item: dict[str, Any]) -> None:
+        await asyncio.to_thread(self._preserve_blocked_media_background_sync, item)
+
+    def _queue_blocked_preservation_fast(self, *, media_url: str, logical: str, method: str, req_headers: dict[str, Any], page_url: str, browser_resource_type: str = "") -> str:
+        if self.sealed_preserve_cancel_requested.is_set():
+            with self.sealed_preserve_lock:
+                self.sealed_preserve_cancelled += 1
+            self._defer_blocked_media_record(media_url=media_url, logical=logical, method=method, req_headers=req_headers, page_url=page_url, reason="sealed preservation canceled by user")
+            return "sealed preservation canceled by user"
+        ok, why, pol = self._sealed_preserve_allowed_fast(media_url=media_url, logical=logical, browser_resource_type=browser_resource_type)
+        if not ok:
+            self._defer_blocked_media_record(media_url=media_url, logical=logical, method=method, req_headers=req_headers, page_url=page_url, reason="aborted by live browser before body download; " + why)
+            return why
+        if pol.get("max_items_per_session") and self.sealed_preserved >= int(pol.get("max_items_per_session") or 0):
+            with self.sealed_preserve_lock:
+                self.sealed_preserve_skipped += 1
+            self._defer_blocked_media_record(media_url=media_url, logical=logical, method=method, req_headers=req_headers, page_url=page_url, reason="sealed preservation skipped: per-session item limit reached")
+            return "sealed preservation skipped: per-session item limit reached"
+        if pol.get("max_total_bytes") and self.sealed_preserved_bytes >= int(pol.get("max_total_bytes") or 0):
+            with self.sealed_preserve_lock:
+                self.sealed_preserve_skipped += 1
+            self._defer_blocked_media_record(media_url=media_url, logical=logical, method=method, req_headers=req_headers, page_url=page_url, reason="sealed preservation skipped: per-session byte limit reached")
+            return "sealed preservation skipped: per-session byte limit reached"
+        if len(self.sealed_preserve_bg_tasks) >= self.sealed_preserve_max_pending_tasks:
+            with self.sealed_preserve_lock:
+                self.sealed_preserve_skipped += 1
+            self._defer_blocked_media_record(media_url=media_url, logical=logical, method=method, req_headers=req_headers, page_url=page_url, reason=f"sealed preservation skipped: background queue full ({len(self.sealed_preserve_bg_tasks)} >= {self.sealed_preserve_max_pending_tasks})")
+            return "sealed preservation skipped: background queue full"
+        if self.preserve_mode == "fast" and self.preserve_skip_decorative_fast and decorative_asset_url(media_url):
+            with self.sealed_preserve_lock:
+                self.sealed_preserve_skipped += 1
+            self._defer_blocked_media_record(media_url=media_url, logical=logical, method=method + "+sealed-preserve-skip", req_headers=req_headers, page_url=page_url, reason="sealed preservation skipped in fast mode: decorative asset")
+            return "sealed preservation skipped in fast mode: decorative asset"
+        clean_headers = cleaned_preserve_headers(req_headers, fallback_user_agent=self.user_agent, referer=req_headers.get("referer") or page_url or self.current_url)
+        item = {"media_url": media_url, "logical": logical, "method": method, "request_headers": clean_headers, "page_url": page_url or self.current_url, "referrer": req_headers.get("referer") or page_url or self.current_url}
+        try:
+            task = asyncio.create_task(self._preserve_blocked_media_background_fast(item))
+            self.sealed_preserve_bg_tasks.add(task)
+            task.add_done_callback(lambda t: self.sealed_preserve_bg_tasks.discard(t))
+            return "sealed preservation queued in background; route returned immediately"
+        except Exception as exc:
+            self._defer_blocked_media_record(media_url=media_url, logical=logical, method=method, req_headers=req_headers, page_url=page_url, reason=f"sealed preservation queue failed: {str(exc)[:300]}")
+            return "sealed preservation queue failed"
+
+    def preservation_status(self) -> dict[str, Any]:
+        """Return lightweight live media-preservation progress for UI polling."""
+        with self.sealed_preserve_lock:
+            pending = len([t for t in list(self.sealed_preserve_bg_tasks) if not t.done()])
+            preserved = int(self.sealed_preserved)
+            skipped = int(self.sealed_preserve_skipped)
+            cancelled = int(self.sealed_preserve_cancelled)
+            timeouts = int(self.sealed_preserve_timeout_count)
+            bytes_done = int(self.sealed_preserved_bytes)
+        with self.deferred_blocked_lock:
+            deferred_pending = len(self.deferred_blocked_media)
+            deferred_dropped = int(self.deferred_blocked_dropped)
+        total_seen = max(0, preserved + skipped + cancelled + pending + deferred_pending)
+        complete = max(0, preserved + skipped + cancelled)
+        pct = int((complete / total_seen) * 100) if total_seen else 100
+        return {
+            "ok": True,
+            "session_id": self.session_id,
+            "running": bool(self.loop is not None and not self.loop.is_closed() and not self.stop_flag.is_set()),
+            "mode": self.preserve_mode,
+            "policy": self.sealed_media_policy_cache,
+            "requests": int(self.requests),
+            "blocked": int(self.blocked),
+            "pending_tasks": pending,
+            "deferred_metadata_pending": deferred_pending,
+            "deferred_metadata_flushed": int(self.deferred_blocked_flushed),
+            "deferred_metadata_dropped": deferred_dropped,
+            "preserved": preserved,
+            "preserved_bytes": bytes_done,
+            "skipped_or_failed": skipped,
+            "timeouts": timeouts,
+            "cancelled": cancelled,
+            "queue_limit": int(self.sealed_preserve_max_pending_tasks),
+            "cancel_requested": bool(self.sealed_preserve_cancel_requested.is_set()),
+            "progress_percent": max(0, min(100, pct)),
+        }
+
+    def cancel_preservation_sync(self) -> dict[str, Any]:
+        """Cancel queued preservation work without stopping the live browser.
+
+        Active thread downloads may finish anyway, but no new blocked media will be
+        queued after this flag is set. This is intentionally coarse-grained;
+        per-item cancellation would add a lot of UI/state complexity for little
+        benefit in the current workflow.
+        """
+        self.sealed_preserve_cancel_requested.set()
+        cancelled = 0
+        for task in list(self.sealed_preserve_bg_tasks):
+            if not task.done():
+                try:
+                    task.cancel()
+                    cancelled += 1
+                except Exception:
+                    pass
+        with self.sealed_preserve_lock:
+            self.sealed_preserve_cancelled += cancelled
+        return self.preservation_status()
 
     async def _route(self, route, request) -> None:
         self.requests += 1
@@ -2486,10 +3427,9 @@ class LiveBrowserSession:
             self.blocked += 1
             logical = classify_resource(request.url, browser_type=rt)
             try:
-                preserved_eid, recorded_bid, preserve_note = await self._preserve_blocked_media_via_route(route, request, logical, req_headers)
-                if not recorded_bid:
-                    recorded_bid = record_blocked_media(actor=self.actor, case_id=self.case_id, root_evidence_id=None, session_id=self.session_id, page_url=self.current_url, media_url=request.url, resource_type=logical, request_method=request.method, referrer=req_headers.get("referer") or self.current_url, policy=self.media_policy, reason="aborted by live browser before body download; " + preserve_note, request_headers=req_headers, use_tor=self.use_tor, head_probe=False, user_agent_profile=self.user_agent_profile, custom_user_agent=self.custom_user_agent)
-                execute("INSERT INTO browser_events(session_id,created_at,event_type,url,resource_type,method,status_code,headers_json,header_sha256,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (self.session_id, utcnow(), "blocked_request", request.url, logical, request.method, None, json.dumps(req_headers, ensure_ascii=False), header_hash(req_headers), pretty({"reason": "media policy pre-body abort", "sealed_preservation": preserve_note, "preserved_evidence_id": preserved_eid, "blocked_media_id": recorded_bid})))
+                self._queue_blocked_preservation_fast(media_url=request.url, logical=logical, method=request.method, req_headers=req_headers, page_url=self.current_url, browser_resource_type=rt)
+                if self.log_blocked_browser_events:
+                    execute("INSERT INTO browser_events(session_id,created_at,event_type,url,resource_type,method,status_code,headers_json,header_sha256,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (self.session_id, utcnow(), "blocked_request", request.url, logical, request.method, None, "{}", header_hash({}), pretty({"reason": "media policy pre-body abort", "fast_live_route": True})))
             except Exception:
                 pass
             await route.abort()
@@ -2498,18 +3438,22 @@ class LiveBrowserSession:
             return
         await route.continue_()
 
-    def _on_frame_nav(self, frame) -> None:
+    def _on_frame_nav(self, page, frame) -> None:
         try:
-            if frame == self.page.main_frame:
+            if page is not None and frame == page.main_frame:
+                self.page = page
+                self.active_page = page
                 self.current_url = frame.url
                 execute("UPDATE browser_sessions SET current_url=? WHERE session_id=?", (self.current_url, self.session_id))
-                execute("INSERT INTO browser_events(session_id,created_at,event_type,url,resource_type,method,status_code,headers_json,header_sha256,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (self.session_id, utcnow(), "navigation", self.current_url, "document", "GET", None, "{}", header_hash({}), pretty({"auto_capture_enabled": self.auto_capture})))
+                execute("INSERT INTO browser_events(session_id,created_at,event_type,url,resource_type,method,status_code,headers_json,header_sha256,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (self.session_id, utcnow(), "navigation", self.current_url, "document", "GET", None, "{}", header_hash({}), pretty({"auto_capture_enabled": self.auto_capture, "tab_count": len(self._live_pages_snapshot()), "chat_capture_profile": chat_profile_url(self.current_url)})))
                 if self.auto_capture and self.loop:
-                    asyncio.run_coroutine_threadsafe(self._auto_capture_after_navigation(self.current_url), self.loop)
+                    asyncio.run_coroutine_threadsafe(self._auto_capture_after_navigation(self.current_url, page), self.loop)
         except Exception:
             pass
 
     def _on_response(self, resp) -> None:
+        if not self.log_live_responses:
+            return
         async def inner():
             try:
                 req = resp.request
@@ -2518,12 +3462,12 @@ class LiveBrowserSession:
             except Exception:
                 pass
         try:
-            if self.loop:
+            if self.loop and not self.loop.is_closed():
                 asyncio.run_coroutine_threadsafe(inner(), self.loop)
         except Exception:
             pass
 
-    async def _settle_page_for_capture(self) -> dict[str, Any]:
+    async def _settle_page_for_capture(self, page=None) -> dict[str, Any]:
         """Wait for slow/lazy content before manual or automatic page capture.
 
         This deliberately avoids a single brittle wait. It combines load-state waits,
@@ -2531,8 +3475,11 @@ class LiveBrowserSession:
         document-height stability checks. Long-polling pages can keep networkidle
         from completing, so timeouts are treated as warnings rather than failures.
         """
-        meta: dict[str, Any] = {"settle_enabled": self.settle_before_capture and setting_bool("capture_settle_before_save", "1")}
-        if not meta["settle_enabled"] or self.page is None:
+        page = page or self.page
+        page_url = getattr(page, "url", "") or ""
+        chat_profile = chat_profile_url(page_url)
+        meta: dict[str, Any] = {"settle_enabled": self.settle_before_capture and setting_bool("capture_settle_before_save", "1"), "chat_dynamic_profile": chat_profile}
+        if not meta["settle_enabled"] or page is None:
             return meta
         started = time.time()
         timeout_ms = max(1000, int(get_setting("capture_settle_timeout_ms", "30000") or "30000"))
@@ -2541,13 +3488,26 @@ class LiveBrowserSession:
         pause_ms = max(100, int(get_setting("capture_auto_scroll_pause_ms", "550") or "550"))
         max_steps = max(0, int(get_setting("capture_auto_scroll_max_steps", "30") or "30"))
         stable_rounds_required = max(1, int(get_setting("capture_stable_rounds", "3") or "3"))
+        if chat_profile:
+            timeout_ms = min(timeout_ms, max(2000, int(get_setting("capture_chat_settle_timeout_ms", "10000") or "10000")))
+            network_idle_ms = min(network_idle_ms, max(500, int(get_setting("capture_chat_network_idle_timeout_ms", "1200") or "1200")))
+            wait_after_ms = min(wait_after_ms, max(0, int(get_setting("capture_chat_wait_after_load_ms", "500") or "500")))
+            max_steps = min(max_steps, max(0, int(get_setting("capture_chat_auto_scroll_max_steps", "8") or "8")))
+            stable_rounds_required = min(stable_rounds_required, 2)
+            pause_ms = min(pause_ms, 300)
         auto_scroll = setting_bool("capture_auto_scroll_enabled", "1")
         warnings: list[str] = []
         if wait_after_ms:
             await asyncio.sleep(wait_after_ms / 1000)
-        for state, state_timeout in [("domcontentloaded", min(timeout_ms, 10000)), ("load", min(timeout_ms, 12000)), ("networkidle", min(timeout_ms, network_idle_ms))]:
+        wait_states = [("domcontentloaded", min(timeout_ms, 5000 if chat_profile else 10000))]
+        if not chat_profile:
+            wait_states.extend([("load", min(timeout_ms, 12000)), ("networkidle", min(timeout_ms, network_idle_ms))])
+        else:
+            meta["wait_load"] = "skipped_for_chat_dynamic_profile"
+            meta["wait_networkidle"] = "skipped_for_chat_dynamic_profile"
+        for state, state_timeout in wait_states:
             try:
-                await self.page.wait_for_load_state(state, timeout=state_timeout)
+                await page.wait_for_load_state(state, timeout=state_timeout)
                 meta[f"wait_{state}"] = "ok"
             except Exception as exc:
                 meta[f"wait_{state}"] = "timeout_or_unavailable"
@@ -2558,11 +3518,11 @@ class LiveBrowserSession:
         if auto_scroll:
             while steps < max_steps and (time.time() - started) * 1000 < timeout_ms:
                 try:
-                    height = int(await self.page.evaluate("() => Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0, window.innerHeight || 0)"))
-                    await self.page.evaluate("(y) => window.scrollTo(0, y)", height)
+                    height = int(await page.evaluate("() => Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0, window.innerHeight || 0)"))
+                    await page.evaluate("(y) => window.scrollTo(0, y)", height)
                     await asyncio.sleep(pause_ms / 1000)
-                    new_height = int(await self.page.evaluate("() => Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0, window.innerHeight || 0)"))
-                    ready_state = str(await self.page.evaluate("() => document.readyState"))
+                    new_height = int(await page.evaluate("() => Math.max(document.body ? document.body.scrollHeight : 0, document.documentElement ? document.documentElement.scrollHeight : 0, window.innerHeight || 0)"))
+                    ready_state = str(await page.evaluate("() => document.readyState"))
                     if new_height == last_height and ready_state in {"interactive", "complete"}:
                         stable_rounds += 1
                     else:
@@ -2575,7 +3535,7 @@ class LiveBrowserSession:
                     warnings.append(f"scroll/stability: {str(exc)[:180]}")
                     break
             try:
-                await self.page.evaluate("() => window.scrollTo(0, 0)")
+                await page.evaluate("() => window.scrollTo(0, 0)")
             except Exception:
                 pass
         meta.update({
@@ -2587,12 +3547,12 @@ class LiveBrowserSession:
             "warnings": warnings[:10],
         })
         try:
-            execute("INSERT INTO browser_events(session_id,created_at,event_type,url,resource_type,method,status_code,headers_json,header_sha256,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (self.session_id, utcnow(), "capture_settle_completed", self.page.url, "document", "GET", None, "{}", header_hash({}), pretty(meta)))
+            execute("INSERT INTO browser_events(session_id,created_at,event_type,url,resource_type,method,status_code,headers_json,header_sha256,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (self.session_id, utcnow(), "capture_settle_completed", getattr(page, "url", "") or page_url, "document", "GET", None, "{}", header_hash({}), pretty(meta)))
         except Exception:
             pass
         return meta
 
-    async def _auto_capture_after_navigation(self, nav_url: str) -> None:
+    async def _auto_capture_after_navigation(self, nav_url: str, page=None) -> None:
         if not self.auto_capture or self.page is None:
             return
         try:
@@ -2601,27 +3561,29 @@ class LiveBrowserSession:
                 await asyncio.sleep(delay_ms / 1000)
             if self.stop_flag.is_set() or self.page is None:
                 return
-            current = self.page.url or nav_url
+            target_page = page or self.page
+            current = (getattr(target_page, "url", "") if target_page is not None else "") or nav_url
             key = sha256_text(current)
             with self.auto_capture_lock:
                 if key in self.auto_capture_seen:
                     return
                 self.auto_capture_seen.add(key)
-            eid = await self._capture_current(auto=True)
+            eid = await self._capture_current(auto=True, page=target_page)
             log_event(self.actor, "LIVE_AUTO_CAPTURE_COMPLETED", case_id=self.case_id, evidence_id=eid, session_id=self.session_id, details={"url_sha256": key})
         except Exception as exc:
             log_event(self.actor, "LIVE_AUTO_CAPTURE_FAILED", case_id=self.case_id, session_id=self.session_id, details={"url_sha256": sha256_text(nav_url or ""), "error": str(exc)[:500]})
 
-    async def _collect_page_media_refs(self) -> list[dict[str, Any]]:
+    async def _collect_page_media_refs(self, page=None) -> list[dict[str, Any]]:
         """Collect dynamic/lazy media references from the live DOM before saving.
 
         This catches currentSrc/srcset/poster/background/meta image values that may
         not be visible in static HTML until JavaScript has hydrated the page.
         """
-        if self.page is None:
+        page = page or self.page
+        if page is None:
             return []
         try:
-            refs = await self.page.evaluate("""() => {
+            refs = await page.evaluate("""() => {
                 const out = [];
                 const add = (url, tag, attr) => {
                     if (!url || typeof url !== 'string') return;
@@ -2663,7 +3625,7 @@ class LiveBrowserSession:
             }""")
             if isinstance(refs, list):
                 normalized = []
-                page_url = self.page.url
+                page_url = page.url
                 for r in refs:
                     if isinstance(r, dict) and r.get("url"):
                         rr = dict(r)
@@ -2677,20 +3639,93 @@ class LiveBrowserSession:
                 pass
         return []
 
-    async def _capture_current(self, auto: bool = False) -> int:
-        if self.page is None:
+    async def _prepare_dom_for_capture_snapshot(self, page=None) -> dict[str, Any]:
+        """Annotate dynamic DOM state before page.content() for chat/forms/media pages.
+
+        This keeps manual captures useful after a long chat by preserving current
+        input values, textarea text, selected options, currentSrc/poster values,
+        scroll positions, and javascript:void link counts in the saved DOM/metadata.
+        """
+        page = page or self.page
+        if page is None:
+            return {}
+        try:
+            data = await page.evaluate("""() => {
+                const out = {javascript_void_links: 0, inputs: 0, textareas: 0, media: 0, scrollables: 0};
+                for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+                    const href = a.getAttribute('href') || '';
+                    if (/^javascript:\\s*void/i.test(href) || href.trim() === '#') {
+                        a.setAttribute('data-blindsite-original-href', href);
+                        a.setAttribute('data-blindsite-nonnavigational-link', '1');
+                        out.javascript_void_links++;
+                    }
+                }
+                for (const el of Array.from(document.querySelectorAll('input, textarea, select'))) {
+                    const tag = el.tagName.toLowerCase();
+                    if (tag === 'textarea') {
+                        el.textContent = el.value || '';
+                        el.setAttribute('data-blindsite-value-captured', el.value || '');
+                        out.textareas++;
+                    } else if (tag === 'select') {
+                        for (const opt of Array.from(el.options || [])) {
+                            if (opt.selected) opt.setAttribute('selected', 'selected');
+                            else opt.removeAttribute('selected');
+                        }
+                        out.inputs++;
+                    } else {
+                        const typ = (el.getAttribute('type') || '').toLowerCase();
+                        if (typ === 'password') {
+                            el.setAttribute('data-blindsite-password-present', el.value ? '1' : '0');
+                        } else if (typ === 'checkbox' || typ === 'radio') {
+                            if (el.checked) el.setAttribute('checked', 'checked');
+                            else el.removeAttribute('checked');
+                        } else {
+                            el.setAttribute('value', el.value || '');
+                        }
+                        out.inputs++;
+                    }
+                }
+                for (const el of Array.from(document.querySelectorAll('img,video,audio,source'))) {
+                    if (el.currentSrc) el.setAttribute('data-blindsite-current-src', el.currentSrc);
+                    if (el.src) el.setAttribute('data-blindsite-src', el.src);
+                    if (el.poster) el.setAttribute('data-blindsite-poster', el.poster);
+                    out.media++;
+                }
+                const scrollables = Array.from(document.querySelectorAll('body, html, div, main, section, article, ul, ol'))
+                  .filter(el => (el.scrollHeight || 0) > (el.clientHeight || 0) + 20 || (el.scrollWidth || 0) > (el.clientWidth || 0) + 20)
+                  .slice(0, 200);
+                for (const el of scrollables) {
+                    el.setAttribute('data-blindsite-scroll-top', String(el.scrollTop || 0));
+                    el.setAttribute('data-blindsite-scroll-left', String(el.scrollLeft || 0));
+                    out.scrollables++;
+                }
+                return out;
+            }""")
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            return {"error": str(exc)[:300]}
+
+    async def _capture_current(self, auto: bool = False, page=None) -> int:
+        page = page or self.page
+        if page is None:
             raise HTTPException(409, "Session page is not ready")
-        url = self.page.url
+        self.page = page
+        url = page.url
+        self.current_url = url
         case = case_for(self.case_id)
         safe = case_safe(case)
-        settle_meta = await self._settle_page_for_capture()
+        settle_meta = await self._settle_page_for_capture(page)
+        # Critical performance rule: save the page first. Media preservation is
+        # background work and must never delay or prevent the page capture itself.
+        preserve_flush_meta = {"pending_before": len([t for t in list(self.sealed_preserve_bg_tasks) if not t.done()]), "pending_after": len([t for t in list(self.sealed_preserve_bg_tasks) if not t.done()]), "waited_ms": 0, "page_saved_before_media_flush": True}
         title = ""
         try:
-            title = await self.page.title()
+            title = await page.title()
         except Exception:
             pass
-        html_text = await self.page.content()
-        dynamic_media_refs = await self._collect_page_media_refs()
+        dom_snapshot_meta = await self._prepare_dom_for_capture_snapshot(page)
+        html_text = await page.content()
+        dynamic_media_refs = await self._collect_page_media_refs(page)
         html_media_refs = extract_media_refs(url, html_text)
         combined_media_refs = html_media_refs + dynamic_media_refs
         inline_refs = [r for r in combined_media_refs if r.get("inline")]
@@ -2707,16 +3742,37 @@ class LiveBrowserSession:
             if safe and inline_refs and setting_bool("reject_inline_media_in_safe_mode", "1"):
                 summary["text"] = "Inline embedded media detected; sanitized DOM text was minimized by safe-mode policy."
                 summary["inline_media_count"] = len(inline_refs)
-            meta = {"session_id": self.session_id, "current_url": url, "current_url_sha256": sha256_text(url), "title": title, "browser": self.browser_choice, "use_tor": self.use_tor, "media_policy": self.media_policy, "user_agent_profile": self.user_agent_meta.get("profile"), "user_agent_label": self.user_agent_meta.get("label"), "user_agent_sha256": self.user_agent_meta.get("user_agent_sha256"), "requests": self.requests, "blocked": self.blocked, "sealed_preserved": self.sealed_preserved, "sealed_preserved_bytes": self.sealed_preserved_bytes, "sealed_preserve_skipped": self.sealed_preserve_skipped, "dynamic_media_refs_count": len(dynamic_media_refs), "captured_at": utcnow(), "raw_root_persisted": False, "auto_capture": bool(auto), "settle_before_capture": settle_meta}
+            meta = {"session_id": self.session_id, "current_url": url, "current_url_sha256": sha256_text(url), "title": title, "browser": self.browser_choice, "use_tor": self.use_tor, "media_policy": self.media_policy, "user_agent_profile": self.user_agent_meta.get("profile"), "user_agent_label": self.user_agent_meta.get("label"), "user_agent_sha256": self.user_agent_meta.get("user_agent_sha256"), "requests": self.requests, "blocked": self.blocked, "sealed_preserved": self.sealed_preserved, "sealed_preserved_bytes": self.sealed_preserved_bytes, "sealed_preserve_skipped": self.sealed_preserve_skipped, "dynamic_media_refs_count": len(dynamic_media_refs), "dom_snapshot_meta": dom_snapshot_meta, "captured_at": utcnow(), "raw_root_persisted": False, "auto_capture": bool(auto), "settle_before_capture": settle_meta, "sealed_preserve_background_flush": preserve_flush_meta}
             payload = pretty({"live_browser_metadata": meta, "sanitized_summary": summary}).encode("utf-8")
             storage_mode = "live_browser_sanitized_summary"
             raw_persisted = False
             kind = "live_browser_summary"
             filename = "live_browser_sanitized_summary.json"
             mime_type = "application/json"
-        evidence_meta = {"session_id": self.session_id, "browser": self.browser_choice, "use_tor": self.use_tor, "media_policy": self.media_policy, "user_agent_profile": self.user_agent_meta.get("profile"), "user_agent_label": self.user_agent_meta.get("label"), "user_agent_sha256": self.user_agent_meta.get("user_agent_sha256"), "requests": self.requests, "blocked": self.blocked, "sealed_preserved": self.sealed_preserved, "sealed_preserved_bytes": self.sealed_preserved_bytes, "sealed_preserve_skipped": self.sealed_preserve_skipped, "dynamic_media_refs_count": len(dynamic_media_refs), "dynamic_media_ref_aliases_sample": sorted(list(media_ref_aliases(dynamic_media_refs, url)))[:80], "raw_allowed": raw_allowed, "page_title": title, "current_url": url, "auto_capture": bool(auto), "settle_before_capture": settle_meta}
+        evidence_meta = {"session_id": self.session_id, "browser": self.browser_choice, "use_tor": self.use_tor, "media_policy": self.media_policy, "user_agent_profile": self.user_agent_meta.get("profile"), "user_agent_label": self.user_agent_meta.get("label"), "user_agent_sha256": self.user_agent_meta.get("user_agent_sha256"), "requests": self.requests, "blocked": self.blocked, "sealed_preserved": self.sealed_preserved, "sealed_preserved_bytes": self.sealed_preserved_bytes, "sealed_preserve_skipped": self.sealed_preserve_skipped, "dynamic_media_refs_count": len(dynamic_media_refs), "dynamic_media_ref_aliases_sample": sorted(list(media_ref_aliases(dynamic_media_refs, url)))[:80], "dom_snapshot_meta": dom_snapshot_meta, "raw_allowed": raw_allowed, "page_title": title, "current_url": url, "auto_capture": bool(auto), "settle_before_capture": settle_meta, "sealed_preserve_background_flush": preserve_flush_meta}
         eid = persist_evidence(case_id=self.case_id, actor=self.actor, kind=kind, source_type="live_browser_capture", source_ref=url, filename=filename, mime_type=mime_type, payload=payload, encrypt=True, storage_mode=storage_mode, raw_persisted=raw_persisted, meta=evidence_meta)
         pcid = register_page_capture(session_id=self.session_id, case_id=self.case_id, evidence_id=eid, page_url=url, title=title, capture_mode=storage_mode, raw_persisted=raw_persisted, meta=evidence_meta)
+        deferred_blocked_flush_meta = await self._flush_deferred_blocked_media(root_evidence_id=eid, page_url=url)
+        sealed_snapshot_id: int | None = None
+        snapshot_allowed, snapshot_reason = sealed_page_snapshot_allowed(self.case_id)
+        if (not raw_persisted) and snapshot_allowed and html_text:
+            try:
+                snapshot_meta = {
+                    **evidence_meta,
+                    "sealed_page_snapshot": True,
+                    "snapshot_reason": snapshot_reason,
+                    "parent_page_evidence_id": eid,
+                    "page_capture_id": pcid,
+                    "current_url": url,
+                    "title": title,
+                    "page_title": title,
+                    "raw_root_persisted": True,
+                    "viewer_note": "Hard-sealed rendered DOM snapshot for cleared reviewer full-page reconstruction; local vault key cannot decrypt this object.",
+                }
+                sealed_snapshot_id = persist_evidence(case_id=self.case_id, actor=self.actor, kind="page", source_type="sealed_page_snapshot", source_ref=url, filename="sealed_reviewer_page_snapshot.html", mime_type="text/html", payload=html_text.encode("utf-8", errors="replace"), encrypt=True, parent_id=eid, storage_mode=SEALED_PRESERVED_PAGE_SNAPSHOT_STORAGE_MODE, raw_persisted=True, meta=snapshot_meta, quarantined=True, lock_original=True, disable_plaintext=True, never_materialize=True)
+                log_event(self.actor, "SEALED_PAGE_SNAPSHOT_STORED", case_id=self.case_id, evidence_id=sealed_snapshot_id, session_id=self.session_id, details={"parent_page_evidence_id": eid, "page_capture_id": pcid, "url_sha256": sha256_text(url), "snapshot_reason": snapshot_reason})
+            except Exception as exc:
+                log_event(self.actor, "SEALED_PAGE_SNAPSHOT_FAILED", case_id=self.case_id, evidence_id=eid, session_id=self.session_id, details={"error": str(exc)[:500], "url_sha256": sha256_text(url), "snapshot_reason": snapshot_reason})
         asset_ids: list[int] = []
         if raw_persisted and self.download_allowed_media and not case_safe(case_for(self.case_id)) and not lockdown():
             current_ref_urls = set()
@@ -2742,15 +3798,57 @@ class LiveBrowserSession:
                     log_event(self.actor, "LIVE_CAPTURED_ASSET_STORE_FAILED", case_id=self.case_id, evidence_id=eid, session_id=self.session_id, details={"error": str(exc)[:500], "url_sha256": asset.get("url_sha256")})
         preserved_link_ids = link_preserved_media_to_page_capture(actor=self.actor, case_id=self.case_id, session_id=self.session_id, page_evidence_id=eid, page_url=url, html_refs=html_media_refs, dynamic_refs=dynamic_media_refs)
         asset_ids.extend(preserved_link_ids)
-        update_evidence_meta(eid, {"page_capture_id": pcid, "captured_asset_count": len(asset_ids), "sealed_preserved_asset_links": len(preserved_link_ids), "captured_asset_cache_skipped": self.asset_skipped, "captured_asset_total_bytes": self.asset_bytes_total})
-        log_event(self.actor, "LIVE_CURRENT_PAGE_CAPTURED", case_id=self.case_id, evidence_id=eid, session_id=self.session_id, details={"url_sha256": sha256_text(url), "raw_persisted": raw_persisted, "page_capture_id": pcid, "captured_assets": len(asset_ids), "sealed_preserved_asset_links": len(preserved_link_ids), "asset_skipped": self.asset_skipped, "auto_capture": bool(auto), "settle_elapsed_ms": settle_meta.get("settle_elapsed_ms")})
+        update_evidence_meta(eid, {"page_capture_id": pcid, "captured_asset_count": len(asset_ids), "sealed_preserved_asset_links": len(preserved_link_ids), "sealed_page_snapshot_id": sealed_snapshot_id, "deferred_blocked_media_flush": deferred_blocked_flush_meta, "captured_asset_cache_skipped": self.asset_skipped, "captured_asset_total_bytes": self.asset_bytes_total})
+        log_event(self.actor, "LIVE_CURRENT_PAGE_CAPTURED", case_id=self.case_id, evidence_id=eid, session_id=self.session_id, details={"url_sha256": sha256_text(url), "raw_persisted": raw_persisted, "page_capture_id": pcid, "captured_assets": len(asset_ids), "sealed_preserved_asset_links": len(preserved_link_ids), "sealed_page_snapshot_id": sealed_snapshot_id, "deferred_blocked_media_flush": deferred_blocked_flush_meta, "asset_skipped": self.asset_skipped, "auto_capture": bool(auto), "settle_elapsed_ms": settle_meta.get("settle_elapsed_ms")})
         return eid
 
     def capture_current_sync(self) -> int:
-        if self.loop is None:
-            raise HTTPException(409, "Session loop is not ready")
+        if self.loop is None or self.loop.is_closed() or self.stop_flag.is_set():
+            execute("UPDATE browser_sessions SET status='stopped', stopped_at=coalesce(stopped_at, ?) WHERE session_id=?", (utcnow(), self.session_id))
+            raise HTTPException(409, "This live browser session is no longer active. Start a new live session before capturing.")
         fut = asyncio.run_coroutine_threadsafe(self._capture_current(), self.loop)
-        return int(fut.result(timeout=45))
+        return int(fut.result(timeout=120))
+
+    async def _capture_all_open_tabs(self) -> list[int]:
+        ids: list[int] = []
+        pages = self._live_pages_snapshot()
+        seen_urls: set[str] = set()
+        for p in pages:
+            try:
+                url = getattr(p, "url", "") or ""
+                if not url or url.startswith(("about:", "chrome:", "edge:", "devtools:")):
+                    continue
+                key = sha256_text(url)
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                ids.append(await self._capture_current(auto=False, page=p))
+            except Exception as exc:
+                log_event(self.actor, "LIVE_TAB_CAPTURE_FAILED", case_id=self.case_id, session_id=self.session_id, details={"url": getattr(p, "url", "") or "", "error": str(exc)[:500]})
+        return ids
+
+    def capture_all_open_tabs_sync(self) -> list[int]:
+        if self.loop is None or self.loop.is_closed() or self.stop_flag.is_set():
+            execute("UPDATE browser_sessions SET status='stopped', stopped_at=coalesce(stopped_at, ?) WHERE session_id=?", (utcnow(), self.session_id))
+            raise HTTPException(409, "This live browser session is no longer active. Start a new live session before capturing tabs.")
+        fut = asyncio.run_coroutine_threadsafe(self._capture_all_open_tabs(), self.loop)
+        return list(fut.result(timeout=300))
+
+    def open_tabs_sync(self) -> list[dict[str, Any]]:
+        if self.loop is None or self.loop.is_closed():
+            return []
+        async def inner() -> list[dict[str, Any]]:
+            out = []
+            for i, p in enumerate(self._live_pages_snapshot(), start=1):
+                try:
+                    out.append({"index": i, "url": p.url, "title": await p.title()})
+                except Exception:
+                    pass
+            return out
+        try:
+            return list(asyncio.run_coroutine_threadsafe(inner(), self.loop).result(timeout=10))
+        except Exception:
+            return []
 
     def stop_sync(self) -> None:
         self.stop_flag.set()
@@ -2797,6 +3895,34 @@ def capture_live_session(sid: str) -> int:
     return session.capture_current_sync()
 
 
+def capture_all_live_session_tabs(sid: str) -> list[int]:
+    with LIVE_LOCK:
+        session = LIVE.get(sid)
+    if not session:
+        raise HTTPException(409, "This live session is not running in this app process. Start a new live session.")
+    return session.capture_all_open_tabs_sync()
+
+
+def live_preservation_status_for(sid: str) -> dict[str, Any]:
+    with LIVE_LOCK:
+        session = LIVE.get(sid)
+    if not session:
+        row = rowdict(fetchone("SELECT * FROM browser_sessions WHERE session_id=?", (sid,)))
+        if not row:
+            raise HTTPException(404, "Live session not found")
+        meta = jloads(row.get("meta_json"), {})
+        return {"ok": True, "session_id": sid, "running": False, "status": row.get("status"), "mode": meta.get("sealed_media_preservation", {}).get("mode") or get_setting("sealed_media_preserve_mode", "balanced"), "requests": 0, "blocked": fetchone("SELECT count(*) c FROM blocked_media WHERE session_id=?", (sid,))["c"], "pending_tasks": 0, "deferred_metadata_pending": 0, "preserved": fetchone("SELECT count(*) c FROM blocked_media WHERE session_id=? AND downloaded=1", (sid,))["c"], "preserved_bytes": 0, "skipped_or_failed": fetchone("SELECT count(*) c FROM blocked_media WHERE session_id=? AND downloaded=0", (sid,))["c"], "timeouts": 0, "cancelled": 0, "queue_limit": 0, "cancel_requested": False, "progress_percent": 100}
+    return session.preservation_status()
+
+
+def cancel_live_preservation(sid: str) -> dict[str, Any]:
+    with LIVE_LOCK:
+        session = LIVE.get(sid)
+    if not session:
+        raise HTTPException(409, "This live session is not running in this app process.")
+    return session.cancel_preservation_sync()
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request, error: str | None = None) -> HTMLResponse:
     return layout(request, "Login", f"""{flash(error)}<div class='card'><h2>Sign in</h2><form method='post' action='/login'><label>Username</label><input name='username' autofocus><label>Password</label><input name='password' type='password'><button>Login</button></form><p class='muted'>First run default: admin / change-me-now</p></div>""")
@@ -2827,14 +3953,14 @@ def logout(request: Request) -> RedirectResponse:
 @app.get("/setup", response_class=HTMLResponse)
 def setup_page(request: Request, msg: str | None = None) -> HTMLResponse:
     require_admin(request)
-    bundled = load_bundled_escrow_public_key()
+    bundled = load_uscm_escrow_public_key()
     body = f"""{flash(msg)}<div class='card warn'><h2>First-run setup</h2><p>Choose who controls original reveal/decrypt authority. Organization mode is for agencies and internal teams. Civilian Unknown Master Key mode lets a civilian export sealed encrypted evidence for USCM/law-enforcement handoff without knowing the reveal key.</p>
     <form method='post' action='/setup' enctype='multipart/form-data'>
       <label>New admin password</label><input type='password' name='password' required minlength='10'>
       <div class='grid'>
-        <div class='card'><h3><label><input type='radio' name='custody_choice' value='organization' checked> Organization-Controlled Key</label></h3><p>Your organization/admin creates and controls the master reveal key. Sealed media can be preserved encrypted for export and revealed locally only through the organization master-key workflow.</p><label>Master reveal key</label><input type='password' name='master_key' minlength='12'><label>Default edition</label><select name='edition'><option value='lockdown'>Lockdown / compliance-safe</option><option value='supervised'>Supervised approval mode</option><option value='lab'>Lab/full-forensic mode</option></select><label><input type='checkbox' name='hard_safe' value='1' checked> Hard default safe mode</label></div>
-        <div class='card safe'><h3><label><input type='radio' name='custody_choice' value='civilian_unknown_master'> Civilian Unknown Master Key</label></h3><p>The local user does not create or know the master reveal key. Lockdown stays forced. Sealed evidence exports contain encrypted evidence blobs and wrapped keys for a cleared reviewer.</p><label>Escrow public key PEM</label><textarea name='escrow_public_key' rows='9'>{h(bundled)}</textarea><p class='small muted'>Generate escrow keys with <code>python app.py escrow-generate --out escrow_keys</code>. Put only the public key here. Keep the private key offline.</p></div>
-        <div class='card warn'><h3>Sealed Media Preservation Mode</h3><p class='small muted'>Optional in both custody modes. Block images/video/audio from user display, but preserve selected blocked media as encrypted vault evidence for sealed export and cleared-reviewer access. In Organization mode, local reveal still requires role/policy plus the master reveal key; in Civilian Unknown Master Key mode local reveal remains blocked.</p><label><input type='checkbox' name='sealed_media_preservation_enabled' value='1'> Enable sealed media preservation by default</label><label><input type='checkbox' name='sealed_media_preserve_images' value='1' checked> Preserve blocked images encrypted</label><label><input type='checkbox' name='sealed_media_preserve_video' value='1' checked> Preserve blocked video encrypted</label><label><input type='checkbox' name='sealed_media_preserve_audio' value='1' checked> Preserve blocked audio encrypted</label><label>Maximum bytes per preserved media object</label><input name='sealed_media_preserve_max_bytes' value='52428800'><p class='small muted'>Default is 52,428,800 bytes. Preserved media never renders in the live browser when blocked; it is stored encrypted and linked to captured pages for sealed export/reviewer viewing.</p></div>
+        <div class='card'><h3><label><input type='radio' name='custody_choice' value='organization' checked> Organization-Controlled Key</label></h3><p>Your organization/admin creates and controls the master reveal key. Normal evidence remains encrypted in the local vault and reveal is controlled by organization policy.</p><label>Master reveal key</label><input type='password' name='master_key' minlength='12'><label>Default edition</label><select name='edition'><option value='lockdown'>Lockdown / compliance-safe</option><option value='supervised'>Supervised approval mode</option><option value='lab'>Lab/full-forensic mode</option></select><label><input type='checkbox' name='hard_safe' value='1' checked> Hard default safe mode</label><div class='card warn'><h3>Optional organization hard-sealed media</h3><p class='small muted'>For blocked media preservation, an organization can paste its escrow public key so preserved blocked media is sealed for reviewer/private-key access and cannot be decrypted by the local vault key.</p><label><input type='checkbox' name='organization_hard_seal_media_enabled' value='1'> Hard-seal preserved blocked media to organization escrow public key</label><label>Organization escrow public key PEM</label><textarea name='organization_hard_seal_public_key_pem' rows='7' placeholder='Paste organization/reviewer escrow_public_key.pem here'></textarea></div></div>
+        <div class='card safe'><h3><label><input type='radio' name='custody_choice' value='civilian_unknown_master'> Civilian Unknown Master Key</label></h3><p>The local user does not create, know, or control the private reveal key. Lockdown stays forced. Sensitive/original evidence is hard-sealed to the embedded USCM escrow public key so it cannot be decrypted by the local civilian installation.</p><label>USCM escrow public key PEM</label><textarea name='escrow_public_key' rows='9' readonly>{h(bundled)}</textarea><p class='small muted'>Civilian Unknown Master Key mode uses this USCM public key only. Do not use your own key for this mode; doing so defeats the custody separation. Organizations that need to control their own keys should use Organization-Controlled Key mode.</p></div>
+        <div class='card warn'><h3>Sealed Media Preservation Mode</h3><p class='small muted'>Optional in both custody modes. Block images/video/audio from user display, but preserve selected blocked media for sealed export and cleared-reviewer access. Civilian mode always hard-seals to the USCM key. Organization mode can either use normal local vault encryption or the optional organization hard-seal public key above.</p><label><input type='checkbox' name='sealed_media_preservation_enabled' value='1'> Enable sealed media preservation by default</label><label><input type='checkbox' name='sealed_media_preserve_images' value='1' checked> Preserve blocked images encrypted</label><label><input type='checkbox' name='sealed_media_preserve_video' value='1' checked> Preserve blocked video encrypted</label><label><input type='checkbox' name='sealed_media_preserve_audio' value='1' checked> Preserve blocked audio encrypted</label><label>Maximum bytes per preserved media object</label><input name='sealed_media_preserve_max_bytes' value='52428800'><p class='small muted'>Default is 52,428,800 bytes. Preserved media never renders in the live browser when blocked; it is stored encrypted and linked to captured pages for sealed export/reviewer viewing.</p></div>
         <div class='card good'><h3>Law-enforcement / cleared reviewer import</h3><p>Optional: initialize this installation as a reviewer workstation by importing a sealed evidence ZIP now. You can also do this later from <b>LE Reviewer</b>.</p><label>Sealed BlindSite evidence ZIP</label><input type='file' name='reviewer_package' accept='.zip'><label>Escrow private key PEM</label><input type='file' name='reviewer_private_key' accept='.pem,.key,.txt'><label>Private-key passphrase, if any</label><input type='password' name='reviewer_private_key_passphrase'><label>Reviewer import note</label><textarea name='reviewer_note' placeholder='agency/case note'></textarea></div>
       </div>
       <button class='good'>Finish setup</button>
@@ -2843,7 +3969,7 @@ def setup_page(request: Request, msg: str | None = None) -> HTMLResponse:
 
 
 @app.post("/setup")
-async def setup_submit(request: Request, password: str = Form(...), custody_choice: str = Form("organization"), master_key: str = Form(""), escrow_public_key: str = Form(""), edition: str = Form("lockdown"), hard_safe: str | None = Form(None), sealed_media_preservation_enabled: str | None = Form(None), sealed_media_preserve_images: str | None = Form(None), sealed_media_preserve_video: str | None = Form(None), sealed_media_preserve_audio: str | None = Form(None), sealed_media_preserve_max_bytes: str = Form("52428800"), reviewer_package: UploadFile | None = File(None), reviewer_private_key: UploadFile | None = File(None), reviewer_private_key_passphrase: str = Form(""), reviewer_note: str = Form("")) -> RedirectResponse:
+async def setup_submit(request: Request, password: str = Form(...), custody_choice: str = Form("organization"), master_key: str = Form(""), escrow_public_key: str = Form(""), organization_hard_seal_media_enabled: str | None = Form(None), organization_hard_seal_public_key_pem: str = Form(""), edition: str = Form("lockdown"), hard_safe: str | None = Form(None), sealed_media_preservation_enabled: str | None = Form(None), sealed_media_preserve_images: str | None = Form(None), sealed_media_preserve_video: str | None = Form(None), sealed_media_preserve_audio: str | None = Form(None), sealed_media_preserve_max_bytes: str = Form("52428800"), reviewer_package: UploadFile | None = File(None), reviewer_private_key: UploadFile | None = File(None), reviewer_private_key_passphrase: str = Form(""), reviewer_note: str = Form("")) -> RedirectResponse:
     user = require_admin(request)
     if len(password) < 10:
         raise HTTPException(400, "Admin password must be at least 10 characters")
@@ -2851,10 +3977,18 @@ async def setup_submit(request: Request, password: str = Form(...), custody_choi
         edition = "lockdown"
     execute("UPDATE users SET password_hash=? WHERE username=?", (hash_password(password), user["username"]))
     if custody_choice == "civilian_unknown_master":
-        pem = (escrow_public_key or load_bundled_escrow_public_key()).strip()
+        # Civilian Unknown Master Key mode is intentionally NOT a user-supplied
+        # key workflow. The civilian collector must not possess or control the
+        # private reveal key, so this mode uses the embedded USCM escrow public
+        # key only. Organization-Controlled Key mode remains available for
+        # organizations that need to control their own keys.
+        pem = load_uscm_escrow_public_key().strip()
         fp = escrow_public_fingerprint(pem)
         if not pem or not fp:
-            raise HTTPException(400, "Civilian Unknown Master Key mode requires a valid RSA escrow public key PEM. Run: python app.py escrow-generate --out escrow_keys")
+            raise HTTPException(400, "Civilian Unknown Master Key mode requires the embedded USCM RSA escrow public key")
+        submitted_fp = escrow_public_fingerprint((escrow_public_key or "").strip()) if (escrow_public_key or "").strip() else fp
+        if submitted_fp and submitted_fp != fp:
+            raise HTTPException(400, "Civilian Unknown Master Key mode uses the USCM escrow public key only. Do not use your own key for this mode.")
         hidden_master = secrets.token_urlsafe(40)
         set_master_key(hidden_master)
         set_setting("custody_mode", "civilian_unknown_master")
@@ -2876,16 +4010,30 @@ async def setup_submit(request: Request, password: str = Form(...), custody_choi
             raise HTTPException(400, "Organization-Controlled Key mode requires a master reveal key of at least 12 characters")
         set_master_key(master_key)
         set_setting("custody_mode", "organization")
+        org_pem = (organization_hard_seal_public_key_pem or "").strip()
+        org_fp = escrow_public_fingerprint(org_pem) if org_pem else ""
+        if organization_hard_seal_media_enabled and not org_fp:
+            raise HTTPException(400, "Organization hard-sealed media requires a valid organization escrow public key PEM")
+        set_setting("organization_hard_seal_media_enabled", "1" if organization_hard_seal_media_enabled else "0")
+        set_setting("organization_hard_seal_public_key_pem", org_pem if org_fp else "")
+        set_setting("organization_hard_seal_public_key_fingerprint", org_fp)
     set_setting("sealed_media_preservation_enabled", "1" if sealed_media_preservation_enabled else "0")
     set_setting("sealed_media_preserve_images", "1" if sealed_media_preserve_images else "0")
     set_setting("sealed_media_preserve_video", "1" if sealed_media_preserve_video else "0")
     set_setting("sealed_media_preserve_audio", "1" if sealed_media_preserve_audio else "0")
     set_setting("sealed_media_preserve_max_bytes", str(safe_int(sealed_media_preserve_max_bytes, 52428800, min_value=1048576)))
+    if custody_choice == "civilian_unknown_master":
+        set_setting("organization_hard_seal_media_enabled", "0")
     set_setting("edition", edition)
     set_setting("default_case_mode", edition)
     set_setting("hard_default_safe_mode", "1" if hard_safe else "0")
     set_setting("setup_required", "0")
-    log_event(user["username"], "FIRST_RUN_SETUP_COMPLETED", details={"edition": edition, "hard_safe": bool(hard_safe), "custody_mode": custody_mode(), "sealed_media_preservation_enabled": setting_bool("sealed_media_preservation_enabled", "0")})
+    if organization_controlled_mode() and setting_bool("organization_hard_seal_media_enabled", "0"):
+        try:
+            migrate_existing_organization_preserved_media_to_hard_sealed()
+        except Exception:
+            pass
+    log_event(user["username"], "FIRST_RUN_SETUP_COMPLETED", details={"edition": edition, "hard_safe": bool(hard_safe), "custody_mode": custody_mode(), "sealed_media_preservation_enabled": setting_bool("sealed_media_preservation_enabled", "0"), "organization_hard_seal_media_enabled": setting_bool("organization_hard_seal_media_enabled", "0"), "organization_hard_seal_public_key_fingerprint": get_setting("organization_hard_seal_public_key_fingerprint", "")})
     package_supplied = bool(reviewer_package and reviewer_package.filename)
     key_supplied = bool(reviewer_private_key and reviewer_private_key.filename)
     if package_supplied or key_supplied:
@@ -3043,7 +4191,7 @@ def live_page(request: Request, msg: str | None = None) -> HTMLResponse:
       <label><input type='checkbox' name='auto_capture' value='1' {'checked' if setting_bool('live_auto_capture_default','0') else ''}> Auto-capture each new page after it settles</label>
       <label><input type='checkbox' name='headless' value='1'> Headless instead of visible</label>
       <button class='good'>Open controlled browser window</button>
-    </form><p class='muted small'>If browser binaries are missing, run <code>python app.py --install-browsers</code>.</p></div><div class='card'><h2>Sessions</h2><table><tr><th>Session</th><th>Case</th><th>Actor</th><th>Browser</th><th>Route</th><th>Status</th><th>Current URL</th></tr>{sess_rows}</table></div>"""
+    </form><p class='muted small'>If browser binaries are missing, run <code>python BlindSite.py --install-browsers</code>.</p></div><div class='card'><h2>Sessions</h2><table><tr><th>Session</th><th>Case</th><th>Actor</th><th>Browser</th><th>Route</th><th>Status</th><th>Current URL</th></tr>{sess_rows}</table></div>"""
     return layout(request, "Live Sessions", body)
 
 
@@ -3069,20 +4217,67 @@ def live_detail(request: Request, sid: str, msg: str | None = None) -> HTMLRespo
     captures = page_captures_for_session(sid)
     controls = ""
     if running:
-        controls = f"<form method='post' action='/live/{sid}/capture' style='display:inline'><button class='good'>Capture Current Page</button></form><a class='button good' href='/live/{sid}/pages'>Session page viewer</a><form method='post' action='/live/{sid}/stop' style='display:inline'><button class='danger'>Stop Session</button></form>"
+        controls = f"<form method='post' action='/live/{sid}/capture' style='display:inline'><button class='good'>Capture Current Page / Active Tab</button></form><form method='post' action='/live/{sid}/capture-all-tabs' style='display:inline'><button class='warn'>Capture All Open Tabs</button></form><a class='button good' href='/live/{sid}/pages'>Session page viewer</a><form method='post' action='/live/{sid}/stop' style='display:inline'><button class='danger'>Stop Session</button></form>"
     else:
         controls = "<p class='muted'>This session is not running in this app process. Start a new live session if needed.</p>"
     if mem:
-        runtime = f"<p>{badge('in-memory running','good') if running else badge('in-memory stopped','warn')} {badge('requests '+str(mem.requests),'info')} {badge('blocked '+str(mem.blocked),'warn')} {badge('current '+mem.current_url[:120],'info')}</p>"
+        tabs = mem.open_tabs_sync()
+        tabs_html = "".join(f"<tr><td>{h(t.get('index'))}</td><td>{h(t.get('title') or '')}</td><td class='urlcell'>{h(t.get('url') or '')}</td></tr>" for t in tabs)
+        runtime = f"<p>{badge('in-memory running','good') if running else badge('in-memory stopped','warn')} {badge('requests '+str(mem.requests),'info')} {badge('blocked '+str(mem.blocked),'warn')} {badge('tabs '+str(len(tabs)),'info')} {badge('current '+mem.current_url[:120],'info')}</p><details class='card'><summary>Tracked browser tabs</summary><table><tr><th>#</th><th>Title</th><th>URL</th></tr>{tabs_html or '<tr><td colspan="3" class="muted">No tracked tabs yet.</td></tr>'}</table></details>"
     else:
         runtime = ""
+    preservation_panel = f"""<div class='card safe noprint' id='preservation-panel'>
+      <h2>Background media preservation</h2>
+      <p class='small muted'>Blocked media is preserved in the background so live browsing stays fast. Page capture saves the page first; pending media can continue afterward.</p>
+      <div style='height:18px;border:1px solid #334155;border-radius:999px;overflow:hidden;background:#020617;margin:8px 0'>
+        <div id='preservation-bar' style='height:100%;width:0%;background:#0284c7'></div>
+      </div>
+      <p id='preservation-text' class='mono small'>Loading preservation status…</p>
+      <form method='post' action='/live/{sid}/preservation-cancel' style='display:inline' onsubmit='return confirm("Cancel pending background media preservation for this live session? Active downloads may finish, but no new blocked media will be queued.")'>
+        <button class='secondary'>Cancel pending media preservation</button>
+      </form>
+      <script>
+      (function(){{
+        async function refreshPreservation(){{
+          try{{
+            const r = await fetch('/live/{sid}/preservation-status', {{cache:'no-store'}});
+            const s = await r.json();
+            const pct = Math.max(0, Math.min(100, s.progress_percent || 0));
+            const bar = document.getElementById('preservation-bar');
+            const txt = document.getElementById('preservation-text');
+            if (bar) bar.style.width = pct + '%';
+            if (txt) txt.textContent = `mode=${{s.mode || ''}} | blocked=${{s.blocked || 0}} | pending=${{s.pending_tasks || 0}} | metadata-pending=${{s.deferred_metadata_pending || 0}} | preserved=${{s.preserved || 0}} | failed/skipped=${{s.skipped_or_failed || 0}} | timeouts=${{s.timeouts || 0}} | cancelled=${{s.cancelled || 0}} | bytes=${{s.preserved_bytes || 0}} | ${{pct}}%`;
+          }} catch(e){{
+            const txt = document.getElementById('preservation-text');
+            if (txt) txt.textContent = 'Preservation status unavailable: ' + e;
+          }}
+        }}
+        refreshPreservation();
+        setInterval(refreshPreservation, 1500);
+      }})();
+      </script>
+    </div>"""
     cap_rows = "".join(f"<tr><td><a href='/evidence/{c['evidence_id']}/page-render'>Open renderer</a></td><td><a href='/evidence/{c['evidence_id']}'>Evidence #{c['evidence_id']}</a></td><td>{h(c['capture_mode'])}</td><td>{badge('raw','warn') if c['raw_persisted'] else badge('safe summary','good')}</td><td>{h(c['created_at'])}</td><td class='urlcell'>{h(c['page_url'])}</td><td class='hashcell'><code>{h(c['sha256'])}</code></td></tr>" for c in captures)
     ev_rows = "".join(f"<tr><td>{h(e['created_at'])}</td><td>{h(e['event_type'])}</td><td>{h(e['resource_type'])}</td><td>{h(e['status_code'] or '')}</td><td class='urlcell'>{h(e['url'] or '')}</td><td class='hashcell'><code>{h(e['header_sha256'] or '')}</code></td></tr>" for e in events)
     bm_rows = "".join(f"<tr><td><a href='/blocked/{b['id']}'>#{b['id']}</a></td><td>{h(b['resource_type'])}</td><td>{badge('downloaded','warn') if b['downloaded'] else badge('not downloaded','good')}</td><td>{h(b['reason'])}</td><td class='urlcell'>{h(b['media_url'])}</td><td class='hashcell'><code>{h(b['url_sha256'])}</code></td></tr>" for b in blocked)
-    body = f"""{flash(msg)}<div class='card'><h2>Live session {h(sid)}</h2><p>{badge(row['status'],'good' if row['status']=='running' else 'warn')} {badge(row['browser_choice'])} {badge('Tor','info') if row['use_tor'] else badge('Direct')} {badge(row['media_policy'],'good')} {badge('saves allowed media','warn') if jloads(row.get('meta_json'),{}).get('download_allowed_media') else ""}</p><p><b>Case:</b> {h(row.get('case_name') or '')}</p><p><b>Start:</b> <span class='mono'>{h(row['start_url'])}</span></p><p><b>Current:</b> <span class='mono'>{h(row.get('current_url') or '')}</span></p><p><b>User agent:</b> <span class='mono'>{h((jloads(row.get('meta_json'),{}).get('user_agent_label') or jloads(row.get('meta_json'),{}).get('user_agent_profile') or 'default'))}</span> <span class='small muted'>SHA-256 {h((jloads(row.get('meta_json'),{}).get('user_agent_sha256') or '')[:24])}</span></p><p><a class='button good' href='/live/{sid}/pages'>Open session page viewer</a></p>{runtime}<div class='noprint'>{controls}</div><p class='small muted'>Browse in the popped-up browser. Each time you click Capture Current Page, a saved-page evidence item is created below. This build does not block scripts, stylesheets, documents, XHR, or fetch requests.</p></div>
+    body = f"""{flash(msg)}<div class='card'><h2>Live session {h(sid)}</h2><p>{badge(row['status'],'good' if row['status']=='running' else 'warn')} {badge(row['browser_choice'])} {badge('Tor','info') if row['use_tor'] else badge('Direct')} {badge(row['media_policy'],'good')} {badge('saves allowed media','warn') if jloads(row.get('meta_json'),{}).get('download_allowed_media') else ""}</p><p><b>Case:</b> {h(row.get('case_name') or '')}</p><p><b>Start:</b> <span class='mono'>{h(row['start_url'])}</span></p><p><b>Current:</b> <span class='mono'>{h(row.get('current_url') or '')}</span></p><p><b>User agent:</b> <span class='mono'>{h((jloads(row.get('meta_json'),{}).get('user_agent_label') or jloads(row.get('meta_json'),{}).get('user_agent_profile') or 'default'))}</span> <span class='small muted'>SHA-256 {h((jloads(row.get('meta_json'),{}).get('user_agent_sha256') or '')[:24])}</span></p><p><a class='button good' href='/live/{sid}/pages'>Open session page viewer</a></p>{runtime}<div class='noprint'>{controls}</div>{preservation_panel}<p class='small muted'>Browse in the popped-up browser. Each time you click Capture Current Page, a saved-page evidence item is created below. This build does not block scripts, stylesheets, documents, XHR, or fetch requests.</p></div>
     <div class='card'><h2>Saved page captures from this session</h2><p class='small muted'>Click Open saved page to load the capture exactly as the program saved it: raw HTML in lab mode or a safe reconstructed summary in compliance-safe mode.</p><div class='table-scroll'><table><tr><th>Viewer</th><th>Evidence</th><th>Capture mode</th><th>Raw state</th><th>Captured</th><th>Page URL</th><th>Evidence SHA-256</th></tr>{cap_rows or '<tr><td colspan="7" class="muted">No saved pages yet. Use Capture Current Page while the session is running.</td></tr>'}</table></div></div>
     <div class='grid'><div class='card'><h2>Network/session events</h2><p class='small muted'>Scroll sideways for full URLs and header hashes.</p><div class='table-scroll'><table><tr><th>Time</th><th>Event</th><th>Type</th><th>Status</th><th>URL</th><th>Header hash</th></tr>{ev_rows}</table></div></div><div class='card'><h2>Blocked media</h2><p class='small muted'>Blocked requests were aborted before body download.</p><div class='table-scroll'><table><tr><th>ID</th><th>Type</th><th>State</th><th>Reason</th><th>URL</th><th>URL Hash</th></tr>{bm_rows}</table></div></div></div>"""
     return layout(request, f"Live {sid}", body)
+
+
+@app.get("/live/{sid}/preservation-status")
+def live_preservation_status(request: Request, sid: str) -> JSONResponse:
+    require_user(request)
+    return JSONResponse(live_preservation_status_for(sid))
+
+
+@app.post("/live/{sid}/preservation-cancel")
+def live_preservation_cancel(request: Request, sid: str) -> RedirectResponse:
+    user = require_user(request)
+    status = cancel_live_preservation(sid)
+    log_event(user["username"], "LIVE_PRESERVATION_CANCEL_REQUESTED", session_id=sid, details=status)
+    return RedirectResponse(f"/live/{sid}?msg=Pending%20media%20preservation%20cancelled", 303)
 
 
 @app.post("/live/{sid}/capture")
@@ -3091,6 +4286,16 @@ def live_capture(request: Request, sid: str) -> RedirectResponse:
     eid = capture_live_session(sid)
     log_event(user["username"], "LIVE_CAPTURE_BUTTON_USED", evidence_id=eid, session_id=sid)
     return RedirectResponse(f"/evidence/{eid}/page-render?msg=Current%20page%20captured", 303)
+
+
+@app.post("/live/{sid}/capture-all-tabs")
+def live_capture_all_tabs(request: Request, sid: str) -> RedirectResponse:
+    user = require_user(request)
+    ids = capture_all_live_session_tabs(sid)
+    log_event(user["username"], "LIVE_CAPTURE_ALL_TABS_BUTTON_USED", session_id=sid, details={"captured_evidence_ids": ids, "count": len(ids)})
+    if ids:
+        return RedirectResponse(f"/live/{sid}/pages?msg=Captured%20{len(ids)}%20open%20tab(s)", 303)
+    return RedirectResponse(f"/live/{sid}?msg=No%20open%20tabs%20captured", 303)
 
 
 @app.post("/live/{sid}/stop")
@@ -3135,7 +4340,7 @@ def captures_page(request: Request, case_id: str = "", q: str = "") -> HTMLRespo
           <p><b>Evidence SHA-256:</b> <code>{h(r['sha256'])}</code></p>
           <p><a class='button good' href='/evidence/{r['evidence_id']}/page-render'>Open renderer</a> <a class='button' href='/evidence/{r['evidence_id']}/capture-frame' target='_blank'>Open safe frame</a> <a class='button secondary' href='/evidence/{r['evidence_id']}'>Evidence #{r['evidence_id']}</a></p>
         </div>""")
-    body = f"""<div class='card good'><h2>Saved pages</h2><p>This is where captured pages live. Open saved page loads the page exactly as Forensic Tor Vault preserved it: raw HTML only in approved lab mode, otherwise a safe reconstructed summary/metadata view that fetches no remote resources.</p><form><div class='row'><div><label>Case</label><select name='case_id'>{case_opts}</select></div><div><label>Search URL/title/hash</label><input name='q' value='{h(q)}'></div><div><button>Filter</button></div></div></form></div>{''.join(cards) or '<div class="card"><p class="muted">No saved page captures yet. Start a live session or run direct URL capture, then click Capture Current Page.</p></div>'}"""
+    body = f"""<div class='card good'><h2>Saved pages</h2><p>This is where captured pages live. Open saved page loads the page exactly as BlindSite preserved it: raw HTML only in approved lab mode, otherwise a safe reconstructed summary/metadata view that fetches no remote resources.</p><form><div class='row'><div><label>Case</label><select name='case_id'>{case_opts}</select></div><div><label>Search URL/title/hash</label><input name='q' value='{h(q)}'></div><div><button>Filter</button></div></div></form></div>{''.join(cards) or '<div class="card"><p class="muted">No saved page captures yet. Start a live session or run direct URL capture, then click Capture Current Page.</p></div>'}"""
     return layout(request, "Saved Pages", body)
 
 
@@ -3191,6 +4396,11 @@ def reveal_allowed(user: dict[str, Any], ev: dict[str, Any], mode: str, master_k
     case = case_for(ev.get("case_id"))
     if mode == "blocked":
         return True, "blocked mode always allowed"
+    if hard_sealed_escrow_evidence(ev):
+        meta = evidence_meta_dict(ev)
+        if meta.get("hard_sealed_organization_media"):
+            return False, "organization hard-sealed preserved media cannot be locally revealed or decrypted by the vault key; use sealed export and reviewer decrypt with the matching organization escrow private key"
+        return False, "Civilian Unknown Master Key hard-sealed evidence cannot be locally revealed or decrypted; use sealed export and reviewer decrypt"
     if sealed_preserved_media_evidence(ev):
         if mode == "blur":
             return False, "sealed-preserved blocked media does not allow blur previews; use master-key full reveal in organization mode or sealed reviewer decrypt"
@@ -3434,7 +4644,7 @@ def page_viewer_render_block(request: Request, selected_id: int, *, back_url: st
         exact_controls = f"<div class='card'><b>Exact local renderer unavailable:</b> {h(why)}. Saved local assets linked: {len(assets)}.</div>"
     info = f"""<div class='card good'><h2>{h(heading)}</h2>
       <p>{badge('exact local render active','warn') if exact_active else badge('safe render active','good')} {badge(ev.get('storage_mode'),'info')} {badge('raw persisted','warn') if ev.get('raw_persisted') else badge('safe summary','good')} {badge('saved assets '+str(len(assets)),'info')}</p>
-      <p class='small muted'>Safe render is the default no-network view. Exact local render only uses the HTML/media/CSS assets that Forensic Tor Vault saved into this case.</p>
+      <p class='small muted'>Safe render is the default no-network view. Exact local render only uses the HTML/media/CSS assets that BlindSite saved into this case.</p>
       <p><a class='button good' href='/evidence/{selected_id}/page-render'>Open full page renderer</a> <a class='button' href='/evidence/{selected_id}/capture-view'>Capture data</a> <a class='button secondary' href='/evidence/{selected_id}'>Evidence record</a></p>
       <table><tr><th>Title</th><td>{h(model.get('title') or ev.get('filename') or '')}</td></tr><tr><th>Source URL</th><td class='urlcell'>{h(model.get('source_url') or ev.get('source_ref') or '')}</td></tr><tr><th>Evidence SHA-256</th><td class='hashcell'><code>{h(ev.get('sha256'))}</code></td></tr></table>
     </div>{exact_controls}<div class='card'><h3>Local assets linked to this saved page</h3><p class='small muted'>These are the images/video/audio/CSS/fonts the renderer can use when exact mode is unlocked. Scroll sideways for full URLs/hashes.</p><div class='table-scroll'><table><tr><th>Evidence</th><th>Type</th><th>MIME</th><th>Size</th><th>SHA-256</th><th>Original URL</th></tr>{asset_rows or '<tr><td colspan="6" class="muted">No saved local assets for this capture. Use lab/full-forensic + allow media + download allowed media to preserve media for exact rendering.</td></tr>'}</table></div></div>"""
@@ -3629,6 +4839,11 @@ def serve_evidence(request: Request, eid: int, mode: str = "blocked", token: str
     if not ev:
         raise HTTPException(404, "Evidence not found")
     verify_view_token(token, eid, mode, user["username"])
+    if hard_sealed_escrow_evidence(ev):
+        meta = evidence_meta_dict(ev)
+        if meta.get("hard_sealed_organization_media"):
+            raise HTTPException(403, "This evidence is hard-sealed to the organization escrow public key and cannot be locally served; use sealed export/reviewer decrypt")
+        raise HTTPException(403, "This evidence is hard-sealed for Civilian Unknown Master Key custody and cannot be locally served")
     if mode == "blur":
         ok, why = reveal_allowed(user, ev, "blur")
         if not ok:
@@ -3663,6 +4878,8 @@ def export_evidence(request: Request, eid: int, include_plaintext: str | None = 
     case = case_for(ev.get("case_id"))
     want_plain = bool(include_plaintext)
     if want_plain:
+        if hard_sealed_escrow_evidence(ev):
+            raise HTTPException(403, "Hard-sealed escrow evidence cannot be plaintext-exported from the local app; use sealed export and reviewer decrypt workflow")
         if sealed_preserved_media_evidence(ev):
             raise HTTPException(403, "Sealed-preserved blocked media cannot be plaintext-exported from the civilian/local app; use sealed LE export and reviewer decrypt workflow")
         if lockdown() and setting_bool("disable_plaintext_export_in_lockdown", "1"):
@@ -3987,12 +5204,32 @@ def collect_case_sealed_rows(case_id: int) -> dict[str, Any]:
 
 
 def sealed_public_key(recipient_public_key_pem: str = "") -> tuple[str, str]:
-    pem = (recipient_public_key_pem or get_setting("escrow_public_key_pem", "") or load_bundled_escrow_public_key()).strip()
+    if civilian_unknown_master_mode():
+        uscm_pem = load_uscm_escrow_public_key().strip()
+        uscm_fp = escrow_public_fingerprint(uscm_pem)
+        if not uscm_pem or not uscm_fp:
+            raise HTTPException(400, "Civilian Unknown Master Key mode requires the embedded USCM escrow public key")
+        if recipient_public_key_pem and escrow_public_fingerprint(recipient_public_key_pem.strip()) != uscm_fp:
+            raise HTTPException(400, "Civilian Unknown Master Key mode uses the USCM escrow public key only. Do not provide a recipient/custom key for this custody mode.")
+        return uscm_pem, uscm_fp
+    org_hard_pem, org_hard_fp = organization_hard_seal_public_key()
+    recipient_pem = (recipient_public_key_pem or "").strip()
+    recipient_fp = escrow_public_fingerprint(recipient_pem) if recipient_pem else ""
+    if organization_controlled_mode() and setting_bool("organization_hard_seal_media_enabled", "0") and org_hard_pem and org_hard_fp:
+        # Preserved blocked media may already be hard-sealed to the organization key.
+        # Use the same public key for sealed export so one matching private key can
+        # decrypt both hard-sealed media and normal vault-wrapped objects.
+        if recipient_pem and recipient_fp != org_hard_fp:
+            raise HTTPException(400, "Organization hard-sealed media preservation is enabled. Use the same organization escrow public key for sealed export, or disable hard-sealed media preservation before exporting to a different key.")
+        pem = org_hard_pem
+        fp = org_hard_fp
+        return pem, fp
+    pem = (recipient_pem or get_setting("escrow_public_key_pem", "") or load_bundled_escrow_public_key()).strip()
     fp = escrow_public_fingerprint(pem) if pem else ""
     if not fp and get_setting("escrow_public_key_fingerprint", ""):
         fp = get_setting("escrow_public_key_fingerprint", "")
     if not pem or not fp:
-        raise HTTPException(400, "Sealed export requires a valid escrow/recipient RSA public key. Civilian mode uses the setup escrow public key; organization mode can paste a recipient public key on this page.")
+        raise HTTPException(400, "Sealed export requires a valid escrow/recipient RSA public key. Organization mode can paste a recipient public key on this page.")
     return pem, fp
 
 
@@ -4001,16 +5238,18 @@ def sealed_key_material(recipient_public_key_pem: str = "") -> dict[str, Any]:
     wrapped_storage = escrow_wrap(pem, KEY_FILE.read_bytes())
     configured_fp = get_setting("escrow_public_key_fingerprint", "")
     wrapped_master = ""
-    if civilian_unknown_master_mode() and (not recipient_public_key_pem or fp == configured_fp):
+    if civilian_unknown_master_mode():
         wrapped_master = get_setting("wrapped_master_key", "")
         if not wrapped_master:
             raise HTTPException(500, "Civilian Unknown Master Key mode is missing the wrapped master reveal key")
-    return {"escrow_public_key_pem": pem, "escrow_public_key_fingerprint": fp, "wrapped_storage_key": wrapped_storage, "wrapped_master_key": wrapped_master, "recipient_public_key_used": bool(recipient_public_key_pem)}
+    return {"escrow_public_key_pem": pem, "escrow_public_key_fingerprint": fp, "wrapped_storage_key": wrapped_storage, "wrapped_master_key": wrapped_master, "recipient_public_key_used": bool(recipient_public_key_pem and not civilian_unknown_master_mode())}
 
 
 def add_sealed_object(z: zipfile.ZipFile, row: dict[str, Any], object_class: str, out: list[dict[str, Any]]) -> None:
     rel_path = row.get("object_path") or ""
     src = data_path(rel_path)
+    row_hard_sealed = hard_sealed_escrow_evidence(row)
+    row_meta = evidence_meta_dict(row)
     info: dict[str, Any] = {
         "object_class": object_class,
         "id": row.get("id"),
@@ -4020,6 +5259,10 @@ def add_sealed_object(z: zipfile.ZipFile, row: dict[str, Any], object_class: str
         "logical_sha256": row.get("sha256"),
         "logical_size": row.get("size"),
         "source_encrypted": bool(row.get("encrypted")),
+        "hard_sealed_escrow_evidence": bool(row_hard_sealed),
+        "hard_sealed_civilian_evidence": bool(row_meta.get("hard_sealed_civilian_evidence")),
+        "hard_sealed_organization_media": bool(row_meta.get("hard_sealed_organization_media")),
+        "hard_sealed_escrow_public_key_fingerprint": row_meta.get("escrow_public_key_fingerprint"),
         "sealed_reencrypted": False,
         "missing": False,
     }
@@ -4029,7 +5272,15 @@ def add_sealed_object(z: zipfile.ZipFile, row: dict[str, Any], object_class: str
         return
     stored = src.read_bytes()
     sealed = stored
-    if not bool(row.get("encrypted")):
+    decrypt_with = "escrow_wrapped_vault_storage_key"
+    if row_hard_sealed:
+        # Already encrypted to the escrow public key with a per-object key. The
+        # local vault key cannot decrypt this object; sealed export copies the
+        # hard-sealed container as-is for reviewer/private-key recovery.
+        if not parse_hard_sealed_container(stored):
+            info["hard_sealed_container_warning"] = "row is marked hard-sealed, but object did not parse as a hard-sealed escrow container"
+        decrypt_with = "escrow_hard_sealed_object_key"
+    elif not bool(row.get("encrypted")):
         # Never write plaintext evidence bytes to a sealed handoff package.
         sealed = encrypt_bytes(stored)
         info["sealed_reencrypted"] = True
@@ -4040,9 +5291,30 @@ def add_sealed_object(z: zipfile.ZipFile, row: dict[str, Any], object_class: str
         "stored_object_sha256": sha256_bytes(stored),
         "sealed_object_sha256": sha256_bytes(sealed),
         "sealed_object_size": len(sealed),
-        "decrypt_with": "escrow_wrapped_vault_storage_key",
+        "decrypt_with": decrypt_with,
     })
     out.append(info)
+
+
+def hard_sealed_object_fingerprints(rows: list[dict[str, Any]]) -> set[str]:
+    fps: set[str] = set()
+    for row in rows:
+        if not hard_sealed_escrow_evidence(row):
+            continue
+        meta = evidence_meta_dict(row)
+        fp = str(meta.get("escrow_public_key_fingerprint") or "").strip()
+        if fp:
+            fps.add(fp)
+            continue
+        rel_path = row.get("object_path") or ""
+        try:
+            container = parse_hard_sealed_container(data_path(rel_path).read_bytes()) if rel_path else None
+            cfp = str((container or {}).get("escrow_public_key_fingerprint") or "").strip()
+            if cfp:
+                fps.add(cfp)
+        except Exception:
+            pass
+    return fps
 
 
 def sealed_html_summary(manifest: dict[str, Any]) -> str:
@@ -4057,6 +5329,9 @@ def build_sealed_case_package(case_id: int, actor: str, recipient: str = "", rea
         raise HTTPException(403, "Sealed evidence export is disabled in Settings")
     data = collect_case_sealed_rows(case_id)
     keymat = sealed_key_material(recipient_public_key_pem)
+    hard_fps = hard_sealed_object_fingerprints(data.get("evidence") or [])
+    if hard_fps and keymat["escrow_public_key_fingerprint"] not in hard_fps:
+        raise HTTPException(400, "This case contains hard-sealed evidence encrypted to escrow fingerprint(s) " + ", ".join(sorted(hard_fps)) + ". Use the matching escrow public key for sealed export so the reviewer private key can recover all objects.")
     created_at = utcnow()
     objects: list[dict[str, Any]] = []
     buf = io.BytesIO()
@@ -4068,7 +5343,7 @@ def build_sealed_case_package(case_id: int, actor: str, recipient: str = "", rea
                 add_sealed_object(z, row, "derived", objects)
         manifest = {
             "package_type": "blindsite_sealed_law_enforcement_evidence_package",
-            "format_version": 2,
+            "format_version": 3,
             "app": APP_NAME,
             "version": APP_VERSION,
             "created_at": created_at,
@@ -4090,6 +5365,12 @@ def build_sealed_case_package(case_id: int, actor: str, recipient: str = "", rea
             "storage_hash_at_export": storage_hash(),
             "object_count": len(objects),
             "sealed_preserved_media_count": sum(1 for e in data["evidence"] if e.get("storage_mode") == SEALED_PRESERVED_STORAGE_MODE),
+            "hard_sealed_escrow_evidence_count": sum(1 for o in objects if o.get("hard_sealed_escrow_evidence")),
+            "hard_sealed_civilian_evidence_count": sum(1 for o in objects if o.get("hard_sealed_civilian_evidence")),
+            "hard_sealed_organization_media_count": sum(1 for o in objects if o.get("hard_sealed_organization_media")),
+            "hard_sealed_escrow_fingerprints": sorted(hard_fps),
+            "civilian_hard_sealed_storage": civilian_unknown_master_mode(),
+            "organization_hard_sealed_media_storage": organization_controlled_mode() and setting_bool("organization_hard_seal_media_enabled", "0"),
             "sealed_media_preservation_policy": sealed_media_preservation_policy(data.get("case")),
             "objects": objects,
             "blocked_media": data["blocked_media"],
@@ -4100,7 +5381,7 @@ def build_sealed_case_package(case_id: int, actor: str, recipient: str = "", rea
             "stop_reports": data["stop_reports"],
             "audit_events": data["audit_events"],
             "important_disclosure": "This ZIP contains encrypted evidence objects, metadata, hashes, blocked-media records, and escrow-wrapped keys. It intentionally contains no plaintext originals.",
-            "decrypt_command": "python app.py decrypt-sealed blindsite_case_SEALED.zip --private-key escrow_private_key.pem --out reviewed_package --decrypt-evidence --i-understand",
+            "decrypt_command": "python BlindSite.py decrypt-sealed blindsite_case_SEALED.zip --private-key escrow_private_key.pem --out reviewed_package --decrypt-evidence --i-understand",
         }
         manifest_text = pretty(manifest)
         z.writestr("manifest.json", manifest_text)
@@ -4128,15 +5409,20 @@ This package is intended for law enforcement, counsel, USCM, or another cleared 
 It contains actual stored evidence objects, but only in encrypted form. It does not include plaintext originals.
 
 Civilian Unknown Master Key statement:
-- If custody_mode is civilian_unknown_master, the local user did not create or know the master reveal key through BlindSite.
+- If custody_mode is civilian_unknown_master, the local user did not create, know, or control the private reveal key through BlindSite.
+- Sensitive/original evidence objects may be hard-sealed at capture time to the USCM escrow public key. These hard-sealed objects are not decryptable by the local civilian vault key.
 - Full reveal, plaintext export, and original materialization are blocked locally through BlindSite.
-- A cleared reviewer with the escrow private key can unwrap the vault key and decrypt the encrypted_objects using this single Python file's decrypt-sealed command.
+- A cleared reviewer with the escrow private key can decrypt both hard-sealed objects and normal vault-encrypted objects using this single Python file's decrypt-sealed command.
+
+Organization hard-sealed media statement:
+- If Organization-Controlled Key mode has organization hard-sealed media enabled, preserved blocked media may be hard-sealed at capture time to the organization escrow public key.
+- Those hard-sealed media objects are not decryptable by the local BlindSite vault key and require the matching organization escrow private key in reviewer/decrypt workflow.
 
 Suggested review command:
-python app.py decrypt-sealed blindsite_case_{case_id}_sealed_evidence.zip --private-key escrow_private_key.pem --out decrypted_case_{case_id} --decrypt-evidence --i-understand
+python BlindSite.py decrypt-sealed blindsite_case_{case_id}_sealed_evidence.zip --private-key escrow_private_key.pem --out decrypted_case_{case_id} --decrypt-evidence --i-understand
 """)
     payload = buf.getvalue()
-    summary = {"case_id": case_id, "package_sha256": sha256_bytes(payload), "package_size": len(payload), "object_count": len(objects), "sealed_preserved_media_count": sum(1 for e in data["evidence"] if e.get("storage_mode") == SEALED_PRESERVED_STORAGE_MODE), "recipient": recipient, "reason": reason, "custody_mode": custody_mode(), "escrow_public_key_fingerprint": keymat["escrow_public_key_fingerprint"]}
+    summary = {"case_id": case_id, "package_sha256": sha256_bytes(payload), "package_size": len(payload), "object_count": len(objects), "sealed_preserved_media_count": sum(1 for e in data["evidence"] if e.get("storage_mode") == SEALED_PRESERVED_STORAGE_MODE), "hard_sealed_escrow_evidence_count": sum(1 for o in objects if o.get("hard_sealed_escrow_evidence")), "hard_sealed_civilian_evidence_count": sum(1 for o in objects if o.get("hard_sealed_civilian_evidence")), "hard_sealed_organization_media_count": sum(1 for o in objects if o.get("hard_sealed_organization_media")), "recipient": recipient, "reason": reason, "custody_mode": custody_mode(), "escrow_public_key_fingerprint": keymat["escrow_public_key_fingerprint"]}
     return payload, summary
 
 
@@ -4146,8 +5432,13 @@ def sealed_export_page(request: Request, case_id: int) -> HTMLResponse:
     case = case_for(case_id)
     if not case:
         raise HTTPException(404, "Case not found")
-    fp = get_setting("escrow_public_key_fingerprint", "") or escrow_public_fingerprint(get_setting("escrow_public_key_pem", "") or load_bundled_escrow_public_key())
-    body = f"""<div class='card safe'><h2>Sealed law-enforcement evidence export</h2><p>This exports the actual stored evidence blobs in encrypted form so a civilian can hand evidence to law enforcement/USCM without local plaintext reveal.</p><p>{badge(custody_label(),'info')} {badge('No plaintext originals in ZIP','good')} {badge('Encrypted evidence blobs included','warn')}</p><p><b>Escrow public-key fingerprint:</b> <code>{h(fp or 'not configured')}</code></p><form method='post' action='/cases/{case_id}/sealed-export'><label>Recipient / agency</label><input name='recipient' placeholder='Law enforcement / agency / counsel'><label>Reason / handoff note</label><textarea name='reason'></textarea><label>Optional recipient/agency public key PEM</label><textarea name='recipient_public_key_pem' rows='8' placeholder='Organization mode can paste a recipient public key here. Civilian mode normally uses the setup escrow public key.'></textarea><button class='good'>Download sealed encrypted evidence ZIP</button></form></div>"""
+    if organization_controlled_mode() and setting_bool("organization_hard_seal_media_enabled", "0") and get_setting("organization_hard_seal_public_key_fingerprint", ""):
+        fp = get_setting("organization_hard_seal_public_key_fingerprint", "")
+        fp_note = "Organization hard-sealed media public key will be used by default."
+    else:
+        fp = get_setting("escrow_public_key_fingerprint", "") or escrow_public_fingerprint(get_setting("escrow_public_key_pem", "") or load_bundled_escrow_public_key())
+        fp_note = "Paste a recipient/agency public key below for Organization-Controlled exports if no default is configured."
+    body = f"""<div class='card safe'><h2>Sealed law-enforcement evidence export</h2><p>This exports the actual stored evidence blobs in encrypted form so a civilian can hand evidence to law enforcement/USCM without local plaintext reveal.</p><p>{badge(custody_label(),'info')} {badge('No plaintext originals in ZIP','good')} {badge('Encrypted evidence blobs included','warn')}</p><p><b>Default escrow public-key fingerprint:</b> <code>{h(fp or 'not configured')}</code><br><span class='small muted'>{h(fp_note)}</span></p><form method='post' action='/cases/{case_id}/sealed-export'><label>Recipient / agency</label><input name='recipient' placeholder='Law enforcement / agency / counsel'><label>Reason / handoff note</label><textarea name='reason'></textarea><label>Optional recipient/agency public key PEM</label><textarea name='recipient_public_key_pem' rows='8' placeholder='Organization mode can paste a recipient public key here. Civilian mode uses the USCM escrow public key only.'></textarea><button class='good'>Download sealed encrypted evidence ZIP</button></form></div>"""
     return layout(request, "Sealed Evidence Export", body)
 
 
@@ -4255,6 +5546,12 @@ def sealed_zip_inspect_bytes(package_bytes: bytes) -> dict[str, Any]:
                 "contains_plaintext_evidence": manifest.get("contains_plaintext_evidence"),
                 "contains_encrypted_original_evidence": manifest.get("contains_encrypted_original_evidence"),
                 "object_count": len(manifest.get("objects") or []),
+                "sealed_preserved_media_count": manifest.get("sealed_preserved_media_count"),
+                "hard_sealed_escrow_evidence_count": manifest.get("hard_sealed_escrow_evidence_count"),
+                "hard_sealed_civilian_evidence_count": manifest.get("hard_sealed_civilian_evidence_count"),
+                "hard_sealed_organization_media_count": manifest.get("hard_sealed_organization_media_count"),
+                "civilian_hard_sealed_storage": manifest.get("civilian_hard_sealed_storage"),
+                "organization_hard_sealed_media_storage": manifest.get("organization_hard_sealed_media_storage"),
                 "objects": manifest.get("objects") or [],
             }
     except zipfile.BadZipFile as exc:
@@ -4356,7 +5653,10 @@ def decrypt_sealed_package_to_vault(package_bytes: bytes, private_key_pem: str |
                 continue
             try:
                 sealed = z.read(zip_path)
-                plaintext = package_fernet.decrypt(sealed)
+                if obj.get("decrypt_with") == "escrow_hard_sealed_object_key" or obj.get("hard_sealed_escrow_evidence") or obj.get("hard_sealed_civilian_evidence") or obj.get("hard_sealed_organization_media") or parse_hard_sealed_container(sealed):
+                    plaintext = escrow_hard_unseal_bytes(private_key, sealed)
+                else:
+                    plaintext = package_fernet.decrypt(sealed)
                 expected = obj.get("logical_sha256") or obj.get("sha256") or ""
                 actual = sha256_bytes(plaintext)
                 hash_ok = (actual == expected) if expected else True
@@ -4612,9 +5912,29 @@ def reviewer_page_objects(import_id: int, q: str = "", limit: int = 1000) -> lis
         )
         if is_page:
             pages.append(r)
-    def sort_key(row: dict[str, Any]) -> tuple[str, int]:
+    def page_preference(row: dict[str, Any]) -> int:
+        mt = str(row.get("mime_type") or "").split(";", 1)[0].lower()
+        src = reviewer_source_record(row)
+        storage = str(src.get("storage_mode") or "").lower()
+        meta = reviewer_object_meta(row)
+        if storage == SEALED_PRESERVED_PAGE_SNAPSHOT_STORAGE_MODE or meta.get("sealed_page_snapshot"):
+            return 0
+        if mt in {"text/html", "application/xhtml+xml"}:
+            return 1
+        return 2
+
+    best_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in pages:
         ctx = reviewer_page_context(row)
-        return (str(ctx.get("created_at") or row.get("created_at") or ""), int(row.get("id") or 0))
+        key = (str(ctx.get("session_id") or ""), str(ctx.get("page_url") or row.get("source_ref") or row.get("original_url") or row.get("id") or "").split("#", 1)[0])
+        existing = best_by_key.get(key)
+        if existing is None or page_preference(row) < page_preference(existing):
+            best_by_key[key] = row
+    pages = list(best_by_key.values())
+
+    def sort_key(row: dict[str, Any]) -> tuple[str, int, int]:
+        ctx = reviewer_page_context(row)
+        return (str(ctx.get("created_at") or row.get("created_at") or ""), page_preference(row), int(row.get("id") or 0))
     pages.sort(key=sort_key)
     return pages[:limit]
 
@@ -4859,6 +6179,8 @@ def reviewer_rewrite_srcset(value: str, source_url: str, asset_map: dict[str, di
 
 
 def reviewer_csp_for_mode(mode: str) -> str:
+    if mode == "auto":
+        mode = "safe"
     if mode == "scripts":
         return "default-src 'self' data: blob: http: https:; img-src 'self' data: blob: http: https:; media-src 'self' data: blob: http: https:; style-src 'self' 'unsafe-inline' http: https:; font-src 'self' data: http: https:; script-src 'self' 'unsafe-inline' 'unsafe-eval' http: https:; connect-src 'self' http: https: ws: wss:; frame-src http: https:; object-src 'none'; base-uri 'none'; form-action http: https:"
     if mode == "remote":
@@ -4866,8 +6188,10 @@ def reviewer_csp_for_mode(mode: str) -> str:
     return "default-src 'none'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'none'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
 
 
-def reviewer_render_html(import_id: int, obj: dict[str, Any], mode: str = "safe") -> str:
-    mode = mode if mode in {"safe", "remote", "scripts"} else "safe"
+def reviewer_render_html(import_id: int, obj: dict[str, Any], mode: str = "auto") -> str:
+    mode = mode if mode in {"auto", "safe", "remote", "scripts"} else "auto"
+    if mode == "auto":
+        mode = "safe"
     allow_remote = mode in {"remote", "scripts"}
     allow_scripts = mode == "scripts"
     raw_html = read_reviewer_object(obj).decode("utf-8", errors="replace")
@@ -4981,6 +6305,40 @@ def reviewer_render_html(import_id: int, obj: dict[str, Any], mode: str = "safe"
     style_tag = soup.new_tag("style")
     style_tag.string = "[data-reviewer-removed]{display:block;padding:8px;margin:4px;border:1px dashed #64748b;background:#111827;color:#e5e7eb;font-family:Segoe UI,Arial,sans-serif}.reviewer-banner{position:sticky;top:0;z-index:2147483647;background:#111827;color:#e5e7eb;border-bottom:2px solid #38bdf8;padding:8px 12px;font:14px Segoe UI,Arial,sans-serif}img,video{max-width:100%;height:auto}"
     soup.head.append(style_tag)
+    if allow_scripts:
+        guard = soup.new_tag("script")
+        guard["data-blindsite-reviewer-guard"] = "1"
+        guard.string = r"""
+(function(){
+  // Dynamic reviewer safety net: some modern sites render correctly, then their
+  // client JS clears the DOM when cookies/API state are missing. Preserve the
+  // first usable recovered DOM and restore it if the page blanks itself.
+  let snap = null;
+  let snapTextLen = 0;
+  function take(){
+    if (!document.body) return;
+    const html = document.body.innerHTML || '';
+    const text = (document.body.innerText || '').trim();
+    if (html.length > 500 && text.length > 20) { snap = html; snapTextLen = text.length; }
+  }
+  function check(){
+    if (!snap || !document.body) return;
+    const html = document.body.innerHTML || '';
+    const text = (document.body.innerText || '').trim();
+    if ((html.length < Math.max(300, snap.length * 0.20)) || (snapTextLen > 100 && text.length < snapTextLen * 0.15)) {
+      document.body.innerHTML = snap;
+      const note = document.createElement('div');
+      note.className = 'reviewer-banner';
+      note.textContent = 'BlindSite restored the recovered DOM after site JavaScript blanked the page. Remote scripts/callbacks are still enabled in this view.';
+      document.body.insertBefore(note, document.body.firstChild);
+    }
+  }
+  window.addEventListener('DOMContentLoaded', function(){ setTimeout(take, 250); setTimeout(take, 1000); });
+  setTimeout(take, 500);
+  let n = 0; const id = setInterval(function(){ check(); if (++n > 18) clearInterval(id); }, 700);
+})();
+"""
+        soup.head.append(guard)
     banner = soup.new_tag("div")
     banner["class"] = "reviewer-banner"
     if mode == "scripts":
@@ -5025,7 +6383,7 @@ def reviewer_page_payload_model(obj: dict[str, Any]) -> dict[str, Any]:
     return {**ctx, "payload_kind": "text_page", "summary": {"title": ctx.get("title") or obj.get("filename"), "text": text[:300000], "links": [], "removed_counts": {}}, "metadata": ctx.get("source_meta") or {}, "parsed": parsed}
 
 
-def reviewer_page_summary_frame_html(import_id: int, page_obj: dict[str, Any], mode: str = "safe") -> str:
+def reviewer_page_summary_frame_html(import_id: int, page_obj: dict[str, Any], mode: str = "auto") -> str:
     model = reviewer_page_payload_model(page_obj)
     media = reviewer_related_objects(import_id, page_obj, include_session_fallback=True, include_non_media=False, limit=300)
     blocked = reviewer_blocked_records_for_page(import_id, page_obj, limit=500)
@@ -5041,7 +6399,9 @@ def reviewer_page_summary_frame_html(import_id: int, page_obj: dict[str, Any], m
     removed_rows = "".join(f"<tr><td>{h(k)}</td><td>{h(v)}</td></tr>" for k, v in removed.items())
     blocked_rows = "".join(f"<tr><td>{h(b.get('id') or '')}</td><td>{h(b.get('resource_type') or '')}</td><td>{'downloaded/recovered' if b.get('downloaded') else 'metadata only'}</td><td class='urlcell'>{h(b.get('media_url') or '')}</td><td class='hashcell'><code>{h(b.get('url_sha256') or sha256_text(b.get('media_url') or ''))}</code></td></tr>" for b in blocked)
     meta_pre = h(pretty(metadata)[:80000])
-    mode_note = "Local recovered-media view. Scripts, forms, navigation, and remote callbacks are disabled."
+    if mode == "auto":
+        mode = "safe"
+    mode_note = "Best available local recovered-media view. Scripts, forms, navigation, and remote callbacks are disabled."
     if mode == "remote":
         mode_note = "Remote-callback mode selected. Safe-summary page text is local; raw HTML pages may load missing remote media/style."
     elif mode == "scripts":
@@ -5061,7 +6421,7 @@ body{{margin:0;background:#0f172a;color:#e5e7eb;font-family:Segoe UI,Arial,sans-
 </body></html>"""
 
 
-def reviewer_page_frame_html(import_id: int, page_obj: dict[str, Any], mode: str = "safe") -> str:
+def reviewer_page_frame_html(import_id: int, page_obj: dict[str, Any], mode: str = "auto") -> str:
     data = read_reviewer_object(page_obj)
     mt = (page_obj.get("mime_type") or "application/octet-stream").split(";", 1)[0].lower()
     if mt in {"text/html", "application/xhtml+xml"} or data[:512].lstrip().lower().startswith((b"<!doctype", b"<html", b"<head", b"<body")):
@@ -5104,7 +6464,7 @@ def reviewer_page(request: Request, msg: str | None = None) -> HTMLResponse:
     user = require_reviewer(request)
     rows = fetchall("SELECT * FROM reviewer_imports ORDER BY id DESC LIMIT 100")
     trs = "".join(f"<tr><td><a href='/reviewer/imports/{r['id']}/viewer'>#{r['id']}</a></td><td>{h(r['package_name'])}</td><td>{badge(r['status'],'good' if r['status']=='imported' else 'warn' if r['status']=='imported_with_errors' else 'bad' if r['status']=='error' else 'info')}</td><td>{h(r['case_name'] or '')}</td><td>{h(r['recovered_count'])}/{h(r['object_count'])}</td><td><a class='button good' href='/reviewer/imports/{r['id']}/pages'>Pages</a> <a class='button secondary' href='/reviewer/imports/{r['id']}/viewer'>Objects</a></td><td><code>{h((r['package_sha256'] or '')[:24])}…</code></td><td>{h(r['created_at'])}</td></tr>" for r in rows)
-    body = f"""{flash(msg)}<div class='card safe'><h2>Law-enforcement / cleared reviewer import</h2><p>Import a sealed BlindSite / Forensic Tor Vault evidence package with the escrow private key. Recovered plaintext is written only into this local review vault and indexed for browsing.</p><form method='post' action='/reviewer/import' enctype='multipart/form-data'><label>Sealed evidence ZIP</label><input type='file' name='package' accept='.zip' required><label>Escrow private key PEM</label><input type='file' name='private_key' accept='.pem,.key,.txt' required><label>Private-key passphrase, if any</label><input type='password' name='passphrase'><label>Import note</label><textarea name='note' placeholder='Agency/case note'></textarea><button class='good'>Import and decrypt into review vault</button></form></div><div class='card'><h2>Reviewer imports</h2><table><tr><th>ID</th><th>Package</th><th>Status</th><th>Case</th><th>Recovered</th><th>Open</th><th>Package SHA-256</th><th>Imported</th></tr>{trs or '<tr><td colspan="8" class="muted">No reviewer imports yet.</td></tr>'}</table></div>"""
+    body = f"""{flash(msg)}<div class='card safe'><h2>Law-enforcement / cleared reviewer import</h2><p>Import a sealed BlindSite evidence package with the escrow private key. Recovered plaintext is written only into this local review vault and indexed for browsing.</p><form method='post' action='/reviewer/import' enctype='multipart/form-data'><label>Sealed evidence ZIP</label><input type='file' name='package' accept='.zip' required><label>Escrow private key PEM</label><input type='file' name='private_key' accept='.pem,.key,.txt' required><label>Private-key passphrase, if any</label><input type='password' name='passphrase'><label>Import note</label><textarea name='note' placeholder='Agency/case note'></textarea><button class='good'>Import and decrypt into review vault</button></form></div><div class='card'><h2>Reviewer imports</h2><table><tr><th>ID</th><th>Package</th><th>Status</th><th>Case</th><th>Recovered</th><th>Open</th><th>Package SHA-256</th><th>Imported</th></tr>{trs or '<tr><td colspan="8" class="muted">No reviewer imports yet.</td></tr>'}</table></div>"""
     log_event(user["username"], "REVIEWER_AREA_OPENED")
     return layout(request, "LE Reviewer", body)
 
@@ -5128,14 +6488,14 @@ def reviewer_import_detail_alias(request: Request, import_id: int) -> HTMLRespon
 
 
 @app.get("/reviewer/imports/{import_id}/pages", response_class=HTMLResponse)
-def reviewer_pages_viewer(request: Request, import_id: int, page: str = "", render: str = "safe", q: str = "", msg: str | None = None) -> HTMLResponse:
+def reviewer_pages_viewer(request: Request, import_id: int, page: str = "", render: str = "auto", q: str = "", msg: str | None = None) -> HTMLResponse:
     user = require_reviewer(request)
     imp = reviewer_import_for(import_id)
     if not imp:
         raise HTTPException(404, "Reviewer import not found")
-    if render not in {"safe", "remote", "scripts"}:
-        render = get_setting("reviewer_default_render_mode", "safe")
-        render = render if render in {"safe", "remote", "scripts"} else "safe"
+    if render not in {"auto", "safe", "remote", "scripts"}:
+        render = get_setting("reviewer_default_render_mode", "auto")
+        render = render if render in {"auto", "safe", "remote", "scripts"} else "auto"
     pages = reviewer_page_objects(import_id, q=q, limit=600)
     selected_id = int(page) if str(page).isdigit() else (int(pages[0]["id"]) if pages else 0)
     selected = reviewer_object_for(selected_id) if selected_id else None
@@ -5165,7 +6525,7 @@ def reviewer_pages_viewer(request: Request, import_id: int, page: str = "", rend
         frame_url = f"/reviewer/imports/{import_id}/pages/{selected['id']}/frame?mode={h(render)}"
         frame = f"<iframe class='render-frame' sandbox='{sandbox}' src='{frame_url}'></iframe>"
         base = f"/reviewer/imports/{import_id}/pages?page={selected['id']}&q={h(q)}"
-        render_controls = f"""<div class='card {'danger' if render=='scripts' else 'warn' if render=='remote' else 'safe'}'><h3>Page render mode</h3><p>{badge('local safe page view','good') if render=='safe' else badge('allow remote callbacks','warn') if render=='remote' else badge('allow remote callbacks + scripts','bad')}</p><p><a class='button good' href='{base}&render=safe'>Local safe view</a> <a class='button warn' href='{base}&render=remote'>Allow remote callbacks</a> <a class='button danger' href='{base}&render=scripts'>Allow remote callbacks + scripts</a></p><p class='small muted'>Safe view uses recovered local page data and associated recovered media. For raw HTML pages it rewrites local assets first. For safe-summary captures it renders a readable page-content view with associated recovered media.</p></div>"""
+        render_controls = f"""<div class='card {'danger' if render=='scripts' else 'warn' if render=='remote' else 'safe'}'><h3>Page render mode</h3><p>{badge('best available local view','good') if render=='auto' else badge('local safe page view','good') if render=='safe' else badge('allow remote callbacks','warn') if render=='remote' else badge('allow remote callbacks + scripts','bad')}</p><p><a class='button good' href='{base}&render=auto'>Best available</a> <a class='button good' href='{base}&render=safe'>Local safe view</a> <a class='button warn' href='{base}&render=remote'>Allow remote callbacks</a> <a class='button danger' href='{base}&render=scripts'>Allow remote callbacks + scripts</a></p><p class='small muted'>Best available is safe/local by default. Use remote+scripts for dynamic sites that need live callbacks; BlindSite adds a small DOM guard to restore the recovered page if site JavaScript blanks it.</p></div>"""
         media_rows = "".join(
             f"<tr><td><a class='button' href='/reviewer/imports/{import_id}/viewer?obj={m['id']}'>Open</a></td><td>{badge(m.get('kind'),'info')}</td><td>{h(m.get('filename'))}</td><td>{h(m.get('mime_type'))}</td><td>{h(m.get('size'))}</td><td class='urlcell'>{h(m.get('original_url') or m.get('source_ref') or '')}</td><td>{h(m.get('_reviewer_match_reason') or '')}</td><td class='hashcell'><code>{h(m.get('sha256') or '')}</code></td></tr>"
             for m in associated
@@ -5182,14 +6542,14 @@ def reviewer_pages_viewer(request: Request, import_id: int, page: str = "", rend
 
 
 @app.get("/reviewer/imports/{import_id}/pages/{object_id}/frame", response_class=HTMLResponse)
-def reviewer_page_frame_route(request: Request, import_id: int, object_id: int, mode: str = "safe") -> HTMLResponse:
+def reviewer_page_frame_route(request: Request, import_id: int, object_id: int, mode: str = "auto") -> HTMLResponse:
     user = require_reviewer(request)
     obj = reviewer_object_for(object_id)
     if not obj or int(obj.get("import_id") or 0) != import_id:
         raise HTTPException(404, "Recovered page object not found")
     if obj.get("kind") != "page" and (obj.get("mime_type") or "").split(";", 1)[0].lower() not in {"text/html", "application/xhtml+xml"}:
         raise HTTPException(400, "Selected object is not a recovered page capture")
-    mode = mode if mode in {"safe", "remote", "scripts"} else "safe"
+    mode = mode if mode in {"auto", "safe", "remote", "scripts"} else "auto"
     html_doc = reviewer_page_frame_html(import_id, obj, mode)
     log_event(user["username"], "REVIEWER_PAGE_FRAME_SERVED", details={"reviewer_import_id": import_id, "page_object_id": object_id, "mode": mode})
     return HTMLResponse(html_doc, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Content-Security-Policy": reviewer_csp_for_mode(mode)})
@@ -5203,9 +6563,9 @@ def reviewer_viewer(request: Request, import_id: int, kind: str = "all", q: str 
         raise HTTPException(404, "Reviewer import not found")
     if kind not in {"all", "pages", "snapshots", "images", "videos", "audio", "text", "other"}:
         kind = "all"
-    if render not in {"safe", "remote", "scripts"}:
-        render = get_setting("reviewer_default_render_mode", "safe")
-        render = render if render in {"safe", "remote", "scripts"} else "safe"
+    if render not in {"auto", "safe", "remote", "scripts"}:
+        render = get_setting("reviewer_default_render_mode", "auto")
+        render = render if render in {"auto", "safe", "remote", "scripts"} else "auto"
     objects = reviewer_objects_filtered(import_id, kind, q, limit=1000)
     selected_id = int(obj) if str(obj).isdigit() else (int(objects[0]["id"]) if objects else 0)
     selected = reviewer_object_for(selected_id) if selected_id else None
@@ -5333,7 +6693,7 @@ def case_viewer_zip(request: Request, case_id: int, include_assets: str | None =
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("README.txt", (
-            "Forensic Tor Vault offline case viewer. Open index.html first.\n"
+            "BlindSite offline case viewer. Open index.html first.\n"
             "If include_assets=false, viewers are safe summaries and contain no original media bytes.\n"
             "If include_assets=true, saved local assets captured under lab/full-forensic policy are included and rendered offline.\n"
             "No page viewer in this bundle contacts the live site.\n"
@@ -5368,7 +6728,7 @@ def case_viewer_zip(request: Request, case_id: int, include_assets: str | None =
                 rows.append(f"<tr><td><a href='{h(page_name)}'>{h(model.get('title') or ev.get('filename') or 'Saved page')}</a></td><td>{h(renderer)}</td><td>{h(asset_count)}</td><td>{h(c.get('capture_mode'))}</td><td>{h(c.get('page_url'))}</td><td><code>{h(ev.get('sha256'))}</code></td></tr>")
             except Exception as exc:
                 z.writestr(f"saved_pages/errors/evidence_{c.get('evidence_id','unknown')}.txt", str(exc))
-        index = f"""<!doctype html><html><head><meta charset='utf-8'><title>Forensic Tor Vault case {h(case_id)} offline viewer</title><style>body{{font-family:Arial,sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}code{{word-break:break-all}}.muted{{color:#666}}</style></head><body><h1>Forensic Tor Vault offline case viewer</h1><h2>{h(case.get('name',''))}</h2><p class='muted'>Generated {h(utcnow())}. Include saved assets: {h(want_assets)}. All viewers use local files only and do not contact the live site.</p><table><tr><th>Saved page</th><th>Renderer</th><th>Saved assets</th><th>Capture mode</th><th>Source URL</th><th>Evidence SHA-256</th></tr>{''.join(rows) or '<tr><td colspan="6">No saved pages.</td></tr>'}</table></body></html>"""
+        index = f"""<!doctype html><html><head><meta charset='utf-8'><title>BlindSite case {h(case_id)} offline viewer</title><style>body{{font-family:Arial,sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}code{{word-break:break-all}}.muted{{color:#666}}</style></head><body><h1>BlindSite offline case viewer</h1><h2>{h(case.get('name',''))}</h2><p class='muted'>Generated {h(utcnow())}. Include saved assets: {h(want_assets)}. All viewers use local files only and do not contact the live site.</p><table><tr><th>Saved page</th><th>Renderer</th><th>Saved assets</th><th>Capture mode</th><th>Source URL</th><th>Evidence SHA-256</th></tr>{''.join(rows) or '<tr><td colspan="6">No saved pages.</td></tr>'}</table></body></html>"""
         z.writestr("index.html", index)
     log_event(user["username"], "CASE_VIEWER_ZIP_EXPORTED", case_id=case_id, details={"include_assets": want_assets, "page_count": len(captures)})
     buf.seek(0)
@@ -5403,11 +6763,11 @@ def settings_page(request: Request, msg: str | None = None) -> HTMLResponse:
       <label><input type='checkbox' name='capture_auto_scroll_enabled' value='1' {'checked' if truthy(s.get('capture_auto_scroll_enabled','1')) else ''}> Capture: auto-scroll before saving to trigger lazy-loaded content</label>
       <div class='row'><div><label>Capture wait after load (ms)</label><input name='capture_wait_after_load_ms' value='{h(s.get('capture_wait_after_load_ms','1500'))}'></div><div><label>Capture network-idle timeout (ms)</label><input name='capture_network_idle_timeout_ms' value='{h(s.get('capture_network_idle_timeout_ms','8000'))}'></div><div><label>Capture total settle timeout (ms)</label><input name='capture_settle_timeout_ms' value='{h(s.get('capture_settle_timeout_ms','30000'))}'></div></div>
       <div class='row'><div><label>Auto-scroll max steps</label><input name='capture_auto_scroll_max_steps' value='{h(s.get('capture_auto_scroll_max_steps','30'))}'></div><div><label>Auto-scroll pause (ms)</label><input name='capture_auto_scroll_pause_ms' value='{h(s.get('capture_auto_scroll_pause_ms','550'))}'></div><div><label>Stable rounds before save</label><input name='capture_stable_rounds' value='{h(s.get('capture_stable_rounds','3'))}'></div></div>
-      <div class='row'><div><label>Initial navigation timeout (ms)</label><input name='live_initial_navigation_timeout_ms' value='{h(s.get('live_initial_navigation_timeout_ms','60000'))}'></div><div><label>Auto-capture delay after navigation (ms)</label><input name='live_auto_capture_delay_ms' value='{h(s.get('live_auto_capture_delay_ms','2500'))}'></div><div><label>Reviewer default render mode</label><select name='reviewer_default_render_mode'><option value='safe' {'selected' if s.get('reviewer_default_render_mode','safe')=='safe' else ''}>safe local only</option><option value='remote' {'selected' if s.get('reviewer_default_render_mode','safe')=='remote' else ''}>allow remote callbacks</option><option value='scripts' {'selected' if s.get('reviewer_default_render_mode','safe')=='scripts' else ''}>allow remote + scripts</option></select></div></div>
+      <div class='row'><div><label>Initial navigation timeout (ms)</label><input name='live_initial_navigation_timeout_ms' value='{h(s.get('live_initial_navigation_timeout_ms','60000'))}'></div><div><label>Auto-capture delay after navigation (ms)</label><input name='live_auto_capture_delay_ms' value='{h(s.get('live_auto_capture_delay_ms','2500'))}'></div><div><label>Reviewer default render mode</label><select name='reviewer_default_render_mode'><option value='auto' {'selected' if s.get('reviewer_default_render_mode','auto')=='auto' else ''}>auto / best available</option><option value='safe' {'selected' if s.get('reviewer_default_render_mode','auto')=='safe' else ''}>safe local only</option><option value='remote' {'selected' if s.get('reviewer_default_render_mode','auto')=='remote' else ''}>allow remote callbacks</option><option value='scripts' {'selected' if s.get('reviewer_default_render_mode','auto')=='scripts' else ''}>allow remote + scripts</option></select></div></div>
       <label><input type='checkbox' name='reviewer_enabled' value='1' {'checked' if truthy(s.get('reviewer_enabled','1')) else ''}> Enable law-enforcement / cleared reviewer import and viewer area</label>
       <label><input type='checkbox' name='sealed_export_enabled' value='1' {'checked' if truthy(s.get('sealed_export_enabled','1')) else ''}> Enable sealed encrypted law-enforcement evidence export</label>
       <label><input type='checkbox' name='sealed_export_include_derived' value='1' {'checked' if truthy(s.get('sealed_export_include_derived','1')) else ''}> Sealed export includes encrypted derived artifacts/snapshots when available</label>
-      <div class='card warn'><h3>Sealed Media Preservation Mode</h3><p class='small muted'>Works in both Organization-Controlled Key and Civilian Unknown Master Key modes. Blocked images/video/audio remain invisible in the live browser, but selected blocked media can be stored encrypted for sealed reviewer / law-enforcement access. Organization-mode local reveal is master-key gated; civilian mode local reveal remains blocked.</p><label><input type='checkbox' name='sealed_media_preservation_enabled' value='1' {'checked' if truthy(s.get('sealed_media_preservation_enabled','0')) else ''}> Enable sealed media preservation globally</label><label><input type='checkbox' name='sealed_media_preserve_images' value='1' {'checked' if truthy(s.get('sealed_media_preserve_images','1')) else ''}> Preserve blocked images encrypted</label><label><input type='checkbox' name='sealed_media_preserve_video' value='1' {'checked' if truthy(s.get('sealed_media_preserve_video','1')) else ''}> Preserve blocked video encrypted</label><label><input type='checkbox' name='sealed_media_preserve_audio' value='1' {'checked' if truthy(s.get('sealed_media_preserve_audio','1')) else ''}> Preserve blocked audio encrypted</label><div class='row'><div><label>Max bytes per preserved object</label><input name='sealed_media_preserve_max_bytes' value='{h(s.get('sealed_media_preserve_max_bytes','52428800'))}'></div><div><label>Max total bytes per live session</label><input name='sealed_media_preserve_max_total_bytes' value='{h(s.get('sealed_media_preserve_max_total_bytes','209715200'))}'></div><div><label>Max preserved items per live session</label><input name='sealed_media_preserve_max_items_per_session' value='{h(s.get('sealed_media_preserve_max_items_per_session','250'))}'></div></div><label>MIME allowlist, one prefix/type per line</label><textarea name='sealed_media_preserve_mime_allowlist'>{sealed_mime_allowlist}</textarea></div>
+      <div class='card warn'><h3>Sealed Media Preservation Mode</h3><p class='small muted'>Works in both Organization-Controlled Key and Civilian Unknown Master Key modes. Blocked images/video/audio remain invisible in the live browser, but selected blocked media can be stored encrypted for sealed reviewer / law-enforcement access. Organization mode can use normal local vault encryption or optional hard-sealed reviewer-key storage; civilian mode local reveal remains blocked.</p><label><input type='checkbox' name='sealed_media_preservation_enabled' value='1' {'checked' if truthy(s.get('sealed_media_preservation_enabled','0')) else ''}> Enable sealed media preservation globally</label><label><input type='checkbox' name='sealed_media_preserve_images' value='1' {'checked' if truthy(s.get('sealed_media_preserve_images','1')) else ''}> Preserve blocked images encrypted</label><label><input type='checkbox' name='sealed_media_preserve_video' value='1' {'checked' if truthy(s.get('sealed_media_preserve_video','1')) else ''}> Preserve blocked video encrypted</label><label><input type='checkbox' name='sealed_media_preserve_audio' value='1' {'checked' if truthy(s.get('sealed_media_preserve_audio','1')) else ''}> Preserve blocked audio encrypted</label><div class='row'><div><label>Preservation mode</label><select name='sealed_media_preserve_mode'><option value='fast' {'selected' if s.get('sealed_media_preserve_mode','balanced')=='fast' else ''}>fast / least page slowdown</option><option value='balanced' {'selected' if s.get('sealed_media_preserve_mode','balanced')=='balanced' else ''}>balanced / default</option><option value='complete' {'selected' if s.get('sealed_media_preserve_mode','balanced')=='complete' else ''}>complete / try harder</option></select></div><div><label>Route fetch timeout (ms)</label><input name='sealed_media_preserve_fetch_timeout_ms' value='{h(s.get('sealed_media_preserve_fetch_timeout_ms','3500'))}'></div><div><label>Background timeout (ms)</label><input name='sealed_media_preserve_background_timeout_ms' value='{h(s.get('sealed_media_preserve_background_timeout_ms','18000'))}'></div></div><div class='row'><div><label>Max bytes per preserved object</label><input name='sealed_media_preserve_max_bytes' value='{h(s.get('sealed_media_preserve_max_bytes','52428800'))}'></div><div><label>Max total bytes per live session</label><input name='sealed_media_preserve_max_total_bytes' value='{h(s.get('sealed_media_preserve_max_total_bytes','209715200'))}'></div><div><label>Max preserved items per live session</label><input name='sealed_media_preserve_max_items_per_session' value='{h(s.get('sealed_media_preserve_max_items_per_session','250'))}'></div><div><label>Max pending background tasks</label><input name='sealed_media_preserve_max_pending_tasks' value='{h(s.get('sealed_media_preserve_max_pending_tasks','12'))}'><p class='small muted'>Raise to 24–64 if you see queue full.</p></div></div><label><input type='checkbox' name='sealed_media_preserve_skip_decorative_fast' value='1' {'checked' if truthy(s.get('sealed_media_preserve_skip_decorative_fast','1')) else ''}> Fast mode: skip/deprioritize decorative logo/favicon/badge assets so they do not slow page loading</label><label>MIME allowlist, one prefix/type per line</label><textarea name='sealed_media_preserve_mime_allowlist'>{sealed_mime_allowlist}</textarea><div class='card warn'><h3>Organization hard-sealed preserved media</h3><p class='small muted'>Organization mode only. When enabled, preserved blocked media is encrypted to this organization/reviewer public key at capture time. The local vault key cannot decrypt those preserved media originals; reviewer import requires the matching private key.</p><label><input type='checkbox' name='organization_hard_seal_media_enabled' value='1' {'checked' if truthy(s.get('organization_hard_seal_media_enabled','0')) else ''}> Hard-seal preserved blocked media to organization escrow public key</label><label>Organization escrow public key PEM</label><textarea name='organization_hard_seal_public_key_pem' rows='8' placeholder='Paste organization/reviewer escrow_public_key.pem here'>{h(s.get('organization_hard_seal_public_key_pem',''))}</textarea><p class='small muted'>Current fingerprint: <code>{h(s.get('organization_hard_seal_public_key_fingerprint','') or 'not configured')}</code></p></div></div>
       <label><input type='checkbox' name='head_probe_blocked_media' value='1' {'checked' if truthy(s.get('head_probe_blocked_media')) else ''}> HEAD probe blocked media for headers without body download</label>
       <label><input type='checkbox' name='reject_inline_media_in_safe_mode' value='1' {'checked' if truthy(s.get('reject_inline_media_in_safe_mode')) else ''}> Safe mode: minimize/reject inline embedded media summaries</label>
       <div class='row'><div><label>Max root read bytes</label><input name='max_root_read_bytes' value='{h(s.get('max_root_read_bytes','524288'))}'></div><div><label>Max summary chars</label><input name='max_text_summary_chars' value='{h(s.get('max_text_summary_chars','20000'))}'></div><div><label>Max blocked records</label><input name='max_blocked_records' value='{h(s.get('max_blocked_records','1000'))}'></div></div>
@@ -5425,7 +6785,7 @@ def settings_page(request: Request, msg: str | None = None) -> HTMLResponse:
 @app.post("/settings")
 def settings_save(request: Request,
     edition: str = Form("lockdown"), default_capture_mode: str = Form("metadata_only"), default_media_policy: str = Form("block_images_video"), default_user_agent_profile: str = Form("chrome_windows"), custom_user_agent: str = Form(""), live_browser_default: str = Form("tor_managed_chromium"),
-    hard_default_safe_mode: str | None = Form(None), disable_full_reveal_in_lockdown: str | None = Form(None), disable_plaintext_export_in_lockdown: str | None = Form(None), disable_materialization_in_lockdown: str | None = Form(None), allow_blur_in_lockdown: str | None = Form(None), require_master_key_full_reveal: str | None = Form(None), require_approval_full_reveal: str | None = Form(None), require_approval_plaintext_export: str | None = Form(None), require_approval_materialization: str | None = Form(None), live_javascript_enabled: str | None = Form(None), live_download_allowed_media_default: str | None = Form(None), live_auto_capture_default: str | None = Form(None), capture_settle_before_save: str | None = Form(None), capture_auto_scroll_enabled: str | None = Form(None), reviewer_enabled: str | None = Form(None), sealed_export_enabled: str | None = Form(None), sealed_export_include_derived: str | None = Form(None), sealed_media_preservation_enabled: str | None = Form(None), sealed_media_preserve_images: str | None = Form(None), sealed_media_preserve_video: str | None = Form(None), sealed_media_preserve_audio: str | None = Form(None), sealed_media_preserve_max_bytes: str = Form("52428800"), sealed_media_preserve_max_total_bytes: str = Form("209715200"), sealed_media_preserve_max_items_per_session: str = Form("250"), sealed_media_preserve_mime_allowlist: str = Form("image/\nvideo/\naudio/"), head_probe_blocked_media: str | None = Form(None), reject_inline_media_in_safe_mode: str | None = Form(None), max_root_read_bytes: str = Form("524288"), max_text_summary_chars: str = Form("20000"), max_blocked_records: str = Form("1000"), snapshot_max_media_bytes: str = Form("52428800"), snapshot_max_media_items: str = Form("250"), snapshot_max_total_asset_bytes: str = Form("209715200"), capture_wait_after_load_ms: str = Form("1500"), capture_network_idle_timeout_ms: str = Form("8000"), capture_settle_timeout_ms: str = Form("30000"), capture_auto_scroll_max_steps: str = Form("30"), capture_auto_scroll_pause_ms: str = Form("550"), capture_stable_rounds: str = Form("3"), live_initial_navigation_timeout_ms: str = Form("60000"), live_auto_capture_delay_ms: str = Form("2500"), reviewer_default_render_mode: str = Form("safe"), safe_allowlist_domains: str = Form(""), capture_denylist_domains: str = Form(""), tor_browser_path: str = Form(""), tor_executable_path: str = Form(""), tor_auto_start_from_browser_bundle: str | None = Form(None), tor_browser_force_socks: str | None = Form(None), tor_host: str = Form("127.0.0.1"), tor_socks_port: str = Form("9050"), tor_control_port: str = Form("9051"), tor_control_password: str = Form("")) -> RedirectResponse:
+    hard_default_safe_mode: str | None = Form(None), disable_full_reveal_in_lockdown: str | None = Form(None), disable_plaintext_export_in_lockdown: str | None = Form(None), disable_materialization_in_lockdown: str | None = Form(None), allow_blur_in_lockdown: str | None = Form(None), require_master_key_full_reveal: str | None = Form(None), require_approval_full_reveal: str | None = Form(None), require_approval_plaintext_export: str | None = Form(None), require_approval_materialization: str | None = Form(None), live_javascript_enabled: str | None = Form(None), live_download_allowed_media_default: str | None = Form(None), live_auto_capture_default: str | None = Form(None), capture_settle_before_save: str | None = Form(None), capture_auto_scroll_enabled: str | None = Form(None), reviewer_enabled: str | None = Form(None), sealed_export_enabled: str | None = Form(None), sealed_export_include_derived: str | None = Form(None), sealed_media_preservation_enabled: str | None = Form(None), sealed_media_preserve_images: str | None = Form(None), sealed_media_preserve_video: str | None = Form(None), sealed_media_preserve_audio: str | None = Form(None), sealed_media_preserve_max_bytes: str = Form("52428800"), sealed_media_preserve_max_total_bytes: str = Form("209715200"), sealed_media_preserve_max_items_per_session: str = Form("250"), sealed_media_preserve_max_pending_tasks: str = Form("12"), sealed_media_preserve_mime_allowlist: str = Form("image/\nvideo/\naudio/"), sealed_media_preserve_mode: str = Form("balanced"), sealed_media_preserve_fetch_timeout_ms: str = Form("3500"), sealed_media_preserve_background_timeout_ms: str = Form("18000"), sealed_media_preserve_skip_decorative_fast: str | None = Form(None), organization_hard_seal_media_enabled: str | None = Form(None), organization_hard_seal_public_key_pem: str = Form(""), head_probe_blocked_media: str | None = Form(None), reject_inline_media_in_safe_mode: str | None = Form(None), max_root_read_bytes: str = Form("524288"), max_text_summary_chars: str = Form("20000"), max_blocked_records: str = Form("1000"), snapshot_max_media_bytes: str = Form("52428800"), snapshot_max_media_items: str = Form("250"), snapshot_max_total_asset_bytes: str = Form("209715200"), capture_wait_after_load_ms: str = Form("1500"), capture_network_idle_timeout_ms: str = Form("8000"), capture_settle_timeout_ms: str = Form("30000"), capture_auto_scroll_max_steps: str = Form("30"), capture_auto_scroll_pause_ms: str = Form("550"), capture_stable_rounds: str = Form("3"), live_initial_navigation_timeout_ms: str = Form("60000"), live_auto_capture_delay_ms: str = Form("2500"), reviewer_default_render_mode: str = Form("auto"), safe_allowlist_domains: str = Form(""), capture_denylist_domains: str = Form(""), tor_browser_path: str = Form(""), tor_executable_path: str = Form(""), tor_auto_start_from_browser_bundle: str | None = Form(None), tor_browser_force_socks: str | None = Form(None), tor_host: str = Form("127.0.0.1"), tor_socks_port: str = Form("9050"), tor_control_port: str = Form("9051"), tor_control_password: str = Form("")) -> RedirectResponse:
     user = require_admin(request)
     if civilian_unknown_master_mode():
         edition = "lockdown"
@@ -5437,21 +6797,44 @@ def settings_save(request: Request,
         require_approval_full_reveal = "1"
         require_approval_plaintext_export = "1"
         require_approval_materialization = "1"
+        organization_hard_seal_media_enabled = None
+        organization_hard_seal_public_key_pem = ""
     if edition not in EDITIONS: edition = "lockdown"
     if default_capture_mode not in CAPTURE_MODES: default_capture_mode = "metadata_only"
     if default_media_policy not in MEDIA_POLICIES: default_media_policy = "block_images_video"
     if default_user_agent_profile not in USER_AGENT_PROFILES: default_user_agent_profile = "chrome_windows"
     if live_browser_default not in BROWSERS: live_browser_default = "tor_managed_chromium"
-    if reviewer_default_render_mode not in {"safe", "remote", "scripts"}: reviewer_default_render_mode = "safe"
+    if reviewer_default_render_mode not in {"auto", "safe", "remote", "scripts"}: reviewer_default_render_mode = "auto"
     vals = locals().copy(); vals.pop("request"); vals.pop("user")
-    for key in ["hard_default_safe_mode", "disable_full_reveal_in_lockdown", "disable_plaintext_export_in_lockdown", "disable_materialization_in_lockdown", "allow_blur_in_lockdown", "require_master_key_full_reveal", "require_approval_full_reveal", "require_approval_plaintext_export", "require_approval_materialization", "live_javascript_enabled", "live_download_allowed_media_default", "live_auto_capture_default", "capture_settle_before_save", "capture_auto_scroll_enabled", "reviewer_enabled", "sealed_export_enabled", "sealed_export_include_derived", "sealed_media_preservation_enabled", "sealed_media_preserve_images", "sealed_media_preserve_video", "sealed_media_preserve_audio", "tor_auto_start_from_browser_bundle", "tor_browser_force_socks", "head_probe_blocked_media", "reject_inline_media_in_safe_mode"]:
+    for key in ["hard_default_safe_mode", "disable_full_reveal_in_lockdown", "disable_plaintext_export_in_lockdown", "disable_materialization_in_lockdown", "allow_blur_in_lockdown", "require_master_key_full_reveal", "require_approval_full_reveal", "require_approval_plaintext_export", "require_approval_materialization", "live_javascript_enabled", "live_download_allowed_media_default", "live_auto_capture_default", "capture_settle_before_save", "capture_auto_scroll_enabled", "reviewer_enabled", "sealed_export_enabled", "sealed_export_include_derived", "sealed_media_preservation_enabled", "sealed_media_preserve_images", "sealed_media_preserve_video", "sealed_media_preserve_audio", "sealed_media_preserve_skip_decorative_fast", "organization_hard_seal_media_enabled", "tor_auto_start_from_browser_bundle", "tor_browser_force_socks", "head_probe_blocked_media", "reject_inline_media_in_safe_mode"]:
         vals[key] = "1" if vals.get(key) else "0"
     vals["sealed_media_preserve_max_bytes"] = str(safe_int(vals.get("sealed_media_preserve_max_bytes"), 52428800, min_value=1048576))
     vals["sealed_media_preserve_max_total_bytes"] = str(safe_int(vals.get("sealed_media_preserve_max_total_bytes"), 209715200, min_value=1048576))
     vals["sealed_media_preserve_max_items_per_session"] = str(safe_int(vals.get("sealed_media_preserve_max_items_per_session"), 250, min_value=1))
+    vals["sealed_media_preserve_max_pending_tasks"] = str(safe_int(vals.get("sealed_media_preserve_max_pending_tasks"), 12, min_value=1, max_value=1000))
+    if vals.get("sealed_media_preserve_mode") not in {"fast", "balanced", "complete"}:
+        vals["sealed_media_preserve_mode"] = "balanced"
+    vals["sealed_media_preserve_fetch_timeout_ms"] = str(safe_int(vals.get("sealed_media_preserve_fetch_timeout_ms"), 3500, min_value=500, max_value=60000))
+    vals["sealed_media_preserve_background_timeout_ms"] = str(safe_int(vals.get("sealed_media_preserve_background_timeout_ms"), 18000, min_value=1000, max_value=120000))
+    org_pem = str(vals.get("organization_hard_seal_public_key_pem") or "").strip()
+    org_fp = escrow_public_fingerprint(org_pem) if org_pem else ""
+    if civilian_unknown_master_mode():
+        vals["organization_hard_seal_media_enabled"] = "0"
+        vals["organization_hard_seal_public_key_pem"] = ""
+        vals["organization_hard_seal_public_key_fingerprint"] = ""
+    else:
+        if vals.get("organization_hard_seal_media_enabled") == "1" and not org_fp:
+            raise HTTPException(400, "Organization hard-sealed media requires a valid organization escrow public key PEM")
+        vals["organization_hard_seal_public_key_pem"] = org_pem if org_fp else ""
+        vals["organization_hard_seal_public_key_fingerprint"] = org_fp
     for k, v in vals.items():
         set_setting(k, v)
-    log_event(user["username"], "SETTINGS_UPDATED", details={"edition": edition, "default_capture_mode": default_capture_mode, "default_media_policy": default_media_policy, "default_user_agent_profile": default_user_agent_profile, "sealed_media_preservation_enabled": vals.get("sealed_media_preservation_enabled")})
+    if organization_controlled_mode() and setting_bool("organization_hard_seal_media_enabled", "0"):
+        try:
+            migrate_existing_organization_preserved_media_to_hard_sealed()
+        except Exception as exc:
+            log_event(user["username"], "ORGANIZATION_PRESERVED_MEDIA_HARD_SEAL_MIGRATION_FAILED", details={"error": str(exc)[:500]})
+    log_event(user["username"], "SETTINGS_UPDATED", details={"edition": edition, "default_capture_mode": default_capture_mode, "default_media_policy": default_media_policy, "default_user_agent_profile": default_user_agent_profile, "sealed_media_preservation_enabled": vals.get("sealed_media_preservation_enabled"), "organization_hard_seal_media_enabled": vals.get("organization_hard_seal_media_enabled"), "organization_hard_seal_public_key_fingerprint": vals.get("organization_hard_seal_public_key_fingerprint", "")})
     return RedirectResponse("/settings?msg=Settings%20saved", 303)
 
 

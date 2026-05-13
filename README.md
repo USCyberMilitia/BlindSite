@@ -15,6 +15,8 @@ A new standalone validation suite is also available to test core technical claim
 
 A secure key generator for organizations and those testing BlindSite. It is critical this generator is used only by organization or individuals that understand the risks or those wanting to test out BlindSite. For normal Civilian workflows please use Civilian Unknown Master Key Mode with the prefilled key.
 
+Our public key has changed. Please check below for the correct key though it should be filled in for you automatically for Civilian mode.
+
 This is still early-access software, but this update is a major step toward making BlindSite faster, safer, and easier to verify.
 
 > [!WARNING]
@@ -235,18 +237,18 @@ If you want the intended Civilian Unknown Master Key workflow, use the USCM escr
 
 ```text
 -----BEGIN PUBLIC KEY-----
-MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAz/WNWKXWO4DekWR/h3SC
-+e7XFKQJezoe6MjQder8dv45j/f3/xy+Qnfk/ojfPn04D12iL3oy1sa98vwpiMY1
-+EuGkiutjm0w/3mgzF8DU2wP71eL/Jt1z+6OANzNRGb/WU3nFiqMaPiBW911iRsk
-lWAov+kKT6IUF7cTE12f9PuFatjOLIa5rXUShfsiaKSpHWxiLHI1tfBYo+cZw8UH
-tf0JW1Ff7gdy+9g6bMf9WGRhxKkdF0hTzhfg7Ol47T8WHy4jqcjtUV2vD41CNtvM
-k1N/uGTdYTV0H71gFkLxft/unXB5K5hu4xCQUiyZFx8VUJREy9RKresEX9bsqZ/x
-fkKFly1EwxDsHKwVr6PZ7eG+fCs62Q5VzzrM99k0R0vlPEFE0EE1BiIIuGCCA877
-6jHBcYudRK8kMFJe68nghAaVzjHjyczLeTr/KfesDTgSwuAYpmYKNaiZNytsmdml
-mH3BxBGoOj3TtbI4X8YEtWRROvgKslhy5ctMWkKcWFwKL2jPVICC9vSwUbkH+/wI
-XyGnhQjiam67kqy0DZfVzvQu8ACWNzxjblVt0AVXFc6kBrwV+Agz0fTcNeetOP0I
-X+dFQEOZXhMVjstoL+UIKK60D7pUPhE0/Na6XDrI8qTBKSJN9lSyoW5groL9mu5S
-P6ySgUcZiWET2NW9qQzMKP0CAwEAAQ==
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA1y8+WnLXjlnuV+HqL/yM
+/pGqYkbYzYf0AkoxtUdb8nOjfUPtiDq0dcvMqXkAuHK625lyf1Bq0j8wJai766XG
+04ZnZCcK1m4Yw0WMkQEjcn2qlWZB7vniQs07i92pd4EswK9SkCLzCAvDXq3n2xE3
+FTLuqGKnjZcr/1uFpUWcsVGUqZ7fYnPIjNtRPiOCUs/i9kJ6ryKsLoOMx7PgvI8f
+6HHWwcbh5bdeHXi/P+ntri4EbBPqlnMWdYUeF6SuvlhgLwTt1wSzO9ZHic1iCF4G
+hNIoNhbxolBSD41BsuvntXUfebqymWskGbiITLE8plHyrUminzqnZXAkSnOEBqaF
+duDHHCiqLxI71KO+rUZ73IbOBy0a0cJCIJ/qeYh7G8NMyW6PfcCw+TTbsXLZkHI6
+Vl6hfZaoJvZ43/SPt/YwL7FOq+Aef3GHTqHoX/HTR5txHzvH+gApIDs3kFKjwd7D
+yElca3eFGGQM4cijcSpazFVHycZYGOL/DbKxHUjsnYBR5yhPYgDvAz0o+RsKK5ws
+SspvPQ4+DFUDQK4zkj/ZAbrsrdsZtQn51yRXcFfNCUrhUCoEivTmJzq8WGOTsIqA
+taLsgBIqjLIc+fWr4+CNKSGRnkXAWCe+ebmokCZeDAHpwgX/BrLnjr62v+jJnJ46
+cyO7zcKE0wuSAXZ1+tPKP+UCAwEAAQ==
 -----END PUBLIC KEY-----
 ```
 

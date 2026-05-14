@@ -2,7 +2,7 @@
 """
 BlindSite Claims Validation Suite
 
-Standalone validation harness for BlindSite.py.
+Standalone validation harness for BlindSite.py
 
 What this validates(all tests can be reconstructed from logs):(41 different tests):
 - app compiles and self-test runs;

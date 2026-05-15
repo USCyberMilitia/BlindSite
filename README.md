@@ -3,6 +3,12 @@
 
 **Preserve what investigators should not have to see.**
 
+WE ARE COMING UP WITH A SOON TO BE RELEASED SIGNIFICANT UPGRADE. 
+IT WILL BE UP WITHIN NEXT 24 HOURS. 
+MAKE SURE TO STAR AND FEEL FREE TO SHARE. 
+IF YOU HAVE ANY FEEDBACK WE WOULD BE HAPPY TO HEAR IT! OPEN A QUALIFYING ISSUE AND GET REWARDS ON OUR SITE WHICH WILL BE OPEN TO GENERAL PUBLIC WITHIN THE NEXT WEEK!
+
+
 ## Major update: security + performance hardening
 
 BlindSite has received a major security and performance hardening update.

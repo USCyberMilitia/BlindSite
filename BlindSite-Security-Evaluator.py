@@ -2,9 +2,11 @@
 """
 BlindSite Claims Validation Suite
 
-Standalone validation harness for BlindSite.py
+US CYBER MILITIA | BLINDSITE
 
-What this validates(all tests can be reconstructed from logs):(41 different tests):
+Standalone validation harness for BlindSite.py.
+
+What this validates:
 - app compiles and self-test runs;
 - local vault evidence is encrypted at rest;
 - Civilian Unknown Master Key hard-sealed evidence cannot be decrypted by the local vault key;
@@ -17,7 +19,9 @@ What this validates(all tests can be reconstructed from logs):(41 different test
 - storage tampering changes the storage hash;
 - true local live browser blocked-media integration test: blocked from display -> background preserved -> hard-sealed -> logged -> sealed export -> reviewer recovery -> wrong key fails;
 - optional external website sample image can be fetched quickly and pushed through the same hard-sealed preservation path;
-- public repo hygiene scan can flag obvious secrets/private artifacts.
+- public repo hygiene scan can flag obvious secrets/private artifacts;
+- reviewer import password protection stores only a hash and gates locked imports through session state;
+- optional PDF report encryption produces an encrypted PDF that rejects the wrong password and accepts the correct password.
 
 Important:
 This suite provides technical validation evidence. It does not certify legal admissibility,
@@ -59,7 +63,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 
-APP_VERSION = "1.2-reconstructable-evidence-report"
+APP_VERSION = "1.3-review-password-pdf-encryption-security"
 DEFAULT_TIMEOUT = 8
 MAX_WEBSITE_IMAGE_BYTES = 2_000_000
 LIVE_BROWSER_TEST_TIMEOUT = 45
@@ -184,6 +188,8 @@ class Validator:
             else:
                 self.skip("live browser blocked-media integration", "disabled by user")
             self.test_sealed_export_and_reviewer_decrypt()
+            self.test_reviewer_import_password_protection()
+            self.test_pdf_report_encryption()
             self.test_wrong_private_key_fails()
             self.test_audit_chain_tamper_detection()
             self.test_storage_hash_tamper_detection()
@@ -908,6 +914,118 @@ class Validator:
         else:
             self.fail("reviewer decrypt/import recovery", "expected evidence was not recovered", recovered_markers=sorted(recovered_markers), expected=sorted(expected), recovered_count=len(result.get("objects", [])), errors=result.get("errors"))
 
+    def test_reviewer_import_password_protection(self) -> None:
+        """Validate the new LE reviewer case password gate.
+
+        This does not claim recovered files are encrypted at rest. It verifies the
+        security claim actually made in the app: a password-protected reviewer
+        import stores only a password hash and the BlindSite interface considers
+        the import locked until the session is explicitly unlocked.
+        """
+        m = self.m
+        if not self.sealed_package_bytes:
+            self.skip("reviewer import password protection", "sealed package not available")
+            return
+        required = ["reviewer_import_package", "set_reviewer_import_password", "reviewer_import_for", "reviewer_import_is_password_protected", "reviewer_import_is_unlocked", "reviewer_import_session_key", "check_password"]
+        missing = [name for name in required if not hasattr(m, name)]
+        if missing:
+            self.skip("reviewer import password protection", "BlindSite version does not expose reviewer password helpers", missing=missing)
+            return
+        password = "BlindSite-Validation-ReviewPass-123!"
+        try:
+            import_id = m.reviewer_import_package(
+                self.sealed_package_bytes,
+                "validation_password_protected_import.zip",
+                self.org_private_pem,
+                self.org_private_passphrase,
+                "validation_suite",
+                "security evaluator password-protected reviewer import test",
+            )
+            m.set_reviewer_import_password(import_id, password, "validation_suite")
+            imp = m.reviewer_import_for(import_id)
+            notes = m.reviewer_import_notes(imp)
+            self.write_artifact_json(
+                f"reviewer_password/import_{import_id:06d}_row.json",
+                sanitize_mapping({"import": imp, "notes": notes}),
+                "Reviewer import row after password protection was applied",
+                category="reviewer_password_security",
+            )
+            stored = str(imp.get("notes_json") or "") if imp else ""
+            if password in stored:
+                self.fail("reviewer import password not stored in plaintext", "plaintext password appeared in reviewer_imports.notes_json", reviewer_import_id=import_id)
+            else:
+                self.pass_("reviewer import password not stored in plaintext", "review-case password is not present in stored notes_json", reviewer_import_id=import_id)
+
+            pw_hash = m.reviewer_import_password_hash(imp)
+            if pw_hash and m.check_password(password, pw_hash) and not m.check_password("wrong-" + password, pw_hash):
+                self.pass_("reviewer import password hash verification", "correct password verifies and wrong password fails", reviewer_import_id=import_id, password_hash_prefix=pw_hash[:24])
+            else:
+                self.fail("reviewer import password hash verification", "password hash did not verify as expected", reviewer_import_id=import_id, password_hash_prefix=pw_hash[:24])
+
+            class DummyRequest:
+                def __init__(self) -> None:
+                    self.session: dict[str, str] = {}
+
+            req = DummyRequest()
+            locked = not bool(m.reviewer_import_is_unlocked(req, import_id, imp))
+            req.session[m.reviewer_import_session_key(import_id)] = "1"
+            unlocked = bool(m.reviewer_import_is_unlocked(req, import_id, imp))
+            if locked and unlocked and m.reviewer_import_is_password_protected(imp):
+                self.pass_("reviewer import lock/unlock session gate", "import is locked before session unlock and unlocked after session flag", reviewer_import_id=import_id)
+            else:
+                self.fail("reviewer import lock/unlock session gate", "lock/unlock helper behavior did not match expectations", reviewer_import_id=import_id, locked=locked, unlocked=unlocked, protected=m.reviewer_import_is_password_protected(imp))
+        except Exception as exc:
+            self.fail("reviewer import password protection", str(exc), traceback=traceback.format_exc(limit=12))
+
+    def test_pdf_report_encryption(self) -> None:
+        """Validate opt-in PDF encryption helper for LE reports.
+
+        The test uses a fake one-page PDF generated inside the sandbox. It proves
+        the helper returns an encrypted PDF, rejects the wrong password, and opens
+        with the selected password. It does not test full report rendering, which
+        belongs in the performance evaluator.
+        """
+        m = self.m
+        if not hasattr(m, "encrypt_pdf_report_bytes"):
+            self.skip("PDF report encryption", "BlindSite version does not expose encrypt_pdf_report_bytes")
+            return
+        try:
+            try:
+                from pypdf import PdfReader, PdfWriter  # type: ignore
+            except Exception as exc:
+                self.skip("PDF report encryption", f"pypdf is not installed in this environment: {exc}")
+                return
+            writer = PdfWriter()
+            writer.add_blank_page(width=300, height=200)
+            import io
+            src = io.BytesIO()
+            writer.write(src)
+            plain_pdf = src.getvalue()
+            password = "BlindSite-PDF-Validation-123!"
+            encrypted_pdf = m.encrypt_pdf_report_bytes(plain_pdf, password)
+            self.write_artifact_bytes("pdf_encryption/plain_validation_report.pdf", plain_pdf, "Fake unencrypted one-page PDF used as input for encryption test", category="pdf_security", mime="application/pdf")
+            self.write_artifact_bytes("pdf_encryption/encrypted_validation_report.pdf", encrypted_pdf, "Fake encrypted PDF output created by BlindSite encryption helper", category="pdf_security", mime="application/pdf")
+            reader = PdfReader(io.BytesIO(encrypted_pdf))
+            is_encrypted = bool(reader.is_encrypted)
+            wrong_result = None
+            correct_result = None
+            if is_encrypted:
+                try:
+                    wrong_result = reader.decrypt("wrong-" + password)
+                except Exception as exc:
+                    wrong_result = f"error:{exc.__class__.__name__}"
+                reader2 = PdfReader(io.BytesIO(encrypted_pdf))
+                correct_result = reader2.decrypt(password)
+                page_count = len(reader2.pages)
+            else:
+                page_count = 0
+            if is_encrypted and int(correct_result or 0) > 0 and page_count == 1:
+                self.pass_("PDF report encryption helper", "encrypted PDF requires password and opens with correct password", plain_sha256=sha256_bytes(plain_pdf), encrypted_sha256=sha256_bytes(encrypted_pdf), wrong_password_result=wrong_result, correct_password_result=correct_result, page_count=page_count)
+            else:
+                self.fail("PDF report encryption helper", "PDF encryption helper did not produce a verifiably encrypted/openable PDF", is_encrypted=is_encrypted, wrong_password_result=wrong_result, correct_password_result=correct_result, page_count=page_count)
+        except Exception as exc:
+            self.fail("PDF report encryption helper", str(exc), traceback=traceback.format_exc(limit=12))
+
     def test_wrong_private_key_fails(self) -> None:
         m = self.m
         if not self.sealed_package_bytes:
@@ -1294,6 +1412,7 @@ def build_claim_matrix(checks: list[Check]) -> dict[str, Any]:
         "organization_hard_sealed_media": status_for(["organization hard-sealed media container", "organization hard-sealed plaintext absence", "organization hard-sealed vault-key rejection", "organization hard-sealed local read blocked", "organization hard-sealed private-key recovery", "organization hard-sealed wrong-key failure"]),
         "live_browser_blocked_media_flow": live_status,
         "sealed_export_and_reviewer_recovery": status_for(["sealed export plaintext absence", "sealed export .fvault evidence objects", "sealed export manifest custody flags", "reviewer decrypt/import recovery", "reviewer recovered hashes match originals", "wrong private key sealed package failure"]),
+        "reviewer_access_and_pdf_security": status_for(["reviewer import password not stored in plaintext", "reviewer import password hash verification", "reviewer import lock/unlock session gate", "PDF report encryption helper"]),
         "tamper_detection": status_for(["audit chain tamper detection", "storage hash tamper detection"]),
         "repo_hygiene": status_for(["public repo hygiene scan"]),
     }

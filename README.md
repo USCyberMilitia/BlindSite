@@ -3,6 +3,17 @@
 
 **Preserve what investigators should not have to see.**
 
+> [!WARNING]
+> **Early Access / Use at Your Own Risk**
+>
+> BlindSite is an early-access public-interest tool and may contain bugs, vulnerabilities, incomplete documentation, or workflow issues that could create legal, operational, forensic, or security risk.
+>
+> We have tested it against our intended workflows and it performs well for our use cases, but it has not yet undergone independent security review, forensic validation, or legal certification.
+>
+> Do not use BlindSite for live operations, sensitive investigations, or evidence-handling workflows unless you understand the risks, test it in a controlled environment, and have appropriate legal/organizational authorization.
+>
+> Use a fresh VM or dedicated investigation machine. Do not run high-risk investigations from a personal device or everyday browser profile.
+
 # 🔥 BlindSite Second Major Update — Faster, Safer, and More Investigator-Ready
 
 BlindSite has received one of its most significant upgrades yet.
@@ -108,17 +119,8 @@ Our public key has changed. Please check below for the correct key though it sho
 
 This is still early-access software, but this update is a major step toward making BlindSite faster, safer, and easier to verify.
 
-> [!WARNING]
-> **Early Access / Use at Your Own Risk**
->
-> BlindSite is an early-access public-interest tool and may contain bugs, vulnerabilities, incomplete documentation, or workflow issues that could create legal, operational, forensic, or security risk.
->
-> We have tested it against our intended workflows and it performs well for our use cases, but it has not yet undergone independent security review, forensic validation, or legal certification.
->
-> Do not use BlindSite for live operations, sensitive investigations, or evidence-handling workflows unless you understand the risks, test it in a controlled environment, and have appropriate legal/organizational authorization.
->
-> Use a fresh VM or dedicated investigation machine. Do not run high-risk investigations from a personal device or everyday browser profile.
 
+ABOUT THE PROGRAM:
 
 BlindSite is a forensic browser and encrypted evidence vault for high-risk digital investigations.
 

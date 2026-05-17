@@ -11,7 +11,7 @@ First, thank you to everyone who has taken the time to look at the project. Blin
 
 This update is a major step forward.
 
-Our last update improved general performance by approximately **70%**. This new update adds another major performance leap, with Tor/session performance improvements of up to approximately **80%**, depending on workflow, environment, and system resources.
+Our last update improved general performance by approximately **70%** as well as greatly increasing the security/encryption of the workflow. This new update adds another major performance leap, with Tor/session performance improvements of up to approximately **80%**, depending on workflow, environment, and system resources.
 
 > **Older versions should now be considered deprecated.**  
 > BlindSite has moved quickly from early proof-of-concept into a much more serious forensic containment platform.

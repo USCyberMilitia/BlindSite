@@ -3,23 +3,106 @@
 
 **Preserve what investigators should not have to see.**
 
-WE ARE COMING UP WITH A SOON TO BE RELEASED SIGNIFICANT UPGRADE. 
-IT WILL BE UP WITHIN NEXT 24 HOURS. 
-MAKE SURE TO STAR AND FEEL FREE TO SHARE. 
-IF YOU HAVE ANY FEEDBACK WE WOULD BE HAPPY TO HEAR IT! OPEN A QUALIFYING ISSUE AND GET REWARDS ON OUR SITE WHICH WILL BE OPEN TO GENERAL PUBLIC WITHIN THE NEXT WEEK!
+# 🔥 BlindSite Major Update — Faster, Safer, and More Investigator-Ready
 
+BlindSite has received one of its most significant upgrades yet.
 
-## Major update: security + performance hardening
+First, thank you to everyone who has taken the time to look at the project. BlindSite has now reached **330+ total clones by 138 unique cloners**, which tells us people are paying attention and taking the tool seriously enough to pull the code, inspect it, test it, and see where this project is going.
 
-BlindSite has received a major security and performance hardening update.
+This update is a major step forward.
 
-The live capture engine has been reworked so blocked media is no longer processed directly in the browser’s hot request path. Instead, risky media is blocked from display immediately and preserved in the background when enabled. In testing, this improved page-load performance by up to **70%** on media-heavy dynamic sites.
+Our last update improved general performance by approximately **70%**. This new update adds another major performance leap, with Tor/session performance improvements of up to approximately **80%**, depending on workflow, environment, and system resources.
 
-This update also strengthens the custody model with hard-sealed evidence workflows for both Civilian Unknown Master Key mode and Organization hard-sealed media preservation. Sensitive originals can be preserved encrypted in a way that the local vault key cannot decrypt, requiring the correct escrow/reviewer private key for authorized recovery.
+> **Older versions should now be considered deprecated.**  
+> BlindSite has moved quickly from early proof-of-concept into a much more serious forensic containment platform.
 
-A new standalone validation suite is also available to test core technical claims around encrypted storage, hard-sealed custody, wrong-key failure, sealed exports, reviewer recovery, audit-chain tamper detection, and storage-hash tamper detection.
+---
 
-A secure key generator for organizations and those testing BlindSite. It is critical this generator is used only by organization or individuals that understand the risks or those wanting to test out BlindSite. For normal Civilian workflows please use Civilian Unknown Master Key Mode with the prefilled key.
+## 🚀 What’s New
+
+### ⚡ Major Performance Improvements
+
+BlindSite is now significantly faster and more responsive during high-risk investigation workflows.
+
+This update improves Tor/session performance, evidence capture responsiveness, handling of larger or dynamic pages, investigator workflow speed, and general stability during longer sessions.
+
+---
+
+### 🌐 Remote Evidence Resource Capture
+
+BlindSite can now better preserve remote resources and callbacks connected to a page.
+
+Modern web evidence is often not just the visible page. It may include media URLs, redirected resources, embedded content, API responses, video/resource pointers, dynamic assets, and files loaded from external domains.
+
+This helps investigators preserve more of the actual evidence environment instead of relying only on screenshots or surface-level page capture.
+
+---
+
+### 🔎 Search and Evidence Discovery
+
+BlindSite now includes stronger search functionality to help investigators quickly find captured evidence, notes, resources, reports, and case materials.
+
+This makes larger investigations easier to work through without manually digging through folders, logs, or scattered files.
+
+---
+
+### 📝 Secure Report Creation
+
+BlindSite now supports stronger secure report workflows for turning captured evidence into organized case material in a secure manner. Encrypted PDF reports can now be prepared by authorized individuals and securely exported.
+
+Reports can help investigators summarize findings, preserve context, document what was captured, and prepare evidence for safer review or handoff.
+
+---
+
+### 🧵 Background Tasks
+
+Longer operations can now run more smoothly in the background instead of freezing the investigator’s workflow.
+
+This is especially important during larger captures, downloads, exports, scans, and evidence-processing tasks.
+
+---
+
+### 📊 Download Progress Bar
+
+BlindSite now includes clearer download progress handling so investigators can see what is happening during resource capture.
+
+This makes the app feel more transparent and usable when dealing with larger files, remote resources, or slower Tor/network sessions.
+
+---
+
+### 💬 Better Dynamic Investigation Support
+
+BlindSite is becoming much stronger for real-world investigations where evidence appears after the page loads.
+
+This matters for public chat sites, forums, live pages, media-heavy pages, high-risk web communities, and other environments where evidence may appear only after interaction. Got a long chat that's taken place over an hour. Capture the full data set with manual capture!
+
+---
+
+## 🧠 Why This Update Matters
+
+BlindSite exists because people doing high-risk investigations often have no good options.
+
+They are forced to choose between directly viewing disturbing material, taking weak screenshots, downloading risky files manually, losing dynamic evidence, relying on tools not designed for custody, or avoiding the investigation altogether.
+
+BlindSite is designed to create a safer middle path.
+
+It helps investigators preserve evidence while reducing unnecessary exposure, improving custody, and making responsible handoff easier.
+
+---
+
+## ✅ Recommended Action
+
+If you cloned an earlier version of BlindSite, we strongly recommend updating.
+
+---
+
+**Thank you to everyone testing, cloning, reviewing, and following the project.**
+
+This second update is a serious upgrade — and we are just getting started. From here on out it's about putting this code through it's paces, validating all the claims, and hardening the code so it can work on any site without fail. People like you who clone and post issues with the code are a critical part of that process! We will reward you with tokens on our website for thoughtful feedback or used feature suggestions so don't be shy.
+
+2 new standalone security and performance validation suites are also available to test core technical and performance claims around encrypted storage, hard-sealed custody, wrong-key failure, sealed exports, reviewer recovery, audit-chain tamper detection, and storage-hash tamper detection. The security evaluator has been updated since we pushed it yesterday.
+
+A secure key generator for organizations and those testing BlindSite is now available. It is critical this generator is used only by organization or individuals that understand the risks or those wanting to test out BlindSite. For normal Civilian workflows please use Civilian Unknown Master Key Mode with the prefilled key.
 
 Our public key has changed. Please check below for the correct key though it should be filled in for you automatically for Civilian mode.
 
@@ -243,18 +326,18 @@ If you want the intended Civilian Unknown Master Key workflow, use the USCM escr
 
 ```text
 -----BEGIN PUBLIC KEY-----
-MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA1y8+WnLXjlnuV+HqL/yM
-/pGqYkbYzYf0AkoxtUdb8nOjfUPtiDq0dcvMqXkAuHK625lyf1Bq0j8wJai766XG
-04ZnZCcK1m4Yw0WMkQEjcn2qlWZB7vniQs07i92pd4EswK9SkCLzCAvDXq3n2xE3
-FTLuqGKnjZcr/1uFpUWcsVGUqZ7fYnPIjNtRPiOCUs/i9kJ6ryKsLoOMx7PgvI8f
-6HHWwcbh5bdeHXi/P+ntri4EbBPqlnMWdYUeF6SuvlhgLwTt1wSzO9ZHic1iCF4G
-hNIoNhbxolBSD41BsuvntXUfebqymWskGbiITLE8plHyrUminzqnZXAkSnOEBqaF
-duDHHCiqLxI71KO+rUZ73IbOBy0a0cJCIJ/qeYh7G8NMyW6PfcCw+TTbsXLZkHI6
-Vl6hfZaoJvZ43/SPt/YwL7FOq+Aef3GHTqHoX/HTR5txHzvH+gApIDs3kFKjwd7D
-yElca3eFGGQM4cijcSpazFVHycZYGOL/DbKxHUjsnYBR5yhPYgDvAz0o+RsKK5ws
-SspvPQ4+DFUDQK4zkj/ZAbrsrdsZtQn51yRXcFfNCUrhUCoEivTmJzq8WGOTsIqA
-taLsgBIqjLIc+fWr4+CNKSGRnkXAWCe+ebmokCZeDAHpwgX/BrLnjr62v+jJnJ46
-cyO7zcKE0wuSAXZ1+tPKP+UCAwEAAQ==
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAscG0PRP92MgUz96g7AQw
+3IwP6n7BANUrDJeAt2KToOHru2VslJdnau1UwSNvLvSH54mesrqUwzFN2aMtbtK8
+mCJ0Kce25H4kNH7Faav+HplQzE3xG85GrJe3UKqwvWruM2GTALdYFoGdPwhXrFKh
+eCefXO++/118PbN6qVliz1knypKDKgxMz6Eu7LVxyiV5la/4UzEpZw1xFlesxudY
+dyriu31+0Y7sBDdHs92ThaGSKWaENfPDBtvANVMZM2WFC/jX2Z1/C9f4wb7+s1FH
+CGnGGscK1AtpvnHK/YqaFcPqXj7UrAndNynrG2o+ssKO1xdTrvCaKqyk8q7vOiQT
+UcQw0I0WMmgUO7r16dHOhph6CjSvx8Sy0X6GeSjWLIxuFUrUVeq0RetqTsEu6z8s
+CSoOhou/BDyXHiTkz76uv91KobIAZw/pc0G936ho15GaIqus9FG1cefdCFok/WFc
+s4zMFqiOtVDS2yjMPR1azVYpv/o4fPujO5ZxXwelrsNYfeEt7ldGx+NeqcZTYyRU
+AX/ylVdwT9xI8H31fQEuemUtSgxNAHCawyBSQL2DXbONevur0xnxTq8MznHy1qlz
+YubNBgvNrK9iyGuOcgVSaiXOE5fS/rVMvL2HHO0WPV4zwn0tV+t6owjQOUxxVN3y
+jX+9RPguKBS03nI2IId0Vy0CAwEAAQ==
 -----END PUBLIC KEY-----
 ```
 

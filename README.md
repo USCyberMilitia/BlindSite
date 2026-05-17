@@ -3,7 +3,7 @@
 
 **Preserve what investigators should not have to see.**
 
-# 🔥 BlindSite Major Update — Faster, Safer, and More Investigator-Ready
+# 🔥 BlindSite Second Major Update — Faster, Safer, and More Investigator-Ready
 
 BlindSite has received one of its most significant upgrades yet.
 

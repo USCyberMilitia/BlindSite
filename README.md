@@ -128,6 +128,10 @@ It is built for situations where simply visiting a site, viewing media, or manua
 
 BlindSite can capture modern web pages, preserve images/videos/audio as encrypted evidence, block dangerous media from the investigator’s screen, support clear web and darknet workflows, and create sealed evidence packages for authorized reviewers or law enforcement. Think Hunchly but open-source and with more features.
 
+NOTE: BlindSite is NOT trying to be a Hunchly clone. Hunchly helped define investigative web capture. 
+BlindSite builds on that idea for a different problem: high-risk evidence containment, restricted custody,
+blocked-media preservation, sealed export, and safer handoff.
+
 Most tools force investigators into a bad choice:
 
 > **See the content to preserve it, or block it and lose it.**

@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import socket
 import sqlite3
 import ssl
@@ -45,7 +46,7 @@ from PIL import Image, ImageFilter
 from starlette.middleware.sessions import SessionMiddleware
 
 APP_NAME = "US Cyber Militia / BlindSite"
-APP_VERSION = "5.14.0-review-password-pdf-encryption-tor-filters"
+APP_VERSION = "5.14.1-tor-diagnostics-restart"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "vault.sqlite3"
@@ -597,7 +598,7 @@ def init_db() -> None:
         "wrapped_storage_key": "",
         "sealed_export_enabled": "1",
         "sealed_export_include_derived": "1",
-        "sealed_media_preservation_enabled": "0",
+        "sealed_media_preservation_enabled": "1",
         "sealed_media_preserve_images": "1",
         "sealed_media_preserve_video": "1",
         "sealed_media_preserve_audio": "1",
@@ -609,7 +610,7 @@ def init_db() -> None:
         "sealed_media_preserve_mode": "balanced",
         "sealed_media_preserve_background_timeout_ms": "18000",
         "sealed_media_preserve_flush_before_capture_ms": "0",
-        "sealed_media_preserve_max_pending_tasks": "45",
+        "sealed_media_preserve_max_pending_tasks": "75",
         "sealed_media_preserve_skip_decorative_fast": "1",
         "live_response_logging": "0",
         "live_blocked_event_logging": "0",
@@ -661,10 +662,10 @@ def init_db() -> None:
         "live_download_allowed_media_default": "0",
         "live_auto_capture_default": "0",
         "capture_settle_before_save": "1",
-        "capture_wait_after_load_ms": "1500",
-        "capture_network_idle_timeout_ms": "8000",
+        "capture_wait_after_load_ms": "5000",
+        "capture_network_idle_timeout_ms": "20000",
         "capture_settle_timeout_ms": "30000",
-        "capture_auto_scroll_enabled": "1",
+        "capture_auto_scroll_enabled": "0",
         "capture_auto_scroll_max_steps": "30",
         "capture_auto_scroll_pause_ms": "550",
         "capture_stable_rounds": "3",
@@ -691,10 +692,18 @@ def init_db() -> None:
     if get_setting("live_browser_default", "chromium") in {"firefox", "tor_managed_firefox", "tor_managed_chromium"}:
         set_setting("live_browser_default", "chromium")
 
-    # Bump legacy defaults only when the install still uses the old defaults.
-    # This preserves custom values while giving existing early installs the new safer/faster defaults.
-    if get_setting("sealed_media_preserve_max_pending_tasks", "45") == "12":
-        set_setting("sealed_media_preserve_max_pending_tasks", "45")
+    # Bump legacy defaults only once when the install still uses the old defaults.
+    # This preserves custom values after the user changes them in Settings.
+    if get_setting("defaults_20260518_capture_tuning_applied", "0") != "1":
+        if get_setting("sealed_media_preserve_max_pending_tasks", "75") in {"12", "45"}:
+            set_setting("sealed_media_preserve_max_pending_tasks", "75")
+        if get_setting("capture_wait_after_load_ms", "5000") == "1500":
+            set_setting("capture_wait_after_load_ms", "5000")
+        if get_setting("capture_network_idle_timeout_ms", "20000") == "8000":
+            set_setting("capture_network_idle_timeout_ms", "20000")
+        if get_setting("capture_auto_scroll_enabled", "0") == "1":
+            set_setting("capture_auto_scroll_enabled", "0")
+        set_setting("defaults_20260518_capture_tuning_applied", "1")
     if get_setting("sealed_media_preserve_max_items_per_session", "2500") == "250":
         set_setting("sealed_media_preserve_max_items_per_session", "2500")
     if get_setting("sealed_media_preserve_mime_allowlist", "image/\nvideo/\naudio/\napplication/dash+xml\napplication/vnd.apple.mpegurl\napplication/x-mpegurl\napplication/mp4\napplication/octet-stream") == "image/\nvideo/\naudio/":
@@ -1060,9 +1069,123 @@ def choose_open_tor_socks_port() -> int | None:
     return None
 
 
+
+def tor_runtime_dir() -> Path:
+    d = DATA_DIR / "tor_runtime"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def tor_log_path() -> Path:
+    return tor_runtime_dir() / "tor_prewarm.log"
+
+
+def tor_pid_path() -> Path:
+    return tor_runtime_dir() / "tor_provider.pid"
+
+
+def tor_append_runtime_log(message: str) -> None:
+    try:
+        with open(tor_log_path(), "a", encoding="utf-8", errors="ignore") as f:
+            f.write(f"[{utcnow()}] {message}\n")
+    except Exception:
+        pass
+
+
+def tor_log_tail(max_chars: int = 5000) -> str:
+    try:
+        return tor_log_path().read_text(encoding="utf-8", errors="ignore")[-max(200, int(max_chars)):]
+    except Exception:
+        return ""
+
+
+def tor_managed_pid() -> int | None:
+    try:
+        raw = tor_pid_path().read_text(encoding="utf-8", errors="ignore").strip()
+        if raw:
+            return int(raw)
+    except Exception:
+        pass
+    return None
+
+
+def process_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        if os.name == "nt":
+            r = subprocess.run(["tasklist", "/FI", f"PID eq {int(pid)}"], capture_output=True, text=True, timeout=3)
+            return str(pid) in (r.stdout or "")
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def stop_managed_tor(reason: str = "manual") -> dict[str, Any]:
+    """Stop the Tor process started by BlindSite, if we know its PID.
+
+    This intentionally avoids killing arbitrary Tor Browser processes that were
+    not launched by BlindSite. If SOCKS remains open after this, it is likely an
+    external Tor/Tor Browser instance.
+    """
+    pid = tor_managed_pid()
+    host = get_setting("tor_host", "127.0.0.1")
+    port = safe_int(get_setting("tor_socks_port", "9050"), 9050)
+    result: dict[str, Any] = {"ok": False, "reason": reason, "pid": pid, "message": "no managed Tor PID recorded", "socks_port": port}
+    if pid and process_alive(pid):
+        try:
+            tor_append_runtime_log(f"Stopping managed Tor PID {pid} ({reason})")
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True, timeout=8)
+            else:
+                os.kill(pid, signal.SIGTERM)
+            for _ in range(40):
+                if not process_alive(pid):
+                    break
+                time.sleep(0.1)
+            result.update({"ok": True, "message": f"stopped managed Tor PID {pid}", "still_alive": process_alive(pid)})
+        except Exception as exc:
+            result.update({"ok": False, "message": f"failed to stop managed Tor PID {pid}: {exc}"})
+    elif pid:
+        result.update({"ok": True, "message": f"managed Tor PID {pid} was already stopped or stale"})
+    with contextlib.suppress(Exception):
+        tor_pid_path().unlink()
+    # Clean common stale lock file only for BlindSite's own DataDirectory.
+    with contextlib.suppress(Exception):
+        lock = tor_runtime_dir() / "lock"
+        if lock.exists() and not socket_open(host, port):
+            lock.unlink()
+    result["socks_open_after"] = socket_open(host, port)
+    result["log_tail"] = tor_log_tail(2500)
+    tor_append_runtime_log(f"stop result: {json.dumps({k:v for k,v in result.items() if k != 'log_tail'}, default=str)}")
+    return result
+
+
+def tor_diagnostics() -> dict[str, Any]:
+    host = get_setting("tor_host", "127.0.0.1")
+    socks_port = safe_int(get_setting("tor_socks_port", "9050"), 9050)
+    control_port = safe_int(get_setting("tor_control_port", "9051"), 9051)
+    pid = tor_managed_pid()
+    boot = tor_bootstrap_status() if socket_open(host, control_port, timeout=0.5) else {"ok": False, "percent": None, "message": "Tor control unavailable"}
+    return {
+        "host": host,
+        "socks_port": socks_port,
+        "control_port": control_port,
+        "socks_open": socket_open(host, socks_port, timeout=0.5),
+        "control_open": socket_open(host, control_port, timeout=0.5),
+        "managed_pid": pid,
+        "managed_pid_alive": process_alive(pid),
+        "bootstrap": boot,
+        "log_path": str(tor_log_path()),
+        "log_tail": tor_log_tail(3500),
+        "prewarm": dict(TOR_PREWARM_STATUS) if 'TOR_PREWARM_STATUS' in globals() else {},
+    }
+
 def start_bundled_tor_if_possible() -> tuple[bool, str]:
     tor_exe = detect_tor_executable()
     if not tor_exe:
+        tor_append_runtime_log("No bundled/standalone tor executable found")
         return False, "No bundled/standalone tor executable found"
     host = get_setting("tor_host", "127.0.0.1")
     preferred_ports: list[int] = []
@@ -1073,62 +1196,80 @@ def start_bundled_tor_if_possible() -> tuple[bool, str]:
                 preferred_ports.append(port)
         except Exception:
             pass
-    data_dir = DATA_DIR / "tor_runtime"
-    data_dir.mkdir(parents=True, exist_ok=True)
     try:
         control_port = int(get_setting("tor_control_port", "9051") or "9051")
     except Exception:
         control_port = 9051
-    log_path = data_dir / "tor_prewarm.log"
+    log_path = tor_log_path()
+    pid_path = tor_pid_path()
     last_error = ""
     for port in preferred_ports:
         try:
             if socket_open(host, port):
                 set_setting("tor_socks_port", str(port))
-                boot = wait_for_tor_bootstrap(8.0) if socket_open(host, control_port) else {"ok": True, "percent": None, "message": "SOCKS open; control unavailable"}
+                boot = tor_bootstrap_status() if socket_open(host, control_port, timeout=0.75) else {"ok": True, "percent": None, "message": "SOCKS open; control unavailable"}
                 pct = boot.get("percent") if boot.get("percent") is not None else "unknown"
+                tor_append_runtime_log(f"Tor already listening on {host}:{port}; bootstrap {pct}")
                 return True, f"Tor already listening on {host}:{port}; bootstrap {pct}"
 
-            # Tor Browser's bundled tor.exe is safe to run as a standalone local SOCKS
-            # provider for BlindSite. We write logs to data/tor_runtime so failures are visible.
             cmd = [
                 str(tor_exe),
                 "--SocksPort", f"{host}:{port}",
                 "--ControlPort", f"{host}:{control_port}",
                 "--CookieAuthentication", "0",
-                "--DataDirectory", str(data_dir),
+                "--DataDirectory", str(tor_runtime_dir()),
                 "--Log", f"notice file {log_path}",
             ]
             with open(log_path, "a", encoding="utf-8", errors="ignore") as logf:
                 logf.write(f"\n[{utcnow()}] Starting Tor: {' '.join(cmd)}\n")
-                subprocess.Popen(cmd, stdout=logf, stderr=logf, cwd=str(tor_exe.parent), creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW") else 0))
+                proc = subprocess.Popen(cmd, stdout=logf, stderr=logf, cwd=str(tor_exe.parent), creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW") else 0))
+            with contextlib.suppress(Exception):
+                pid_path.write_text(str(proc.pid), encoding="utf-8")
             opened = False
-            for _ in range(100):
+            for _ in range(140):
                 time.sleep(0.25)
                 if socket_open(host, port):
                     opened = True
                     break
+                if proc.poll() is not None:
+                    break
             if opened:
                 set_setting("tor_socks_port", str(port))
-                boot = wait_for_tor_bootstrap(45.0) if socket_open(host, control_port) else {"ok": True, "percent": None, "message": "SOCKS open; control unavailable"}
-                log_event("system", "TOR_PROVIDER_STARTED", details={"tor_exe": str(tor_exe), "socks_port": port, "control_port": control_port, "bootstrap": boot, "log_path": str(log_path)})
+                boot = tor_bootstrap_status() if socket_open(host, control_port, timeout=0.75) else {"ok": True, "percent": None, "message": "SOCKS open; control unavailable"}
+                log_event("system", "TOR_PROVIDER_STARTED", details={"tor_exe": str(tor_exe), "pid": proc.pid, "socks_port": port, "control_port": control_port, "bootstrap": boot, "log_path": str(log_path)})
                 pct = boot.get("percent") if boot.get("percent") is not None else "unknown"
-                return True, f"Started Tor provider on {host}:{port}; bootstrap {pct}; log {log_path}"
-            recent_log = ""
-            with contextlib.suppress(Exception):
-                recent_log = log_path.read_text(encoding="utf-8", errors="ignore")[-900:]
+                tor_append_runtime_log(f"Started Tor provider PID {proc.pid} on {host}:{port}; bootstrap {pct}")
+                return True, f"Started Tor provider PID {proc.pid} on {host}:{port}; bootstrap {pct}; log {log_path}"
+            recent_log = tor_log_tail(1200)
             last_error = f"Tor executable launched but SOCKS did not open on {host}:{port}. Recent Tor log: {recent_log or 'no log output'}"
+            tor_append_runtime_log(last_error)
         except Exception as exc:
             last_error = str(exc)
+            tor_append_runtime_log(f"Tor start attempt failed on port {port}: {last_error}")
     return False, last_error or "Tor executable started but no SOCKS port opened"
-
 
 def ensure_tor_proxy_ready() -> tuple[bool, str]:
     port = choose_open_tor_socks_port()
+    host = get_setting("tor_host", "127.0.0.1")
+    ctrl = safe_int(get_setting("tor_control_port", "9051"), 9051)
     if port:
-        return True, f"Tor SOCKS is open on {get_setting('tor_host','127.0.0.1')}:{port}"
+        if socket_open(host, ctrl, timeout=0.75):
+            boot = tor_bootstrap_status()
+            pct = boot.get("percent")
+            if pct is not None and int(pct) < 100:
+                return False, f"Tor SOCKS is open on {host}:{port}, but bootstrap is only {pct}%. Wait for prewarm to finish or restart Tor."
+        return True, f"Tor SOCKS is open on {host}:{port}"
     if setting_bool("tor_auto_start_from_browser_bundle", "1"):
-        return start_bundled_tor_if_possible()
+        ok, msg = start_bundled_tor_if_possible()
+        if not ok:
+            return ok, msg
+        port = choose_open_tor_socks_port()
+        if port and socket_open(host, ctrl, timeout=0.75):
+            boot = wait_for_tor_bootstrap(90.0)
+            pct = boot.get("percent")
+            if pct is not None and int(pct) < 100:
+                return False, f"Tor started but did not finish bootstrapping within 90s; progress {pct}%. Check Tor diagnostics or restart Tor."
+        return ok, msg
     return False, "Tor SOCKS is not open and auto-start is disabled"
 
 def tor_control_command(command: str, *, timeout: float = 6.0) -> dict[str, Any]:
@@ -1203,37 +1344,86 @@ TOR_PREWARM_LOCK = threading.Lock()
 TOR_PREWARM_STATUS: dict[str, Any] = {"running": False, "ok": False, "message": "not started", "updated_at": "", "reason": "", "socks_port": None, "control_port": None, "exit_ip": None}
 
 def tor_prewarm_background(reason: str = "manual") -> dict[str, Any]:
-    """Start/verify Tor in a background thread so users do not wait at session launch."""
+    """Start/verify Tor in a background thread with live bootstrap diagnostics."""
     with TOR_PREWARM_LOCK:
         if TOR_PREWARM_STATUS.get("running"):
             return dict(TOR_PREWARM_STATUS)
-        TOR_PREWARM_STATUS.update({"running": True, "ok": False, "message": f"starting ({reason})", "updated_at": utcnow(), "reason": reason})
+        TOR_PREWARM_STATUS.update({"running": True, "ok": False, "message": f"starting ({reason})", "updated_at": utcnow(), "reason": reason, "started_at": utcnow(), "log_tail": tor_log_tail(2500)})
+    tor_append_runtime_log(f"Tor prewarm requested: {reason}")
+
+    def update_status(**kwargs: Any) -> None:
+        with TOR_PREWARM_LOCK:
+            TOR_PREWARM_STATUS.update(kwargs)
+            TOR_PREWARM_STATUS["updated_at"] = utcnow()
 
     def worker() -> None:
         try:
             ok, msg = ensure_tor_proxy_ready()
             port = choose_open_tor_socks_port()
-            boot = tor_bootstrap_status() if port else {"ok": False, "message": "SOCKS not open"}
-            with TOR_PREWARM_LOCK:
-                TOR_PREWARM_STATUS.update({"running": False, "ok": bool(ok), "message": msg, "updated_at": utcnow(), "reason": reason, "socks_port": port, "control_port": safe_int(get_setting("tor_control_port", "9051"), 9051), "bootstrap": boot})
-            log_event("system", "TOR_BACKGROUND_PREWARM_COMPLETED", details={"ok": bool(ok), "message": msg, "reason": reason, "socks_port": port, "bootstrap": boot})
+            host = get_setting("tor_host", "127.0.0.1")
+            ctrl = safe_int(get_setting("tor_control_port", "9051"), 9051)
+            update_status(ok=False, message=msg, socks_port=port, control_port=ctrl, diagnostics=tor_diagnostics(), log_tail=tor_log_tail(3500))
+            if not ok and not port:
+                update_status(running=False, ok=False, message=msg, diagnostics=tor_diagnostics(), log_tail=tor_log_tail(3500))
+                log_event("system", "TOR_BACKGROUND_PREWARM_FAILED", details={"message": msg, "reason": reason, "diagnostics": tor_diagnostics()})
+                return
+
+            # If control is available, keep the background job alive until Tor reaches 100% or times out.
+            timeout_s = 180.0
+            deadline = time.time() + timeout_s
+            last_boot: dict[str, Any] = {"ok": False, "percent": None, "message": "not checked"}
+            while time.time() < deadline:
+                if not socket_open(host, port or safe_int(get_setting("tor_socks_port", "9050"), 9050), timeout=0.5):
+                    update_status(running=False, ok=False, message="Tor SOCKS closed during prewarm", socks_port=port, diagnostics=tor_diagnostics(), log_tail=tor_log_tail(3500))
+                    return
+                if socket_open(host, ctrl, timeout=0.5):
+                    last_boot = tor_bootstrap_status()
+                    pct = last_boot.get("percent")
+                    msg2 = f"Tor SOCKS open on {host}:{port}; bootstrap {pct if pct is not None else 'unknown'}%"
+                    update_status(running=True, ok=bool(pct and int(pct) >= 100), message=msg2, socks_port=port, control_port=ctrl, bootstrap=last_boot, diagnostics=tor_diagnostics(), log_tail=tor_log_tail(3500))
+                    if pct is not None and int(pct) >= 100:
+                        update_status(running=False, ok=True, message=f"Tor ready on {host}:{port}; bootstrap 100%", socks_port=port, control_port=ctrl, bootstrap=last_boot, diagnostics=tor_diagnostics(), log_tail=tor_log_tail(3500))
+                        log_event("system", "TOR_BACKGROUND_PREWARM_COMPLETED", details={"ok": True, "message": "Tor bootstrap 100%", "reason": reason, "socks_port": port, "bootstrap": last_boot})
+                        return
+                else:
+                    update_status(running=False, ok=True, message=f"Tor SOCKS open on {host}:{port}; control unavailable, cannot read bootstrap", socks_port=port, control_port=ctrl, bootstrap={"ok": False, "message": "control unavailable"}, diagnostics=tor_diagnostics(), log_tail=tor_log_tail(3500))
+                    log_event("system", "TOR_BACKGROUND_PREWARM_COMPLETED", details={"ok": True, "message": "SOCKS open; control unavailable", "reason": reason, "socks_port": port})
+                    return
+                time.sleep(1.0)
+            pct = last_boot.get("percent")
+            message = f"Tor SOCKS open on {host}:{port}, but bootstrap did not reach 100% within {int(timeout_s)}s; last progress {pct if pct is not None else 'unknown'}%"
+            update_status(running=False, ok=False, message=message, socks_port=port, control_port=ctrl, bootstrap=last_boot, diagnostics=tor_diagnostics(), log_tail=tor_log_tail(3500))
+            log_event("system", "TOR_BACKGROUND_PREWARM_TIMEOUT", details={"message": message, "reason": reason, "socks_port": port, "bootstrap": last_boot})
         except Exception as exc:
-            with TOR_PREWARM_LOCK:
-                TOR_PREWARM_STATUS.update({"running": False, "ok": False, "message": str(exc)[:500], "updated_at": utcnow(), "reason": reason})
-            log_event("system", "TOR_BACKGROUND_PREWARM_FAILED", details={"error": str(exc)[:500], "reason": reason})
+            update_status(running=False, ok=False, message=str(exc)[:500], diagnostics=tor_diagnostics(), log_tail=tor_log_tail(3500))
+            log_event("system", "TOR_BACKGROUND_PREWARM_FAILED", details={"error": str(exc)[:500], "reason": reason, "diagnostics": tor_diagnostics()})
 
     threading.Thread(target=worker, name="BlindSiteTorPrewarm", daemon=True).start()
     return dict(TOR_PREWARM_STATUS)
 
+
 def tor_prewarm_status() -> dict[str, Any]:
     with TOR_PREWARM_LOCK:
         status = dict(TOR_PREWARM_STATUS)
+    host = get_setting("tor_host", "127.0.0.1")
+    ctrl = safe_int(get_setting("tor_control_port", "9051"), 9051)
     port = choose_open_tor_socks_port()
     if port:
-        boot = tor_bootstrap_status() if socket_open(get_setting("tor_host", "127.0.0.1"), int(get_setting("tor_control_port", "9051") or "9051")) else {"ok": False, "percent": None, "message": "Tor control unavailable"}
+        boot = tor_bootstrap_status() if socket_open(host, ctrl, timeout=0.5) else {"ok": False, "percent": None, "message": "Tor control unavailable"}
         pct = boot.get("percent")
-        status.update({"ok": True, "running": False, "message": f"Tor SOCKS is open on {get_setting('tor_host','127.0.0.1')}:{port}" + (f"; bootstrap {pct}%" if pct is not None else ""), "socks_port": port, "bootstrap": boot})
+        if pct is not None and int(pct) < 100:
+            # Keep reporting bootstrapping instead of pretending the provider is fully ready.
+            if not status.get("running"):
+                status.update({"ok": False, "running": False})
+            status.update({"message": f"Tor SOCKS is open on {host}:{port}; bootstrap {pct}%", "socks_port": port, "bootstrap": boot})
+        else:
+            status.update({"ok": True, "running": False, "message": f"Tor SOCKS is open on {host}:{port}" + ("; bootstrap 100%" if pct is not None else "; control unavailable"), "socks_port": port, "bootstrap": boot})
+    else:
+        status.setdefault("message", "Tor SOCKS is closed")
+    status["diagnostics"] = tor_diagnostics()
+    status["log_tail"] = tor_log_tail(3500)
     return status
+
 
 def tor_browser_status_html() -> str:
     path = detect_tor_browser_executable()
@@ -3480,7 +3670,7 @@ def expanded_remote_media_candidates(refs: list[dict[str, Any]], source_url: str
     return out[:max(1, limit)]
 
 class LiveBrowserSession:
-    def __init__(self, *, session_id: str, case_id: int | None, actor: str, start_url: str, browser_choice: str, use_tor: bool, media_policy: str, headless: bool, user_agent_profile: str | None = None, custom_user_agent: str | None = None, download_allowed_media: bool = False, auto_capture: bool = False, settle_before_capture: bool = True, sealed_media_preservation_session: bool = True, capture_auto_scroll_session: bool = True):
+    def __init__(self, *, session_id: str, case_id: int | None, actor: str, start_url: str, browser_choice: str, use_tor: bool, media_policy: str, headless: bool, user_agent_profile: str | None = None, custom_user_agent: str | None = None, download_allowed_media: bool = False, auto_capture: bool = False, settle_before_capture: bool = True, sealed_media_preservation_session: bool = True, capture_auto_scroll_session: bool = False):
         self.session_id = session_id
         self.case_id = case_id
         self.actor = actor
@@ -3532,7 +3722,7 @@ class LiveBrowserSession:
         self.sealed_media_policy_cache = sealed_media_preservation_policy(case_for(case_id))
         self.preserve_mode = sealed_media_preserve_mode()
         self.preserve_skip_decorative_fast = setting_bool("sealed_media_preserve_skip_decorative_fast", "1")
-        self.sealed_preserve_max_pending_tasks = safe_int(get_setting("sealed_media_preserve_max_pending_tasks", "45"), 45, min_value=1, max_value=1000)
+        self.sealed_preserve_max_pending_tasks = safe_int(get_setting("sealed_media_preserve_max_pending_tasks", "75"), 75, min_value=1, max_value=1000)
         self.deferred_blocked_max = safe_int(get_setting("max_blocked_records", "1000"), 1000, min_value=100, max_value=20000)
         self.log_live_responses = setting_bool("live_response_logging", "0")
         self.log_blocked_browser_events = setting_bool("live_blocked_event_logging", "0")
@@ -3854,7 +4044,7 @@ class LiveBrowserSession:
         if pol.get("max_total_bytes") and self.sealed_preserved_bytes >= int(pol.get("max_total_bytes") or 0):
             self.sealed_preserve_skipped += 1
             return False, "sealed preservation skipped: per-session byte limit reached"
-        max_pending = safe_int(get_setting("sealed_media_preserve_max_pending_tasks", "45"), 45, min_value=1, max_value=1000)
+        max_pending = safe_int(get_setting("sealed_media_preserve_max_pending_tasks", "75"), 75, min_value=1, max_value=1000)
         if len(self.sealed_preserve_bg_tasks) >= max_pending:
             self.sealed_preserve_skipped += 1
             return False, f"sealed preservation skipped: background queue full ({len(self.sealed_preserve_bg_tasks)} >= {max_pending})"
@@ -4442,8 +4632,8 @@ class LiveBrowserSession:
             return meta
         started = time.time()
         timeout_ms = max(1000, int(get_setting("capture_settle_timeout_ms", "30000") or "30000"))
-        network_idle_ms = max(500, int(get_setting("capture_network_idle_timeout_ms", "8000") or "8000"))
-        wait_after_ms = max(0, int(get_setting("capture_wait_after_load_ms", "1500") or "1500"))
+        network_idle_ms = max(500, int(get_setting("capture_network_idle_timeout_ms", "20000") or "20000"))
+        wait_after_ms = max(0, int(get_setting("capture_wait_after_load_ms", "5000") or "5000"))
         pause_ms = max(100, int(get_setting("capture_auto_scroll_pause_ms", "550") or "550"))
         max_steps = max(0, int(get_setting("capture_auto_scroll_max_steps", "30") or "30"))
         stable_rounds_required = max(1, int(get_setting("capture_stable_rounds", "3") or "3"))
@@ -4454,7 +4644,7 @@ class LiveBrowserSession:
             max_steps = min(max_steps, max(0, int(get_setting("capture_chat_auto_scroll_max_steps", "8") or "8")))
             stable_rounds_required = min(stable_rounds_required, 2)
             pause_ms = min(pause_ms, 300)
-        auto_scroll = bool(self.capture_auto_scroll_session) and setting_bool("capture_auto_scroll_enabled", "1")
+        auto_scroll = bool(self.capture_auto_scroll_session) and setting_bool("capture_auto_scroll_enabled", "0")
         warnings: list[str] = []
         if wait_after_ms:
             await asyncio.sleep(wait_after_ms / 1000)
@@ -4990,7 +5180,7 @@ class LiveBrowserSession:
         self.stop_flag.set()
 
 
-def start_live_session(*, actor: str, case_id: int | None, start_url: str, browser_choice: str, use_tor: bool, media_policy: str, headless: bool, user_agent_profile: str | None = None, custom_user_agent: str | None = None, download_allowed_media: bool = False, auto_capture: bool = False, settle_before_capture: bool = True, sealed_media_preservation_session: bool = True, capture_auto_scroll_session: bool = True) -> LiveBrowserSession:
+def start_live_session(*, actor: str, case_id: int | None, start_url: str, browser_choice: str, use_tor: bool, media_policy: str, headless: bool, user_agent_profile: str | None = None, custom_user_agent: str | None = None, download_allowed_media: bool = False, auto_capture: bool = False, settle_before_capture: bool = True, sealed_media_preservation_session: bool = True, capture_auto_scroll_session: bool = False) -> LiveBrowserSession:
     case = case_for(case_id)
     if browser_choice in {"torbrowser", "tor_managed_chromium", "tor_managed_firefox"}:
         use_tor = True
@@ -5006,7 +5196,7 @@ def start_live_session(*, actor: str, case_id: int | None, start_url: str, brows
     sid = uuid.uuid4().hex[:16]
     ua_meta = user_agent_info(user_agent_profile, custom_user_agent)
     execute("""INSERT INTO browser_sessions(session_id,case_id,actor,browser_choice,start_url,use_tor,media_policy,headless,status,current_url,created_at,meta_json)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (sid, case_id, actor, browser_choice, normalize_url(start_url), 1 if use_tor else 0, policy, 1 if headless else 0, "starting", normalize_url(start_url), utcnow(), pretty({"version": APP_VERSION, "user_agent_profile": ua_meta["profile"], "user_agent_label": ua_meta["label"], "user_agent_sha256": ua_meta["user_agent_sha256"], "user_agent": ua_meta["user_agent"], "download_allowed_media": bool(download_allowed_media), "sealed_media_preservation": sealed_media_preservation_policy(case), "auto_capture": bool(auto_capture), "settle_before_capture": bool(settle_before_capture), "sealed_media_preservation_session": bool(sealed_media_preservation_session), "capture_settle_timeout_ms": get_setting("capture_settle_timeout_ms", "30000"), "capture_auto_scroll_enabled": get_setting("capture_auto_scroll_enabled", "1"), "capture_auto_scroll_session": bool(capture_auto_scroll_session), "tor_browser_path": str(detect_tor_browser_executable() or "") if browser_choice == "torbrowser" else ""})))
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (sid, case_id, actor, browser_choice, normalize_url(start_url), 1 if use_tor else 0, policy, 1 if headless else 0, "starting", normalize_url(start_url), utcnow(), pretty({"version": APP_VERSION, "user_agent_profile": ua_meta["profile"], "user_agent_label": ua_meta["label"], "user_agent_sha256": ua_meta["user_agent_sha256"], "user_agent": ua_meta["user_agent"], "download_allowed_media": bool(download_allowed_media), "sealed_media_preservation": sealed_media_preservation_policy(case), "auto_capture": bool(auto_capture), "settle_before_capture": bool(settle_before_capture), "sealed_media_preservation_session": bool(sealed_media_preservation_session), "capture_settle_timeout_ms": get_setting("capture_settle_timeout_ms", "30000"), "capture_auto_scroll_enabled": get_setting("capture_auto_scroll_enabled", "0"), "capture_auto_scroll_session": bool(capture_auto_scroll_session), "tor_browser_path": str(detect_tor_browser_executable() or "") if browser_choice == "torbrowser" else ""})))
     session = LiveBrowserSession(session_id=sid, case_id=case_id, actor=actor, start_url=start_url, browser_choice=browser_choice, use_tor=use_tor, media_policy=policy, headless=headless, user_agent_profile=ua_meta["profile"], custom_user_agent=custom_user_agent or "", download_allowed_media=download_allowed_media, auto_capture=auto_capture, settle_before_capture=settle_before_capture, sealed_media_preservation_session=sealed_media_preservation_session, capture_auto_scroll_session=capture_auto_scroll_session)
     with LIVE_LOCK:
         LIVE[sid] = session
@@ -5091,13 +5281,28 @@ def retry_live_blocked_media(sid: str, *, actor: str, blocked_ids: list[int] | N
     return result
 
 
+def early_access_warning_html() -> str:
+    return """
+    <div class='card warn' style='text-align:center;max-width:980px;margin:14px auto;'>
+      <h2 style='margin-top:0'>Early-Access Safety Notice</h2>
+      <p><b>BlindSite is an early-access evidence-preservation tool.</b> Use it only for lawful investigations and only under policies you understand. File and media workflows can be risky depending on the content, facts, and jurisdiction.</p>
+      <p><b>Sealed Sender / file-download mode</b> keeps media blocked from normal live viewing while preserving selected blocked files encrypted for sealed export and cleared-reviewer access. In Civilian Unknown Master Key mode, hard-sealed originals cannot be decrypted by the local civilian installation.</p>
+      <p><b>Civilian use of Organization-Controlled Key mode:</b> use it only for lawful, non-risky investigations where no illegal or high-risk content will be downloaded or viewed. It can be appropriate when intentionally viewing ordinary, non-risky images/media is necessary.</p>
+      <p class='small muted'>This is a technical custody and workflow control. It is not legal advice and does not guarantee legal protection. Default: file downloads enabled. You can change Sealed Sender globally in Settings, per case, and per live session.</p>
+    </div>
+    """
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request, error: str | None = None) -> HTMLResponse:
-    return layout(request, "Login", f"""{flash(error)}<div class='card'><h2>Sign in</h2><form method='post' action='/login'><label>Username</label><input name='username' autofocus><label>Password</label><input name='password' type='password'><label><input type='checkbox' name='init_tor_session' value='1'> Initialize Tor in the background for this session</label><label><input type='checkbox' name='force_tor_all_cases' value='1'> Force Tor for all case captures/live sessions this sign-in session</label><p class='small muted'>Tor initialization is non-blocking. It prepares Tor so later Tor sessions do not have to wait, but it does not force normal traffic through Tor unless selected above or in a case/session.</p><button>Login</button></form><p class='muted'>First run default: admin / change-me-now</p></div>""")
+    body = f"""{flash(error)}
+    {early_access_warning_html()}
+    <div class='card'><h2>Sign in</h2><form method='post' action='/login'><label>Username</label><input name='username' autofocus><label>Password</label><input name='password' type='password'><label><input type='checkbox' name='init_tor_session' value='1'> Initialize Tor in the background for this session</label><label><input type='checkbox' name='force_tor_all_cases' value='1'> Force Tor for all case captures/live sessions this sign-in session</label><p class='small muted'>Tor initialization is non-blocking. It prepares Tor so later Tor sessions do not have to wait, but it does not force normal traffic through Tor unless selected above or in a case/session.</p><div class='row' style='justify-content:center;align-items:center'><button class='good' style='flex:0 1 auto' name='sealed_sender_file_downloads' value='enabled'>Continue with file downloads enabled</button><button class='secondary' style='flex:0 1 auto' name='sealed_sender_file_downloads' value='disabled'>Continue with file downloads disabled</button></div></form><p class='muted'>First run default: admin / change-me-now</p></div>"""
+    return layout(request, "Login", body)
 
 
 @app.post("/login")
-def login(request: Request, username: str = Form(...), password: str = Form(...), init_tor_session: str | None = Form(None), force_tor_all_cases: str | None = Form(None)) -> RedirectResponse:
+def login(request: Request, username: str = Form(...), password: str = Form(...), init_tor_session: str | None = Form(None), force_tor_all_cases: str | None = Form(None), sealed_sender_file_downloads: str = Form("enabled")) -> RedirectResponse:
     init_db()
     row = fetchone("SELECT * FROM users WHERE username=?", (username.strip(),))
     if not row or not check_password(password, row["password_hash"]):
@@ -5107,7 +5312,10 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
         request.session["force_tor_all_cases"] = "1"
     else:
         request.session.pop("force_tor_all_cases", None)
-    log_event(row["username"], "LOGIN", details={"init_tor_session": bool(init_tor_session), "force_tor_all_cases": bool(force_tor_all_cases)})
+    sealed_sender_enabled = str(sealed_sender_file_downloads or "enabled").strip().lower() != "disabled"
+    request.session["sealed_sender_file_downloads_enabled"] = "1" if sealed_sender_enabled else "0"
+    set_setting("sealed_media_preservation_enabled", "1" if sealed_sender_enabled else "0")
+    log_event(row["username"], "LOGIN", details={"init_tor_session": bool(init_tor_session), "force_tor_all_cases": bool(force_tor_all_cases), "sealed_sender_file_downloads_enabled": sealed_sender_enabled})
     # Optional Tor prewarm is intentionally non-blocking. It starts/verifies the
     # Tor provider in the background so sign-in remains fast and normal traffic
     # is not forced through Tor unless a Tor browser/session is explicitly used.
@@ -5134,13 +5342,15 @@ def logout(request: Request) -> RedirectResponse:
 def setup_page(request: Request, msg: str | None = None) -> HTMLResponse:
     require_admin(request)
     bundled = load_uscm_escrow_public_key()
-    body = f"""{flash(msg)}<div class='card warn'><h2>First-run setup</h2><p>Choose who controls original reveal/decrypt authority. Organization mode is for agencies and internal teams. Civilian Unknown Master Key mode lets a civilian export sealed encrypted evidence for USCM/law-enforcement handoff without knowing the reveal key.</p>
+    body = f"""{flash(msg)}
+    {early_access_warning_html()}
+    <div class='card warn'><h2>First-run setup</h2><p>Choose who controls original reveal/decrypt authority. Organization-Controlled Key mode is for agencies, internal teams, and lawful non-risky civilian investigations where the operator may intentionally view ordinary non-risky images/media. Civilian Unknown Master Key mode is the safer default for unknown or risky investigations because sensitive originals are hard-sealed for USCM/law-enforcement handoff without the local civilian user knowing the reveal key.</p>
     <form method='post' action='/setup' enctype='multipart/form-data'>
       <label>New admin password</label><input type='password' name='password' required minlength='10'>
       <div class='grid'>
-        <div class='card'><h3><label><input type='radio' name='custody_choice' value='organization' checked> Organization-Controlled Key</label></h3><p>Your organization/admin creates and controls the master reveal key. Normal evidence remains encrypted in the local vault and reveal is controlled by organization policy.</p><label>Master reveal key</label><input type='password' name='master_key' minlength='12'><label>Default edition</label><select name='edition'><option value='lockdown'>Lockdown / compliance-safe</option><option value='supervised'>Supervised approval mode</option><option value='lab'>Lab/full-forensic mode</option></select><label><input type='checkbox' name='hard_safe' value='1' checked> Hard default safe mode</label><div class='card warn'><h3>Optional organization hard-sealed media</h3><p class='small muted'>For blocked media preservation, an organization can paste its escrow public key so preserved blocked media is sealed for reviewer/private-key access and cannot be decrypted by the local vault key.</p><label><input type='checkbox' name='organization_hard_seal_media_enabled' value='1'> Hard-seal preserved blocked media to organization escrow public key</label><label>Organization escrow public key PEM</label><textarea name='organization_hard_seal_public_key_pem' rows='7' placeholder='Paste organization/reviewer escrow_public_key.pem here'></textarea></div></div>
-        <div class='card safe'><h3><label><input type='radio' name='custody_choice' value='civilian_unknown_master'> Civilian Unknown Master Key</label></h3><p>The local user does not create, know, or control the private reveal key. Lockdown stays forced. Sensitive/original evidence is hard-sealed to the embedded USCM escrow public key so it cannot be decrypted by the local civilian installation.</p><label>USCM escrow public key PEM</label><textarea name='escrow_public_key' rows='9' readonly>{h(bundled)}</textarea><p class='small muted'>Civilian Unknown Master Key mode uses this USCM public key only. Do not use your own key for this mode; doing so defeats the custody separation. Organizations that need to control their own keys should use Organization-Controlled Key mode.</p></div>
-        <div class='card warn'><h3>Sealed Media Preservation Mode</h3><p class='small muted'>Optional in both custody modes. Block images/video/audio from user display, but preserve selected blocked media for sealed export and cleared-reviewer access. Civilian mode always hard-seals to the USCM key. Organization mode can either use normal local vault encryption or the optional organization hard-seal public key above.</p><label><input type='checkbox' name='sealed_media_preservation_enabled' value='1'> Enable sealed media preservation by default</label><label><input type='checkbox' name='sealed_media_preserve_images' value='1' checked> Preserve blocked images encrypted</label><label><input type='checkbox' name='sealed_media_preserve_video' value='1' checked> Preserve blocked video encrypted</label><label><input type='checkbox' name='sealed_media_preserve_audio' value='1' checked> Preserve blocked audio encrypted</label><label>Maximum bytes per preserved media object</label><input name='sealed_media_preserve_max_bytes' value='52428800'><p class='small muted'>Default is 52,428,800 bytes. Preserved media never renders in the live browser when blocked; it is stored encrypted and linked to captured pages for sealed export/reviewer viewing.</p></div>
+        <div class='card'><h3><label><input type='radio' name='custody_choice' value='organization' checked> Organization-Controlled Key</label></h3><p>Your organization/admin creates and controls the master reveal key. Normal evidence remains encrypted in the local vault and reveal is controlled by organization policy. Civilians should use this mode only for lawful, non-risky investigations where no illegal or high-risk content will be downloaded or viewed and where viewing ordinary non-risky images is intentional.</p><label>Master reveal key</label><input type='password' name='master_key' minlength='12'><label>Default edition</label><select name='edition'><option value='lockdown'>Lockdown / compliance-safe</option><option value='supervised'>Supervised approval mode</option><option value='lab'>Lab/full-forensic mode</option></select><label><input type='checkbox' name='hard_safe' value='1' checked> Hard default safe mode</label><div class='card warn'><h3>Optional organization hard-sealed media</h3><p class='small muted'>For blocked media preservation, an organization can paste its escrow public key so preserved blocked media is sealed for reviewer/private-key access and cannot be decrypted by the local vault key.</p><label><input type='checkbox' name='organization_hard_seal_media_enabled' value='1'> Hard-seal preserved blocked media to organization escrow public key</label><label>Organization escrow public key PEM</label><textarea name='organization_hard_seal_public_key_pem' rows='7' placeholder='Paste organization/reviewer escrow_public_key.pem here'></textarea></div></div>
+        <div class='card safe'><h3><label><input type='radio' name='custody_choice' value='civilian_unknown_master'> Civilian Unknown Master Key</label></h3><p>The local user does not create, know, or control the private reveal key. Lockdown stays forced. Sensitive/original evidence is hard-sealed to the embedded USCM escrow public key so it cannot be decrypted by the local civilian installation. Use this mode for unknown, risky, or handoff-focused investigations.</p><label>USCM escrow public key PEM</label><textarea name='escrow_public_key' rows='9' readonly>{h(bundled)}</textarea><p class='small muted'>Civilian Unknown Master Key mode uses this USCM public key only. Do not use your own key for this mode; doing so defeats the custody separation. Organizations that need to control their own keys should use Organization-Controlled Key mode.</p></div>
+        <div class='card warn'><h3>Sealed Media Preservation Mode</h3><p class='small muted'>Optional in both custody modes. Block images/video/audio from user display, but preserve selected blocked media for sealed export and cleared-reviewer access. Civilian mode always hard-seals to the USCM key. Organization mode can either use normal local vault encryption or the optional organization hard-seal public key above.</p><label><input type='checkbox' name='sealed_media_preservation_enabled' value='1' checked> Enable Sealed Sender / file downloads by default</label><label><input type='checkbox' name='sealed_media_preserve_images' value='1' checked> Preserve blocked images encrypted</label><label><input type='checkbox' name='sealed_media_preserve_video' value='1' checked> Preserve blocked video encrypted</label><label><input type='checkbox' name='sealed_media_preserve_audio' value='1' checked> Preserve blocked audio encrypted</label><label>Maximum bytes per preserved media object</label><input name='sealed_media_preserve_max_bytes' value='52428800'><p class='small muted'>Default is 52,428,800 bytes. Preserved media never renders in the live browser when blocked; it is stored encrypted and linked to captured pages for sealed export/reviewer viewing.</p></div>
         <div class='card good'><h3>Law-enforcement / cleared reviewer import</h3><p>Optional: initialize this installation as a reviewer workstation by importing a sealed evidence ZIP now. You can also do this later from <b>LE Reviewer</b>.</p><label>Sealed BlindSite evidence ZIP</label><input type='file' name='reviewer_package' accept='.zip'><label>Escrow private key PEM</label><input type='file' name='reviewer_private_key' accept='.pem,.key,.txt'><label>Private-key passphrase, if any</label><input type='password' name='reviewer_private_key_passphrase'><label>Reviewer import note</label><textarea name='reviewer_note' placeholder='agency/case note'></textarea></div>
       </div>
       <button class='good'>Finish setup</button>
@@ -5274,7 +5484,7 @@ def cases_page(request: Request) -> HTMLResponse:
       <div><label>Default media policy</label><select name='media_policy'><option value='block_images_video'>Block images + video/audio</option><option value='block_all_media'>Block all media + fonts</option><option value='block_images'>Block images only</option><option value='allow_all'>Allow all</option></select></div></div>
       <label><input type='checkbox' name='force_tor' value='1' {'checked' if request.session.get('force_tor_all_cases') else ''}> Force Tor for this case {'(session default)' if request.session.get('force_tor_all_cases') else ''}</label>
       <label><input type='checkbox' name='raw_root_allowed' value='1'> Allow raw root persistence in lab/supervised workflows</label>
-      <div class='card warn'><h3>Sealed Media Preservation for this case</h3><p class='small muted'>Active in both custody modes when the global setting and this case setting are enabled. Media remains blocked from display, but selected blocked media can be stored encrypted for sealed export and cleared review.</p><label><input type='checkbox' name='sealed_media_preservation_enabled' value='1' {'checked' if setting_bool('sealed_media_preservation_enabled','0') and civilian_unknown_master_mode() else ''}> Enable for this case</label><label><input type='checkbox' name='sealed_media_preserve_images' value='1' checked> Preserve blocked images encrypted</label><label><input type='checkbox' name='sealed_media_preserve_video' value='1' checked> Preserve blocked video encrypted</label><label><input type='checkbox' name='sealed_media_preserve_audio' value='1' checked> Preserve blocked audio encrypted</label><label>Case max bytes per preserved media object</label><input name='sealed_media_preserve_max_bytes' value='{h(get_setting('sealed_media_preserve_max_bytes','52428800'))}'></div>
+      <div class='card warn'><h3>Sealed Media Preservation for this case</h3><p class='small muted'>Active in both custody modes when the global setting and this case setting are enabled. Media remains blocked from display, but selected blocked media can be stored encrypted for sealed export and cleared review.</p><label><input type='checkbox' name='sealed_media_preservation_enabled' value='1' {'checked' if setting_bool('sealed_media_preservation_enabled','1') else ''}> Enable for this case</label><label><input type='checkbox' name='sealed_media_preserve_images' value='1' checked> Preserve blocked images encrypted</label><label><input type='checkbox' name='sealed_media_preserve_video' value='1' checked> Preserve blocked video encrypted</label><label><input type='checkbox' name='sealed_media_preserve_audio' value='1' checked> Preserve blocked audio encrypted</label><label>Case max bytes per preserved media object</label><input name='sealed_media_preserve_max_bytes' value='{h(get_setting('sealed_media_preserve_max_bytes','52428800'))}'></div>
       <button>Create case</button></form></div>
       <div class='card'><h2>Cases</h2><table><tr><th>ID</th><th>Name</th><th>Hashtags</th><th>Mode</th><th>Safe</th><th>Media policy</th><th>Sealed media</th><th>Created</th></tr>{table}</table></div>"""
     return layout(request, "Cases", body)
@@ -5339,7 +5549,7 @@ def case_detail(request: Request, case_id: int, msg: str | None = None) -> HTMLR
     body = f"""{flash(msg)}<div class='card'><h2>{h(case['name'])}</h2><p>{badge(case['mode'],'good' if case['mode']=='lockdown' else 'warn')} {badge('compliance-safe','good') if case['compliance_safe'] else badge('review/lab','warn')} {badge('force Tor','info') if case['force_tor'] else ''} {badge('irreversible lock','warn') if case['irreversible_lock'] else ''} {hashtag_badges(case.get('hashtags') or '')}</p><form method='post' action='/cases/{case_id}/hashtags' class='noprint'><label>Case hashtags</label><input name='hashtags' value='{h(normalize_hashtags(case.get('hashtags') or ''))}' placeholder='#priority #agency #casework'><button class='secondary'>Save case hashtags</button></form><pre>{h(pretty(case))}</pre><p><a class='button' href='/cases/{case_id}/report'>Case report</a> <a class='button' href='/cases/{case_id}/report.zip'>Report-only ZIP</a> <a class='button good' href='/cases/{case_id}/pages'>Case page viewer</a> <a class='button good' href='/captures?case_id={case_id}'>Saved pages</a> <a class='button' href='/media?case_id={case_id}'>Media</a> <a class='button warn' href='/cases/{case_id}/sealed-export'>Sealed LE Export</a></p><form method='post' action='/cases/{case_id}/rendered-export' class='noprint'><h3>Export offline saved-page viewer ZIP</h3><label><input type='checkbox' name='include_assets' value='1'> Include saved local image/video/audio/style/font assets where policy permits</label><label>Master key required if including viewable assets</label><input type='password' name='master_key'><button class='warn'>Export viewer ZIP</button></form></div>{sealed_form}{quick_viewer}
     <div class='grid'><div class='card'><h2>Upload evidence</h2><form method='post' action='/upload' enctype='multipart/form-data'><input type='hidden' name='case_id' value='{case_id}'><label>File</label><input type='file' name='file' required><label><input type='checkbox' name='quarantine' value='1' checked> Quarantine on intake</label><button>Upload</button></form></div>
     <div class='card'><h2>Direct URL capture</h2><form method='post' action='/capture'><input type='hidden' name='case_id' value='{case_id}'><label>URL</label><input name='url' placeholder='https://example.org' required><div class='row'><div><label>Mode</label><select name='capture_mode'><option value='metadata_only'>Metadata only</option><option value='safe_summary'>Sanitized summary</option><option value='evidence_safe'>Evidence safe</option><option value='full_forensic'>Full forensic</option></select></div><div><label>Media policy</label><select name='media_policy'><option value='{h(case['default_media_policy'])}'>{h(case['default_media_policy'])} (case default)</option><option value='block_images_video'>Block images + video/audio</option><option value='block_all_media'>Block all media + fonts</option><option value='block_images'>Block images only</option><option value='allow_all'>Allow all</option></select></div></div><div class='row'><div><label>User agent</label><select name='user_agent_profile'>{ua_select_html('user_agent_profile')}</select></div><div><label>Custom UA, if selected</label><input name='custom_user_agent' placeholder='optional custom user agent'></div></div><label><input type='checkbox' name='use_tor' value='1' {'checked' if case['force_tor'] or request.session.get('force_tor_all_cases') else ''}> Use Tor SOCKS</label><label><input type='checkbox' name='download_allowed_media' value='1'> In lab/full-forensic only: download allowed original media unblurred</label><button>Capture URL</button></form></div>
-    <div class='card good'><h2>Start visible live browser</h2><form method='post' action='/live/start'><input type='hidden' name='case_id' value='{case_id}'><label>Start URL</label><input name='start_url' value='https://www.google.com' required><div class='row'><div><label>Browser</label><select name='browser_choice'>{browser_select_html('browser_choice')}</select></div><div><label>Media policy</label><select name='media_policy'><option value='{h(case['default_media_policy'])}'>{h(case['default_media_policy'])} (case default)</option><option value='block_images_video'>Block images + video/audio</option><option value='block_all_media'>Block all media + fonts</option><option value='block_images'>Block images only</option><option value='allow_all'>Allow all</option></select></div></div><div class='row'><div><label>User agent</label><select name='user_agent_profile'>{ua_select_html('user_agent_profile')}</select></div><div><label>Custom UA, if selected</label><input name='custom_user_agent' placeholder='optional custom user agent'></div></div><label><input type='checkbox' name='use_tor' value='1' {'checked' if case['force_tor'] or request.session.get('force_tor_all_cases') else ''}> Route browser through Tor</label><label><input type='checkbox' name='download_allowed_media' value='1' {'checked' if setting_bool('live_download_allowed_media_default','0') else ''}> Lab/full-forensic only: save allowed images/video/audio for exact page renderer</label><label><input type='checkbox' name='sealed_media_preservation_session' value='1' {'checked' if sealed_media_preservation_policy(case).get('enabled') else ''}> Block display, preserve blocked media encrypted for sealed export in this session</label><label><input type='checkbox' name='settle_before_capture' value='1' {'checked' if setting_bool('capture_settle_before_save','1') else ''}> Before manual/auto capture, wait for page load/DOM settle</label><label><input type='checkbox' name='capture_auto_scroll_session' value='1' {'checked' if setting_bool('capture_auto_scroll_enabled','1') else ''}> Before capture, auto-scroll to trigger lazy-loaded content</label><label><input type='checkbox' name='auto_capture' value='1' {'checked' if setting_bool('live_auto_capture_default','0') else ''}> Auto-capture each new page after it settles</label><label><input type='checkbox' name='headless' value='1'> Headless instead of visible</label><button class='good'>Open controlled browser</button></form></div></div>
+    <div class='card good'><h2>Start visible live browser</h2><form method='post' action='/live/start'><input type='hidden' name='case_id' value='{case_id}'><label>Start URL</label><input name='start_url' value='https://www.google.com' required><div class='row'><div><label>Browser</label><select name='browser_choice'>{browser_select_html('browser_choice')}</select></div><div><label>Media policy</label><select name='media_policy'><option value='{h(case['default_media_policy'])}'>{h(case['default_media_policy'])} (case default)</option><option value='block_images_video'>Block images + video/audio</option><option value='block_all_media'>Block all media + fonts</option><option value='block_images'>Block images only</option><option value='allow_all'>Allow all</option></select></div></div><div class='row'><div><label>User agent</label><select name='user_agent_profile'>{ua_select_html('user_agent_profile')}</select></div><div><label>Custom UA, if selected</label><input name='custom_user_agent' placeholder='optional custom user agent'></div></div><label><input type='checkbox' name='use_tor' value='1' {'checked' if case['force_tor'] or request.session.get('force_tor_all_cases') else ''}> Route browser through Tor</label><label><input type='checkbox' name='download_allowed_media' value='1' {'checked' if setting_bool('live_download_allowed_media_default','0') else ''}> Lab/full-forensic only: save allowed images/video/audio for exact page renderer</label><label><input type='checkbox' name='sealed_media_preservation_session' value='1' {'checked' if sealed_media_preservation_policy(case).get('enabled') else ''}> Block display, preserve blocked media encrypted for sealed export in this session</label><label><input type='checkbox' name='settle_before_capture' value='1' {'checked' if setting_bool('capture_settle_before_save','1') else ''}> Before manual/auto capture, wait for page load/DOM settle</label><label><input type='checkbox' name='capture_auto_scroll_session' value='1' {'checked' if setting_bool('capture_auto_scroll_enabled','0') else ''}> Before capture, auto-scroll to trigger lazy-loaded content</label><label><input type='checkbox' name='auto_capture' value='1' {'checked' if setting_bool('live_auto_capture_default','0') else ''}> Auto-capture each new page after it settles</label><label><input type='checkbox' name='headless' value='1'> Headless instead of visible</label><button class='good'>Open controlled browser</button></form></div></div>
     <div class='card'><h2>Saved page captures / case page viewer</h2><p class='small muted'>Open case page viewer to render the captured page from locally saved bytes. In lab/full-forensic captures with saved media, the renderer can show saved images/video/audio without contacting the live site.</p><div class='table-scroll'><table><tr><th>Case viewer</th><th>Full renderer</th><th>Evidence</th><th>Title</th><th>Mode</th><th>Renderer state</th><th>URL</th></tr>{cap_rows or '<tr><td colspan="7" class="muted">No saved pages yet. Start a live session and click Capture Current Page, or use Direct URL capture.</td></tr>'}</table></div></div><div class='card'><h2>Evidence</h2><table><tr><th>ID</th><th>File</th><th>Kind</th><th>Storage</th><th>Status</th></tr>{ev_rows}</table></div><div class='card'><h2>Blocked media records</h2><table><tr><th>ID</th><th>Type</th><th>URL</th><th>URL hash</th></tr>{b_rows}</table></div>"""
     return layout(request, f"Case #{case_id}", body)
 
@@ -5385,7 +5595,7 @@ def live_page(request: Request, msg: str | None = None) -> HTMLResponse:
       <label><input type='checkbox' name='download_allowed_media' value='1' {'checked' if setting_bool('live_download_allowed_media_default','0') else ''}> Lab/full-forensic only: save allowed images/video/audio/CSS for exact page renderer</label>
       <label><input type='checkbox' name='sealed_media_preservation_session' value='1' {'checked' if setting_bool('sealed_media_preservation_enabled','0') else ''}> Block display, preserve blocked media encrypted for sealed export in this session</label>
       <label><input type='checkbox' name='settle_before_capture' value='1' {'checked' if setting_bool('capture_settle_before_save','1') else ''}> Before manual/auto capture, wait for page load/DOM settle</label>
-      <label><input type='checkbox' name='capture_auto_scroll_session' value='1' {'checked' if setting_bool('capture_auto_scroll_enabled','1') else ''}> Before capture, auto-scroll to trigger lazy-loaded content</label>
+      <label><input type='checkbox' name='capture_auto_scroll_session' value='1' {'checked' if setting_bool('capture_auto_scroll_enabled','0') else ''}> Before capture, auto-scroll to trigger lazy-loaded content</label>
       <label><input type='checkbox' name='auto_capture' value='1' {'checked' if setting_bool('live_auto_capture_default','0') else ''}> Auto-capture each new page after it settles</label>
       <label><input type='checkbox' name='headless' value='1'> Headless instead of visible</label>
       <button class='good'>Open controlled browser window</button>
@@ -10105,6 +10315,35 @@ def tor_prewarm_status_route(request: Request) -> JSONResponse:
     require_user(request)
     return JSONResponse(tor_prewarm_status())
 
+
+@app.post("/tor/restart-json")
+def tor_restart_json_route(request: Request) -> JSONResponse:
+    user = require_user(request)
+    if user.get("role") not in {"admin", "supervisor"}:
+        raise HTTPException(403, "Only admins/supervisors can restart Tor")
+    stopped = stop_managed_tor("manual-restart")
+    status = tor_prewarm_background("manual-restart")
+    log_event(user["username"], "TOR_BACKGROUND_RESTART_REQUESTED", details={"stopped": stopped, "status": status})
+    return JSONResponse({"ok": True, "stopped": stopped, "status": tor_prewarm_status()})
+
+
+@app.post("/tor/stop-json")
+def tor_stop_json_route(request: Request) -> JSONResponse:
+    user = require_user(request)
+    if user.get("role") not in {"admin", "supervisor"}:
+        raise HTTPException(403, "Only admins/supervisors can stop Tor")
+    result = stop_managed_tor("manual-stop")
+    with TOR_PREWARM_LOCK:
+        TOR_PREWARM_STATUS.update({"running": False, "ok": False, "message": result.get("message", "Tor stopped"), "updated_at": utcnow(), "reason": "manual-stop", "diagnostics": tor_diagnostics(), "log_tail": tor_log_tail(3500)})
+    log_event(user["username"], "TOR_BACKGROUND_STOP_REQUESTED", details=result)
+    return JSONResponse({"ok": bool(result.get("ok")), "result": result, "status": tor_prewarm_status()})
+
+
+@app.get("/tor/diagnostics")
+def tor_diagnostics_route(request: Request) -> JSONResponse:
+    require_user(request)
+    return JSONResponse(tor_diagnostics())
+
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request, msg: str | None = None) -> HTMLResponse:
     user = require_admin(request)
@@ -10129,21 +10368,33 @@ def settings_page(request: Request, msg: str | None = None) -> HTMLResponse:
       <label><input type='checkbox' name='live_download_allowed_media_default' value='1' {'checked' if truthy(s.get('live_download_allowed_media_default')) else ''}> Live browser: check “save allowed media for exact renderer” by default</label>
       <label><input type='checkbox' name='live_auto_capture_default' value='1' {'checked' if truthy(s.get('live_auto_capture_default','0')) else ''}> Live browser: check “auto-capture each new settled page” by default</label>
       <label><input type='checkbox' name='capture_settle_before_save' value='1' {'checked' if truthy(s.get('capture_settle_before_save','1')) else ''}> Capture: wait/settle before saving manual and auto captures</label>
-      <label><input type='checkbox' name='capture_auto_scroll_enabled' value='1' {'checked' if truthy(s.get('capture_auto_scroll_enabled','1')) else ''}> Capture: auto-scroll before saving to trigger lazy-loaded content</label>
-      <div class='row'><div><label>Capture wait after load (ms)</label><input name='capture_wait_after_load_ms' value='{h(s.get('capture_wait_after_load_ms','1500'))}'></div><div><label>Capture network-idle timeout (ms)</label><input name='capture_network_idle_timeout_ms' value='{h(s.get('capture_network_idle_timeout_ms','8000'))}'></div><div><label>Capture total settle timeout (ms)</label><input name='capture_settle_timeout_ms' value='{h(s.get('capture_settle_timeout_ms','30000'))}'></div></div>
+      <label><input type='checkbox' name='capture_auto_scroll_enabled' value='1' {'checked' if truthy(s.get('capture_auto_scroll_enabled','0')) else ''}> Capture: auto-scroll before saving to trigger lazy-loaded content</label>
+      <div class='row'><div><label>Capture wait after load (ms)</label><input name='capture_wait_after_load_ms' value='{h(s.get('capture_wait_after_load_ms','5000'))}'></div><div><label>Capture network-idle timeout (ms)</label><input name='capture_network_idle_timeout_ms' value='{h(s.get('capture_network_idle_timeout_ms','20000'))}'></div><div><label>Capture total settle timeout (ms)</label><input name='capture_settle_timeout_ms' value='{h(s.get('capture_settle_timeout_ms','30000'))}'></div></div>
       <div class='row'><div><label>Auto-scroll max steps</label><input name='capture_auto_scroll_max_steps' value='{h(s.get('capture_auto_scroll_max_steps','30'))}'></div><div><label>Auto-scroll pause (ms)</label><input name='capture_auto_scroll_pause_ms' value='{h(s.get('capture_auto_scroll_pause_ms','550'))}'></div><div><label>Stable rounds before save</label><input name='capture_stable_rounds' value='{h(s.get('capture_stable_rounds','3'))}'></div></div>
       <div class='row'><div><label>Initial navigation timeout (ms)</label><input name='live_initial_navigation_timeout_ms' value='{h(s.get('live_initial_navigation_timeout_ms','60000'))}'></div><div><label>Auto-capture delay after navigation (ms)</label><input name='live_auto_capture_delay_ms' value='{h(s.get('live_auto_capture_delay_ms','2500'))}'></div><div><label>Reviewer default render mode</label><select name='reviewer_default_render_mode'><option value='auto' {'selected' if s.get('reviewer_default_render_mode','auto')=='auto' else ''}>auto / best available</option><option value='safe' {'selected' if s.get('reviewer_default_render_mode','auto')=='safe' else ''}>safe local only</option><option value='remote' {'selected' if s.get('reviewer_default_render_mode','auto')=='remote' else ''}>allow remote callbacks</option><option value='scripts' {'selected' if s.get('reviewer_default_render_mode','auto')=='scripts' else ''}>allow remote + scripts</option></select></div></div>
       <label><input type='checkbox' name='reviewer_enabled' value='1' {'checked' if truthy(s.get('reviewer_enabled','1')) else ''}> Enable law-enforcement / cleared reviewer import and viewer area</label>
       <label><input type='checkbox' name='sealed_export_enabled' value='1' {'checked' if truthy(s.get('sealed_export_enabled','1')) else ''}> Enable sealed encrypted law-enforcement evidence export</label>
       <label><input type='checkbox' name='sealed_export_include_derived' value='1' {'checked' if truthy(s.get('sealed_export_include_derived','1')) else ''}> Sealed export includes encrypted derived artifacts/snapshots when available</label>
-      <div class='card warn'><h3>Sealed Media Preservation Mode</h3><p class='small muted'>Works in both Organization-Controlled Key and Civilian Unknown Master Key modes. Blocked images/video/audio remain invisible in the live browser, but selected blocked media can be stored encrypted for sealed reviewer / law-enforcement access. Organization mode can use normal local vault encryption or optional hard-sealed reviewer-key storage; civilian mode local reveal remains blocked.</p><label><input type='checkbox' name='sealed_media_preservation_enabled' value='1' {'checked' if truthy(s.get('sealed_media_preservation_enabled','0')) else ''}> Enable sealed media preservation globally</label><label><input type='checkbox' name='sealed_media_preserve_images' value='1' {'checked' if truthy(s.get('sealed_media_preserve_images','1')) else ''}> Preserve blocked images encrypted</label><label><input type='checkbox' name='sealed_media_preserve_video' value='1' {'checked' if truthy(s.get('sealed_media_preserve_video','1')) else ''}> Preserve blocked video encrypted</label><label><input type='checkbox' name='sealed_media_preserve_audio' value='1' {'checked' if truthy(s.get('sealed_media_preserve_audio','1')) else ''}> Preserve blocked audio encrypted</label><div class='row'><div><label>Preservation mode</label><select name='sealed_media_preserve_mode'><option value='fast' {'selected' if s.get('sealed_media_preserve_mode','balanced')=='fast' else ''}>fast / least page slowdown</option><option value='balanced' {'selected' if s.get('sealed_media_preserve_mode','balanced')=='balanced' else ''}>balanced / default</option><option value='complete' {'selected' if s.get('sealed_media_preserve_mode','balanced')=='complete' else ''}>complete / try harder</option></select></div><div><label>Route fetch timeout (ms)</label><input name='sealed_media_preserve_fetch_timeout_ms' value='{h(s.get('sealed_media_preserve_fetch_timeout_ms','3500'))}'></div><div><label>Background timeout (ms)</label><input name='sealed_media_preserve_background_timeout_ms' value='{h(s.get('sealed_media_preserve_background_timeout_ms','18000'))}'></div></div><div class='row'><div><label>Max bytes per preserved object</label><input name='sealed_media_preserve_max_bytes' value='{h(s.get('sealed_media_preserve_max_bytes','52428800'))}'></div><div><label>Max total bytes per live session</label><input name='sealed_media_preserve_max_total_bytes' value='{h(s.get('sealed_media_preserve_max_total_bytes','209715200'))}'></div><div><label>Max preserved items per live session</label><input name='sealed_media_preserve_max_items_per_session' value='{h(s.get('sealed_media_preserve_max_items_per_session','2500'))}'></div><div><label>Max pending background tasks</label><input name='sealed_media_preserve_max_pending_tasks' value='{h(s.get('sealed_media_preserve_max_pending_tasks','45'))}'><p class='small muted'>Default is 45. Raise to 64–128 if you still see queue full on very media-heavy sites.</p></div></div><label><input type='checkbox' name='sealed_media_preserve_skip_decorative_fast' value='1' {'checked' if truthy(s.get('sealed_media_preserve_skip_decorative_fast','1')) else ''}> Fast mode: skip/deprioritize decorative logo/favicon/badge assets so they do not slow page loading</label><label>MIME allowlist, one prefix/type per line</label><textarea name='sealed_media_preserve_mime_allowlist'>{sealed_mime_allowlist}</textarea><div class='card warn'><h3>Organization hard-sealed preserved media</h3><p class='small muted'>Organization mode only. When enabled, preserved blocked media is encrypted to this organization/reviewer public key at capture time. The local vault key cannot decrypt those preserved media originals; reviewer import requires the matching private key.</p><label><input type='checkbox' name='organization_hard_seal_media_enabled' value='1' {'checked' if truthy(s.get('organization_hard_seal_media_enabled','0')) else ''}> Hard-seal preserved blocked media to organization escrow public key</label><label>Organization escrow public key PEM</label><textarea name='organization_hard_seal_public_key_pem' rows='8' placeholder='Paste organization/reviewer escrow_public_key.pem here'>{h(s.get('organization_hard_seal_public_key_pem',''))}</textarea><p class='small muted'>Current fingerprint: <code>{h(s.get('organization_hard_seal_public_key_fingerprint','') or 'not configured')}</code></p></div></div>
+      <div class='card warn'><h3>Sealed Sender / Sealed Media Preservation Mode</h3><p class='small muted'>Works in both Organization-Controlled Key and Civilian Unknown Master Key modes. Blocked images/video/audio remain invisible in the live browser, but selected blocked media can be stored encrypted for sealed reviewer / law-enforcement access. Organization mode can use normal local vault encryption or optional hard-sealed reviewer-key storage; civilian mode local reveal remains blocked. This is a technical custody control, not legal advice or a guarantee of legal protection.</p><label><input type='checkbox' name='sealed_media_preservation_enabled' value='1' {'checked' if truthy(s.get('sealed_media_preservation_enabled','1')) else ''}> Enable Sealed Sender / file downloads globally</label><label><input type='checkbox' name='sealed_media_preserve_images' value='1' {'checked' if truthy(s.get('sealed_media_preserve_images','1')) else ''}> Preserve blocked images encrypted</label><label><input type='checkbox' name='sealed_media_preserve_video' value='1' {'checked' if truthy(s.get('sealed_media_preserve_video','1')) else ''}> Preserve blocked video encrypted</label><label><input type='checkbox' name='sealed_media_preserve_audio' value='1' {'checked' if truthy(s.get('sealed_media_preserve_audio','1')) else ''}> Preserve blocked audio encrypted</label><div class='row'><div><label>Preservation mode</label><select name='sealed_media_preserve_mode'><option value='fast' {'selected' if s.get('sealed_media_preserve_mode','balanced')=='fast' else ''}>fast / least page slowdown</option><option value='balanced' {'selected' if s.get('sealed_media_preserve_mode','balanced')=='balanced' else ''}>balanced / default</option><option value='complete' {'selected' if s.get('sealed_media_preserve_mode','balanced')=='complete' else ''}>complete / try harder</option></select></div><div><label>Route fetch timeout (ms)</label><input name='sealed_media_preserve_fetch_timeout_ms' value='{h(s.get('sealed_media_preserve_fetch_timeout_ms','3500'))}'></div><div><label>Background timeout (ms)</label><input name='sealed_media_preserve_background_timeout_ms' value='{h(s.get('sealed_media_preserve_background_timeout_ms','18000'))}'></div></div><div class='row'><div><label>Max bytes per preserved object</label><input name='sealed_media_preserve_max_bytes' value='{h(s.get('sealed_media_preserve_max_bytes','52428800'))}'></div><div><label>Max total bytes per live session</label><input name='sealed_media_preserve_max_total_bytes' value='{h(s.get('sealed_media_preserve_max_total_bytes','209715200'))}'></div><div><label>Max preserved items per live session</label><input name='sealed_media_preserve_max_items_per_session' value='{h(s.get('sealed_media_preserve_max_items_per_session','2500'))}'></div><div><label>Max pending background tasks</label><input name='sealed_media_preserve_max_pending_tasks' value='{h(s.get('sealed_media_preserve_max_pending_tasks','75'))}'><p class='small muted'>Default is 75. Raise to 128 if you still see queue full on very media-heavy sites.</p></div></div><label><input type='checkbox' name='sealed_media_preserve_skip_decorative_fast' value='1' {'checked' if truthy(s.get('sealed_media_preserve_skip_decorative_fast','1')) else ''}> Fast mode: skip/deprioritize decorative logo/favicon/badge assets so they do not slow page loading</label><label>MIME allowlist, one prefix/type per line</label><textarea name='sealed_media_preserve_mime_allowlist'>{sealed_mime_allowlist}</textarea><div class='card warn'><h3>Organization hard-sealed preserved media</h3><p class='small muted'>Organization mode only. When enabled, preserved blocked media is encrypted to this organization/reviewer public key at capture time. The local vault key cannot decrypt those preserved media originals; reviewer import requires the matching private key.</p><label><input type='checkbox' name='organization_hard_seal_media_enabled' value='1' {'checked' if truthy(s.get('organization_hard_seal_media_enabled','0')) else ''}> Hard-seal preserved blocked media to organization escrow public key</label><label>Organization escrow public key PEM</label><textarea name='organization_hard_seal_public_key_pem' rows='8' placeholder='Paste organization/reviewer escrow_public_key.pem here'>{h(s.get('organization_hard_seal_public_key_pem',''))}</textarea><p class='small muted'>Current fingerprint: <code>{h(s.get('organization_hard_seal_public_key_fingerprint','') or 'not configured')}</code></p></div></div>
       <label><input type='checkbox' name='head_probe_blocked_media' value='1' {'checked' if truthy(s.get('head_probe_blocked_media')) else ''}> HEAD probe blocked media for headers without body download</label>
       <label><input type='checkbox' name='reject_inline_media_in_safe_mode' value='1' {'checked' if truthy(s.get('reject_inline_media_in_safe_mode')) else ''}> Safe mode: minimize/reject inline embedded media summaries</label>
       <div class='row'><div><label>Max root read bytes</label><input name='max_root_read_bytes' value='{h(s.get('max_root_read_bytes','524288'))}'></div><div><label>Max summary chars</label><input name='max_text_summary_chars' value='{h(s.get('max_text_summary_chars','20000'))}'></div><div><label>Max blocked records</label><input name='max_blocked_records' value='{h(s.get('max_blocked_records','1000'))}'></div></div>
       <div class='row'><div><label>Snapshot max media bytes per file</label><input name='snapshot_max_media_bytes' value='{h(s.get('snapshot_max_media_bytes','52428800'))}'></div><div><label>Snapshot max media items per capture</label><input name='snapshot_max_media_items' value='{h(s.get('snapshot_max_media_items','250'))}'></div><div><label>Snapshot max total bytes per live session</label><input name='snapshot_max_total_asset_bytes' value='{h(s.get('snapshot_max_total_asset_bytes','209715200'))}'></div></div>
       <label>Safe allowlist domains, one per line</label><textarea name='safe_allowlist_domains'>{h(s.get('safe_allowlist_domains',''))}</textarea>
       <label>Capture denylist domains, one per line</label><textarea name='capture_denylist_domains'>{h(s.get('capture_denylist_domains',''))}</textarea>
-      <h3>Tor</h3><div class='card'><h3>Tor / One-Click managed Tor</h3><p>{tor_browser_status_html()}</p><label>Default live browser</label><select name='live_browser_default'>{browser_select_html('live_browser_default', s.get('live_browser_default','chromium'))}</select><label>Tor Browser path</label><input name='tor_browser_path' value='{h(s.get('tor_browser_path',''))}' placeholder='C:/Users/you/Desktop/Tor Browser/Browser/firefox.exe'><label>Bundled/standalone tor executable path</label><input name='tor_executable_path' value='{h(s.get('tor_executable_path',''))}' placeholder='Optional: .../TorBrowser/Tor/tor.exe'><label><input type='checkbox' name='tor_auto_start_from_browser_bundle' value='1' {'checked' if truthy(s.get('tor_auto_start_from_browser_bundle','1')) else ''}> One-click Tor: auto-start bundled tor.exe if SOCKS is not already open</label><label><input type='checkbox' name='tor_browser_force_socks' value='1' {'checked' if truthy(s.get('tor_browser_force_socks')) else ''}> When using Tor Browser option, also force the configured SOCKS proxy</label><label><input type='checkbox' name='tor_background_prewarm_enabled' value='1' {'checked' if truthy(s.get('tor_background_prewarm_enabled','0')) else ''}> Pre-initialize Tor provider in the background on app startup / sign-in</label><button type='button' class='secondary' onclick="fetch('/tor/prewarm-json',{{method:'POST'}}).then(r=>r.json()).then(j=>{{document.getElementById('tor-prewarm-status').textContent=(j.status&&j.status.message)||JSON.stringify(j);}}).catch(e=>alert(e))">Start / verify Tor in background now</button><button type='button' class='warn' onclick="fetch('/tor/newnym',{{method:'POST'}}).then(r=>r.json()).then(j=>alert('New Tor identity: '+JSON.stringify(j,null,2))).catch(e=>alert(e))">Request new Tor identity</button><button type='button' class='secondary' onclick="fetch('/tor/exit-ip').then(r=>r.json()).then(j=>alert('Tor exit IP: '+JSON.stringify(j,null,2))).catch(e=>alert(e))">Check Tor exit IP</button><p class='small muted'>Background prewarm starts or verifies the Tor SOCKS provider without slowing sign-in or forcing normal traffic through Tor. Current background status: <code id='tor-prewarm-status'>{h(tor_prewarm_status().get('message',''))}</code></p><script>setInterval(()=>fetch('/tor/prewarm-status').then(r=>r.json()).then(j=>{{let e=document.getElementById('tor-prewarm-status'); if(e) e.textContent=(j.message||'')+(j.running?' (running)':'');}}).catch(()=>{{}}), 2500);</script></div><div class='row'><div><label>Tor host</label><input name='tor_host' value='{h(s.get('tor_host','127.0.0.1'))}'></div><div><label>SOCKS port</label><input name='tor_socks_port' value='{h(s.get('tor_socks_port','9050'))}'><p class='small muted'>Auto-detect also checks 9150 and 9050.</p></div><div><label>Control port</label><input name='tor_control_port' value='{h(s.get('tor_control_port','9051'))}'></div></div><label>Tor control password (optional)</label><input name='tor_control_password' type='password' value='{h(s.get('tor_control_password',''))}'>
+      <h3>Tor</h3><div class='card'><h3>Tor / One-Click managed Tor</h3><p>{tor_browser_status_html()}</p><label>Default live browser</label><select name='live_browser_default'>{browser_select_html('live_browser_default', s.get('live_browser_default','chromium'))}</select><label>Tor Browser path</label><input name='tor_browser_path' value='{h(s.get('tor_browser_path',''))}' placeholder='C:/Users/you/Desktop/Tor Browser/Browser/firefox.exe'><label>Bundled/standalone tor executable path</label><input name='tor_executable_path' value='{h(s.get('tor_executable_path',''))}' placeholder='Optional: .../TorBrowser/Tor/tor.exe'><label><input type='checkbox' name='tor_auto_start_from_browser_bundle' value='1' {'checked' if truthy(s.get('tor_auto_start_from_browser_bundle','1')) else ''}> One-click Tor: auto-start bundled tor.exe if SOCKS is not already open</label><label><input type='checkbox' name='tor_browser_force_socks' value='1' {'checked' if truthy(s.get('tor_browser_force_socks')) else ''}> When using Tor Browser option, also force the configured SOCKS proxy</label><label><input type='checkbox' name='tor_background_prewarm_enabled' value='1' {'checked' if truthy(s.get('tor_background_prewarm_enabled','0')) else ''}> Pre-initialize Tor provider in the background on app startup / sign-in</label><button type='button' class='secondary' onclick="torAction('/tor/prewarm-json')">Start / verify Tor in background now</button><button type='button' class='warn' onclick="torAction('/tor/restart-json')">Restart managed Tor</button><button type='button' class='secondary' onclick="torAction('/tor/stop-json')">Stop managed Tor</button><button type='button' class='warn' onclick="fetch('/tor/newnym',{{method:'POST'}}).then(r=>r.json()).then(j=>alert('New Tor identity: '+JSON.stringify(j,null,2))).catch(e=>alert(e))">Request new Tor identity</button><button type='button' class='secondary' onclick="fetch('/tor/exit-ip').then(r=>r.json()).then(j=>alert('Tor exit IP: '+JSON.stringify(j,null,2))).catch(e=>alert(e))">Check Tor exit IP</button><p class='small muted'>Background prewarm starts or verifies the Tor SOCKS provider without slowing sign-in or forcing normal traffic through Tor. Current background status: <code id='tor-prewarm-status'>{h(tor_prewarm_status().get('message',''))}</code></p><pre id='tor-diagnostics' class='small' style='max-height:260px;overflow:auto;white-space:pre-wrap;background:#071019;border:1px solid #244;padding:10px;border-radius:10px'>{h(pretty(tor_prewarm_status()))}</pre><script>
+function torRender(j){{
+  let s=(j.status||j);
+  let e=document.getElementById('tor-prewarm-status');
+  if(e) e.textContent=(s.message||'')+(s.running?' (running)':'');
+  let d=document.getElementById('tor-diagnostics');
+  if(d) d.textContent=JSON.stringify(s,null,2);
+}}
+function torAction(url){{
+  fetch(url,{{method:'POST'}}).then(r=>r.json()).then(j=>torRender(j)).catch(e=>alert(e));
+}}
+setInterval(()=>fetch('/tor/prewarm-status').then(r=>r.json()).then(j=>torRender(j)).catch(()=>{{}}), 2000);
+</script></div><div class='row'><div><label>Tor host</label><input name='tor_host' value='{h(s.get('tor_host','127.0.0.1'))}'></div><div><label>SOCKS port</label><input name='tor_socks_port' value='{h(s.get('tor_socks_port','9050'))}'><p class='small muted'>Auto-detect also checks 9150 and 9050.</p></div><div><label>Control port</label><input name='tor_control_port' value='{h(s.get('tor_control_port','9051'))}'></div></div><label>Tor control password (optional)</label><input name='tor_control_password' type='password' value='{h(s.get('tor_control_password',''))}'>
       <button class='good'>Save settings</button></form></div>
       <div class='card'><h2>Master reveal key</h2><form method='post' action='/settings/master-key'><label>New master reveal key</label><input name='master_key' type='password' minlength='12'><button class='danger'>Rotate master key</button></form></div>
       <div class='card'><h2>Create user</h2><form method='post' action='/settings/users'><div class='row'><div><label>Username</label><input name='username'></div><div><label>Password</label><input name='password' type='password'></div><div><label>Role</label><select name='role'><option value='investigator'>investigator</option><option value='supervisor'>supervisor</option><option value='reviewer'>reviewer</option><option value='admin'>admin</option></select></div><div><label>Image policy</label><select name='image_policy'><option value='none'>none</option><option value='blur'>blur</option><option value='full'>full</option></select></div></div><button>Create user</button></form><table><tr><th>User</th><th>Role</th><th>Image policy</th><th>Master</th><th>Approval</th><th>WebAuthn</th></tr>{user_rows}</table></div>
@@ -10154,7 +10405,7 @@ def settings_page(request: Request, msg: str | None = None) -> HTMLResponse:
 @app.post("/settings")
 def settings_save(request: Request,
     edition: str = Form("lockdown"), default_capture_mode: str = Form("metadata_only"), default_media_policy: str = Form("block_images_video"), default_user_agent_profile: str = Form("chrome_windows"), custom_user_agent: str = Form(""), live_browser_default: str = Form("chromium"),
-    hard_default_safe_mode: str | None = Form(None), disable_full_reveal_in_lockdown: str | None = Form(None), disable_plaintext_export_in_lockdown: str | None = Form(None), disable_materialization_in_lockdown: str | None = Form(None), allow_blur_in_lockdown: str | None = Form(None), require_master_key_full_reveal: str | None = Form(None), require_approval_full_reveal: str | None = Form(None), require_approval_plaintext_export: str | None = Form(None), require_approval_materialization: str | None = Form(None), live_javascript_enabled: str | None = Form(None), live_download_allowed_media_default: str | None = Form(None), live_auto_capture_default: str | None = Form(None), capture_settle_before_save: str | None = Form(None), capture_auto_scroll_enabled: str | None = Form(None), reviewer_enabled: str | None = Form(None), sealed_export_enabled: str | None = Form(None), sealed_export_include_derived: str | None = Form(None), sealed_media_preservation_enabled: str | None = Form(None), sealed_media_preserve_images: str | None = Form(None), sealed_media_preserve_video: str | None = Form(None), sealed_media_preserve_audio: str | None = Form(None), sealed_media_preserve_max_bytes: str = Form("52428800"), sealed_media_preserve_max_total_bytes: str = Form("209715200"), sealed_media_preserve_max_items_per_session: str = Form("2500"), sealed_media_preserve_max_pending_tasks: str = Form("45"), sealed_media_preserve_mime_allowlist: str = Form("image/\nvideo/\naudio/\napplication/dash+xml\napplication/vnd.apple.mpegurl\napplication/x-mpegurl\napplication/mp4\napplication/octet-stream"), sealed_media_preserve_mode: str = Form("balanced"), sealed_media_preserve_fetch_timeout_ms: str = Form("3500"), sealed_media_preserve_background_timeout_ms: str = Form("18000"), sealed_media_preserve_skip_decorative_fast: str | None = Form(None), organization_hard_seal_media_enabled: str | None = Form(None), organization_hard_seal_public_key_pem: str = Form(""), head_probe_blocked_media: str | None = Form(None), reject_inline_media_in_safe_mode: str | None = Form(None), max_root_read_bytes: str = Form("524288"), max_text_summary_chars: str = Form("20000"), max_blocked_records: str = Form("1000"), snapshot_max_media_bytes: str = Form("52428800"), snapshot_max_media_items: str = Form("250"), snapshot_max_total_asset_bytes: str = Form("209715200"), capture_wait_after_load_ms: str = Form("1500"), capture_network_idle_timeout_ms: str = Form("8000"), capture_settle_timeout_ms: str = Form("30000"), capture_auto_scroll_max_steps: str = Form("30"), capture_auto_scroll_pause_ms: str = Form("550"), capture_stable_rounds: str = Form("3"), live_initial_navigation_timeout_ms: str = Form("60000"), live_auto_capture_delay_ms: str = Form("2500"), reviewer_default_render_mode: str = Form("auto"), safe_allowlist_domains: str = Form(""), capture_denylist_domains: str = Form(""), tor_browser_path: str = Form(""), tor_executable_path: str = Form(""), tor_auto_start_from_browser_bundle: str | None = Form(None), tor_browser_force_socks: str | None = Form(None), tor_background_prewarm_enabled: str | None = Form(None), tor_host: str = Form("127.0.0.1"), tor_socks_port: str = Form("9050"), tor_control_port: str = Form("9051"), tor_control_password: str = Form("")) -> RedirectResponse:
+    hard_default_safe_mode: str | None = Form(None), disable_full_reveal_in_lockdown: str | None = Form(None), disable_plaintext_export_in_lockdown: str | None = Form(None), disable_materialization_in_lockdown: str | None = Form(None), allow_blur_in_lockdown: str | None = Form(None), require_master_key_full_reveal: str | None = Form(None), require_approval_full_reveal: str | None = Form(None), require_approval_plaintext_export: str | None = Form(None), require_approval_materialization: str | None = Form(None), live_javascript_enabled: str | None = Form(None), live_download_allowed_media_default: str | None = Form(None), live_auto_capture_default: str | None = Form(None), capture_settle_before_save: str | None = Form(None), capture_auto_scroll_enabled: str | None = Form(None), reviewer_enabled: str | None = Form(None), sealed_export_enabled: str | None = Form(None), sealed_export_include_derived: str | None = Form(None), sealed_media_preservation_enabled: str | None = Form(None), sealed_media_preserve_images: str | None = Form(None), sealed_media_preserve_video: str | None = Form(None), sealed_media_preserve_audio: str | None = Form(None), sealed_media_preserve_max_bytes: str = Form("52428800"), sealed_media_preserve_max_total_bytes: str = Form("209715200"), sealed_media_preserve_max_items_per_session: str = Form("2500"), sealed_media_preserve_max_pending_tasks: str = Form("75"), sealed_media_preserve_mime_allowlist: str = Form("image/\nvideo/\naudio/\napplication/dash+xml\napplication/vnd.apple.mpegurl\napplication/x-mpegurl\napplication/mp4\napplication/octet-stream"), sealed_media_preserve_mode: str = Form("balanced"), sealed_media_preserve_fetch_timeout_ms: str = Form("3500"), sealed_media_preserve_background_timeout_ms: str = Form("18000"), sealed_media_preserve_skip_decorative_fast: str | None = Form(None), organization_hard_seal_media_enabled: str | None = Form(None), organization_hard_seal_public_key_pem: str = Form(""), head_probe_blocked_media: str | None = Form(None), reject_inline_media_in_safe_mode: str | None = Form(None), max_root_read_bytes: str = Form("524288"), max_text_summary_chars: str = Form("20000"), max_blocked_records: str = Form("1000"), snapshot_max_media_bytes: str = Form("52428800"), snapshot_max_media_items: str = Form("250"), snapshot_max_total_asset_bytes: str = Form("209715200"), capture_wait_after_load_ms: str = Form("5000"), capture_network_idle_timeout_ms: str = Form("20000"), capture_settle_timeout_ms: str = Form("30000"), capture_auto_scroll_max_steps: str = Form("30"), capture_auto_scroll_pause_ms: str = Form("550"), capture_stable_rounds: str = Form("3"), live_initial_navigation_timeout_ms: str = Form("60000"), live_auto_capture_delay_ms: str = Form("2500"), reviewer_default_render_mode: str = Form("auto"), safe_allowlist_domains: str = Form(""), capture_denylist_domains: str = Form(""), tor_browser_path: str = Form(""), tor_executable_path: str = Form(""), tor_auto_start_from_browser_bundle: str | None = Form(None), tor_browser_force_socks: str | None = Form(None), tor_background_prewarm_enabled: str | None = Form(None), tor_host: str = Form("127.0.0.1"), tor_socks_port: str = Form("9050"), tor_control_port: str = Form("9051"), tor_control_password: str = Form("")) -> RedirectResponse:
     user = require_admin(request)
     if civilian_unknown_master_mode():
         edition = "lockdown"
@@ -10180,7 +10431,7 @@ def settings_save(request: Request,
     vals["sealed_media_preserve_max_bytes"] = str(safe_int(vals.get("sealed_media_preserve_max_bytes"), 52428800, min_value=1048576))
     vals["sealed_media_preserve_max_total_bytes"] = str(safe_int(vals.get("sealed_media_preserve_max_total_bytes"), 209715200, min_value=1048576))
     vals["sealed_media_preserve_max_items_per_session"] = str(safe_int(vals.get("sealed_media_preserve_max_items_per_session"), 2500, min_value=1))
-    vals["sealed_media_preserve_max_pending_tasks"] = str(safe_int(vals.get("sealed_media_preserve_max_pending_tasks"), 45, min_value=1, max_value=1000))
+    vals["sealed_media_preserve_max_pending_tasks"] = str(safe_int(vals.get("sealed_media_preserve_max_pending_tasks"), 75, min_value=1, max_value=1000))
     if vals.get("sealed_media_preserve_mode") not in {"fast", "balanced", "complete"}:
         vals["sealed_media_preserve_mode"] = "balanced"
     vals["sealed_media_preserve_fetch_timeout_ms"] = str(safe_int(vals.get("sealed_media_preserve_fetch_timeout_ms"), 3500, min_value=500, max_value=60000))
@@ -10484,7 +10735,16 @@ def launch(host: str, port: int, open_browser: bool = True) -> None:
         threading.Thread(target=opener, daemon=True).start()
     import uvicorn
     # Important: pass the app object, not 'app:app', so the file can be renamed.
-    uvicorn.run(app, host=host, port=port, reload=False)
+    try:
+        uvicorn.run(app, host=host, port=port, reload=False)
+    finally:
+        # Ctrl-C / terminal shutdown cleanup: stop only the Tor provider process
+        # that BlindSite started and recorded. This intentionally does not kill
+        # unrelated external Tor Browser/Tor instances.
+        try:
+            stop_managed_tor("terminal-shutdown")
+        except Exception as exc:
+            tor_append_runtime_log(f"Terminal shutdown Tor cleanup failed: {exc}")
 
 
 def main() -> None:

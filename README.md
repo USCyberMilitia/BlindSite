@@ -258,6 +258,7 @@ python -m pip install --upgrade \
   cryptography \
   itsdangerous \
   pillow \
+  pypdf \
   playwright \
   python-multipart
 ```

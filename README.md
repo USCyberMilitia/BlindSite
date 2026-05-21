@@ -14,91 +14,86 @@
 >
 > Use a fresh VM or dedicated investigation machine. Do not run high-risk investigations from a personal device or everyday browser profile.
 
-# 🔥 BlindSite Second Major Update — Faster, Safer, and More Investigator-Ready
+## Latest Major Update: Faster, Safer, More Investigator-Ready
 
-BlindSite has received one of its most significant upgrades yet.
+BlindSite has received a major forensic hardening and usability update focused on real-world investigations, darknet workflows, evidence integrity, and safer review.
 
-First, thank you to everyone who has taken the time to look at the project. BlindSite has now reached **330+ total clones by 138 unique cloners**, which tells us people are paying attention and taking the tool seriously enough to pull the code, inspect it, test it, and see where this project is going.
+### New Features
 
-This update is a major step forward.
+- **Application Genesis Hash**
+  - Every new investigation can now be cryptographically tied to the exact BlindSite build/source file that created it.
+  - Helps investigators and reviewers verify which version of BlindSite initialized the case.
 
-Our last update improved general performance by approximately **70%** as well as greatly increasing the security/encryption of the workflow. This new update adds another major performance leap, with Tor/session performance improvements of up to approximately **80%**, depending on workflow, environment, and system resources.
+- **Executable Genesis Seal**
+  - Adds an `application_genesis` audit event at the start of new investigation/session audit chains.
+  - Records the executable/source hash, app version, custody mode, release metadata when available, and verification warnings.
 
-> **Older versions should now be considered deprecated.**  
-> BlindSite has moved quickly from early proof-of-concept into a much more serious forensic containment platform.
+- **Optional YubiKey / WebAuthn Protection**
+  - YubiKey/security-key support is now available as an optional extra layer.
+  - It does **not** replace the master reveal key.
+  - Users can enable security-key prompts for login and high-risk actions.
 
----
+- **LE Reviewer YubiKey Protection**
+  - Imported reviewer case files can now be protected with a review password and/or YubiKey.
+  - Adds safer access control for sensitive recovered evidence.
 
-## 🚀 What’s New
+- **LE Reviewer Import Timeout**
+  - Imported reviewer cases can automatically re-lock after inactivity.
+  - Reviewers must re-authenticate with password or YubiKey after the timeout expires.
 
-### ⚡ Major Performance Improvements
+- **Global Tor Status Bar**
+  - BlindSite now shows Tor readiness across the app.
+  - Displays Tor closed/starting/bootstrapping/ready status with a live percentage indicator.
 
-BlindSite is now significantly faster and more responsive during high-risk investigation workflows.
+- **Improved Tor Workflow**
+  - Tor startup, diagnostics, bootstrap progress, and managed shutdown are more visible and easier to trust.
+  - Helps investigators know whether Tor is actually ready before depending on it.
 
-This update improves Tor/session performance, evidence capture responsiveness, handling of larger or dynamic pages, investigator workflow speed, and general stability during longer sessions.
+- **CAPTCHA / Challenge Image Exception**
+  - BlindSite can now allow narrow CAPTCHA/challenge images while keeping other media blocked.
+  - This helps investigators access sites that require CAPTCHA verification without switching to unsafe “allow all images” mode.
 
----
+- **Inline/Base64 CAPTCHA Support**
+  - Some onion sites embed CAPTCHAs directly as `data:image/png;base64,...`.
+  - BlindSite now supports those inline CAPTCHA images when the surrounding page context indicates a challenge/human-verification step.
 
-### 🌐 Remote Evidence Resource Capture
+- **Blocked Media Safety Preserved**
+  - CAPTCHA support does **not** allow all images.
+  - Video, audio, normal images, and unrelated media remain blocked unless policy allows them.
+  - CAPTCHA exceptions are logged for forensic transparency.
 
-BlindSite can now better preserve remote resources and callbacks connected to a page.
+- **Smarter Background Media Retry**
+  - Background media preservation remains fast and recoverable.
+  - Queue-full items are treated as a subset of not-downloaded media, so investigators can retry failed preservation without losing the session.
 
-Modern web evidence is often not just the visible page. It may include media URLs, redirected resources, embedded content, API responses, video/resource pointers, dynamic assets, and files loaded from external domains.
+- **Cleaner Header Hash Display**
+  - Events with no captured headers no longer appear as if they have meaningful identical header hashes.
+  - BlindSite now makes empty-header events clearer in the UI.
 
-This helps investigators preserve more of the actual evidence environment instead of relying only on screenshots or surface-level page capture.
+- **Debug / Self-Test / Security Evaluator Updates**
+  - Self-test and debug output now include newer forensic/security features.
+  - The security evaluator was updated to cover Application Genesis Hash, YubiKey/WebAuthn, sealed custody, reviewer protection, and related claims.
 
----
+### Why This Matters
 
-### 🔎 Search and Evidence Discovery
+This update makes BlindSite more usable in real investigative conditions.
 
-BlindSite now includes stronger search functionality to help investigators quickly find captured evidence, notes, resources, reports, and case materials.
+Investigators often need to access fragile, hostile, or darknet sites where:
 
-This makes larger investigations easier to work through without manually digging through folders, logs, or scattered files.
+- Tor must be working correctly
+- media must stay blocked
+- CAPTCHAs must still be solvable by a human
+- evidence must remain sealed and reviewable
+- access to recovered evidence must be controlled
+- the tool version that created the case must be verifiable
 
----
+BlindSite is built around a simple principle:
 
-### 📝 Secure Report Creation
+> Preserve what investigators should not have to see.
 
-BlindSite now supports stronger secure report workflows for turning captured evidence into organized case material in a secure manner. Encrypted PDF reports can now be prepared by authorized individuals and securely exported.
-
-Reports can help investigators summarize findings, preserve context, document what was captured, and prepare evidence for safer review or handoff.
-
----
-
-### 🧵 Background Tasks
-
-Longer operations can now run more smoothly in the background instead of freezing the investigator’s workflow.
-
-This is especially important during larger captures, downloads, exports, scans, and evidence-processing tasks.
-
----
-
-### 📊 Download Progress Bar
-
-BlindSite now includes clearer download progress handling so investigators can see what is happening during resource capture.
-
-This makes the app feel more transparent and usable when dealing with larger files, remote resources, or slower Tor/network sessions.
-
----
-
-### 💬 Better Dynamic Investigation Support
-
-BlindSite is becoming much stronger for real-world investigations where evidence appears after the page loads.
-
-This matters for public chat sites, forums, live pages, media-heavy pages, high-risk web communities, and other environments where evidence may appear only after interaction. Got a long chat that's taken place over an hour. Capture the full data set with manual capture!
-
----
-
-## 🧠 Why This Update Matters
-
-BlindSite exists because people doing high-risk investigations often have no good options.
-
-They are forced to choose between directly viewing disturbing material, taking weak screenshots, downloading risky files manually, losing dynamic evidence, relying on tools not designed for custody, or avoiding the investigation altogether.
-
-BlindSite is designed to create a safer middle path.
-
-It helps investigators preserve evidence while reducing unnecessary exposure, improving custody, and making responsible handoff easier.
-
+This update pushes that idea further by making BlindSite safer, more transparent, more verifiable, and more practical for real high-risk investigations.
+> **Older versions should now be considered deprecated.**
+> 
 ---
 
 ## ✅ Recommended Action
@@ -109,18 +104,9 @@ If you cloned an earlier version of BlindSite, we strongly recommend updating.
 
 **Thank you to everyone testing, cloning, reviewing, and following the project.**
 
-This second update is a serious upgrade — and we are just getting started. From here on out it's about putting this code through it's paces, validating all the claims, and hardening the code so it can work on any site without fail. People like you who clone and post issues with the code are a critical part of that process! We will reward you with tokens on our website for thoughtful feedback or used feature suggestions so don't be shy.
+This fourth update is a serious upgrade — and we are just getting started. From here on out it's about putting this code through it's paces, validating all the claims, and hardening the code so it can work on any site without fail. People like you who clone and post issues with the code are a critical part of that process! We will reward you with tokens on our website for thoughtful feedback or used feature suggestions so don't be shy.
 
-2 new standalone security and performance validation suites are also available to test core technical and performance claims around encrypted storage, hard-sealed custody, wrong-key failure, sealed exports, reviewer recovery, audit-chain tamper detection, and storage-hash tamper detection. The security evaluator has been updated since we pushed it yesterday.
-
-A secure key generator for organizations and those testing BlindSite is now available. It is critical this generator is used only by organization or individuals that understand the risks or those wanting to test out BlindSite. For normal Civilian workflows please use Civilian Unknown Master Key Mode with the prefilled key.
-
-Our public key has changed. Please check below for the correct key though it should be filled in for you automatically for Civilian mode.
-
-This is still early-access software, but this update is a major step toward making BlindSite faster, safer, and easier to verify.
-
-
-ABOUT THE PROGRAM:
+**ABOUT THE PROGRAM:**
 
 BlindSite is a forensic browser and encrypted evidence vault for high-risk digital investigations.
 
@@ -154,95 +140,7 @@ It helps protect:
 - cases from weak custody records;
 - review workflows from unsafe remote callbacks;
 - organizations from uncontrolled access to sensitive material.
-
----
-
-## Top features
-
-### 1. Blind / sealed media preservation
-
-Images, videos, and audio can be blocked from the user’s screen while still being preserved encrypted in the evidence vault.
-
-That means investigators can capture high-risk pages without casually viewing or handling sensitive media in plaintext.
-
----
-
-### 2. Civilian Unknown Master Key mode
-
-In this custody mode, the civilian user does **not** possess the master reveal key.
-
-They can preserve evidence, but they cannot locally reveal, export, or casually view dangerous originals.
-
-The evidence can later be handed off as a sealed package to an authorized reviewer.
-
----
-
-### 3. Organization-Controlled Key mode
-
-Organizations can control their own master key and decide who can unlock, review, export, or preserve evidence.
-
-This is useful for:
-
-- agencies;
-- law firms;
-- nonprofits;
-- newsrooms;
-- internal investigation teams.
-
----
-
-### 4. Sealed evidence export
-
-BlindSite can export a sealed case package containing:
-
-- encrypted evidence objects;
-- metadata;
-- hashes;
-- audit records;
-- page captures;
-- blocked-media records;
-- wrapped keys.
-
-The ZIP does **not** include plaintext originals by default.
-
----
-
-### 5. Law-enforcement / cleared reviewer viewer
-
-Authorized reviewers can import a sealed evidence package, decrypt it with the escrow/private key, and browse recovered pages and media in a clean case viewer.
-
-The reviewer can inspect captured pages without manually digging through hundreds of raw files.
-
----
-
-### 6. Dynamic page capture and reconstruction
-
-BlindSite can capture modern pages with images, video, lazy-loaded content, and dynamic media.
-
-Recovered pages can be rendered locally using saved evidence objects instead of calling back to the live site.
-
----
-
-### 7. Tor-aware controlled browser sessions
-
-BlindSite supports controlled live browsing workflows, including:
-
-- Tor-based modes;
-- manual capture;
-- automatic capture;
-- media-blocking policies;
-- encrypted media preservation.
-
----
-
-### 8. Audit chain and audit seals
-
-Important actions are logged into an audit chain.
-
-BlindSite can also create audit/storage seals: cryptographic checkpoints showing what the audit log and evidence vault looked like at a specific moment.
-
-This makes later tampering easier to detect.
-
+  
 ---
 
 ## Install dependencies

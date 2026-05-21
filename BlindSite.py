@@ -26,6 +26,7 @@ import time
 import traceback
 import uuid
 import webbrowser
+import textwrap
 import zipfile
 from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
@@ -38,15 +39,15 @@ import requests
 from bs4 import BeautifulSoup
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import padding, rsa, ec
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse, PlainTextResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageDraw
 from starlette.middleware.sessions import SessionMiddleware
 
 APP_NAME = "US Cyber Militia / BlindSite"
-APP_VERSION = "5.14.1-tor-diagnostics-restart"
+APP_VERSION = "5.19.6-pdf-report-full-width-timeouts"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "vault.sqlite3"
@@ -473,6 +474,11 @@ def init_db() -> None:
             role TEXT NOT NULL DEFAULT 'investigator', image_policy TEXT NOT NULL DEFAULT 'blur',
             require_master_key INTEGER NOT NULL DEFAULT 1, require_approval INTEGER NOT NULL DEFAULT 1,
             require_webauthn INTEGER NOT NULL DEFAULT 0, webauthn_note TEXT, created_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS webauthn_credentials(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, credential_id TEXT UNIQUE NOT NULL,
+            public_key_pem TEXT NOT NULL, cose_alg INTEGER, sign_count INTEGER NOT NULL DEFAULT 0,
+            aaguid TEXT, nickname TEXT, transports_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL,
+            last_used_at TEXT, FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE)""",
         """CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS cases(
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT, mode TEXT NOT NULL DEFAULT 'lockdown',
@@ -509,6 +515,7 @@ def init_db() -> None:
         """CREATE TABLE IF NOT EXISTS audit_events(
             id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
             case_id INTEGER, evidence_id INTEGER, blocked_media_id INTEGER, session_id TEXT,
+            investigation_id TEXT NOT NULL DEFAULT 'global',
             details_json TEXT NOT NULL DEFAULT '{}', prev_hash TEXT NOT NULL, event_hash TEXT NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS approvals(
             id INTEGER PRIMARY KEY AUTOINCREMENT, case_id INTEGER, evidence_id INTEGER, blocked_media_id INTEGER,
@@ -565,6 +572,7 @@ def init_db() -> None:
             if col not in cols(table):
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         add_col("settings", "updated_at", "TEXT NOT NULL DEFAULT ''")
+        add_col("audit_events", "investigation_id", "TEXT NOT NULL DEFAULT 'global'")
         add_col("blocked_media", "materialized_evidence_id", "INTEGER")
         add_col("blocked_media", "request_headers_json", "TEXT")
         add_col("blocked_media", "header_sha256", "TEXT")
@@ -617,6 +625,13 @@ def init_db() -> None:
         "organization_hard_seal_media_enabled": "0",
         "organization_hard_seal_public_key_pem": "",
         "organization_hard_seal_public_key_fingerprint": "",
+        "webauthn_stepup_max_age_seconds": "900",
+        "webauthn_require_for_full_reveal": "1",
+        "webauthn_require_for_plaintext_export": "1",
+        "webauthn_require_for_materialization": "1",
+        "webauthn_require_for_sealed_export": "1",
+        "webauthn_require_for_exact_page_render": "1",
+        "webauthn_require_for_admin_settings": "0",
         "edition": "lockdown",
         "default_case_mode": "lockdown",
         "default_media_policy": "block_images_video",
@@ -661,6 +676,7 @@ def init_db() -> None:
         "snapshot_max_total_asset_bytes": "209715200",
         "live_download_allowed_media_default": "0",
         "live_auto_capture_default": "0",
+        "live_allow_captcha_challenge_media_default": "0",
         "capture_settle_before_save": "1",
         "capture_wait_after_load_ms": "5000",
         "capture_network_idle_timeout_ms": "20000",
@@ -673,6 +689,20 @@ def init_db() -> None:
         "live_auto_capture_delay_ms": "2500",
         "reviewer_enabled": "1",
         "reviewer_default_render_mode": "auto",
+        "reviewer_import_unlock_timeout_seconds": "900",
+        "pdf_report_navigation_timeout_ms": "60000",
+        "pdf_report_domcontentloaded_timeout_ms": "20000",
+        "pdf_report_scripts_wait_ms": "12000",
+        "pdf_report_safe_wait_ms": "3000",
+        "pdf_report_screenshot_timeout_ms": "30000",
+        "pdf_report_fallback_timeout_ms": "30000",
+        "pdf_report_full_width_capture": "1",
+        "pdf_report_max_capture_width": "2400",
+        "pdf_report_max_capture_height": "24000",
+        "pdf_report_pdf_page_width_px": "1224",
+        "pdf_report_pdf_page_height_px": "1584",
+        "pdf_report_pdf_margin_px": "36",
+        "pdf_report_split_overlap_px": "24",
         "capture_chat_profile_enabled": "1",
         "capture_chat_url_keywords": "chat\nchatroom\nrooms",
         "capture_chat_settle_timeout_ms": "10000",
@@ -728,39 +758,340 @@ def init_db() -> None:
         pass
 
 
-def log_event(actor: str, action: str, *, case_id: int | None = None, evidence_id: int | None = None, blocked_media_id: int | None = None, session_id: str | None = None, details: dict[str, Any] | None = None) -> str:
+
+ZERO_HASH = "0" * 64
+APPLICATION_BUILD_IDENTITY_CACHE: dict[str, Any] | None = None
+AUDIT_GENERATED_DETAIL_KEYS = {"genesis_hash", "event_hash"}
+
+
+def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    hsh = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            if chunk:
+                hsh.update(chunk)
+    return hsh.hexdigest()
+
+
+def git_value(args: list[str]) -> str:
+    try:
+        r = subprocess.run(["git", *args], cwd=str(BASE_DIR), capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            return (r.stdout or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def current_git_commit() -> str:
+    for key in ["BLINDSITE_GIT_COMMIT", "APP_GIT_COMMIT", "GIT_COMMIT", "RELEASE_GIT_COMMIT"]:
+        val = os.environ.get(key, "").strip()
+        if val:
+            return val
+    val = git_value(["rev-parse", "HEAD"])
+    if val:
+        return val
+    try:
+        head = (BASE_DIR / ".git" / "HEAD").read_text(encoding="utf-8", errors="ignore").strip()
+        if head.startswith("ref:"):
+            ref = head.split(" ", 1)[1].strip()
+            ref_path = BASE_DIR / ".git" / ref
+            if ref_path.exists():
+                return ref_path.read_text(encoding="utf-8", errors="ignore").strip()
+        elif head:
+            return head
+    except Exception:
+        pass
+    return ""
+
+
+def current_release_tag() -> str:
+    for key in ["BLINDSITE_RELEASE_TAG", "APP_RELEASE_TAG", "RELEASE_TAG", "GITHUB_REF_NAME"]:
+        val = os.environ.get(key, "").strip()
+        if val:
+            return val
+    return git_value(["describe", "--tags", "--exact-match"])
+
+
+def application_build_identity(*, refresh: bool = False) -> dict[str, Any]:
+    """Return the current Application Genesis Hash identity for this build.
+
+    Frozen/PyInstaller builds are bound to sys.executable. Source runs are bound
+    to this main Python file plus any nearby simple source/build manifest if one
+    exists. Hashing failures never block startup; the failure is returned and
+    can be recorded in the genesis audit event.
+    """
+    global APPLICATION_BUILD_IDENTITY_CACHE
+    if APPLICATION_BUILD_IDENTITY_CACHE is not None and not refresh:
+        return dict(APPLICATION_BUILD_IDENTITY_CACHE)
+
+    frozen = bool(getattr(sys, "frozen", False))
+    identity: dict[str, Any] = {
+        "feature_name": "Application Genesis Hash",
+        "seal_name": "Executable Genesis Seal",
+        "app_name": "BlindSite",
+        "app_title": APP_NAME,
+        "app_version": APP_VERSION,
+        "frozen_executable": frozen,
+        "build_kind": "frozen_executable" if frozen else "source",
+        "executable_path": str(Path(sys.executable).resolve()) if frozen else "",
+        "source_path": "" if frozen else str(Path(__file__).resolve()),
+        "executable_sha256": "",
+        "git_commit": current_git_commit(),
+        "release_tag": current_release_tag(),
+        "source_component_hashes": [],
+        "hash_error": "",
+        "warnings": [],
+    }
+
+    try:
+        if frozen:
+            target = Path(sys.executable).resolve()
+            identity["executable_sha256"] = sha256_file(target)
+        else:
+            components: list[dict[str, Any]] = []
+            main_path = Path(__file__).resolve()
+            components.append({"kind": "main_source", "path": str(main_path), "sha256": sha256_file(main_path)})
+            for name in [
+                "build_manifest.json", "source_manifest.json", "application_manifest.json",
+                "manifest.json", "SHA256SUMS", "RELEASE.txt", "VERSION.txt"
+            ]:
+                candidate = BASE_DIR / name
+                if candidate.exists() and candidate.is_file():
+                    try:
+                        components.append({"kind": "manifest", "path": str(candidate.resolve()), "sha256": sha256_file(candidate)})
+                    except Exception as exc:
+                        components.append({"kind": "manifest", "path": str(candidate.resolve()), "sha256": "", "error": str(exc)[:500]})
+            identity["source_component_hashes"] = components
+            if len(components) == 1:
+                identity["executable_sha256"] = components[0].get("sha256", "")
+            else:
+                identity["executable_sha256"] = sha256_text(canonical(components))
+    except Exception as exc:
+        identity["hash_error"] = str(exc)[:1000]
+
+    if not identity.get("executable_sha256"):
+        identity["warnings"].append("Executable Genesis Seal warning: executable/source hash could not be computed.")
+    if not frozen:
+        identity["warnings"].append("Executable Genesis Seal warning: source mode was used instead of a frozen/release executable.")
+    if not identity.get("git_commit"):
+        identity["warnings"].append("Executable Genesis Seal warning: git_commit is missing.")
+    if not identity.get("release_tag"):
+        identity["warnings"].append("Executable Genesis Seal warning: release_tag is missing.")
+    if identity.get("hash_error"):
+        identity["warnings"].append("Executable Genesis Seal warning: hash computation failed; see hash_error.")
+
+    APPLICATION_BUILD_IDENTITY_CACHE = dict(identity)
+    return identity
+
+
+def infer_investigation_id(case_id: int | None = None, session_id: str | None = None, details: dict[str, Any] | None = None) -> str:
     details = details or {}
-    prev = fetchone("SELECT event_hash FROM audit_events ORDER BY id DESC LIMIT 1")
-    prev_hash = prev["event_hash"] if prev else "GENESIS"
+    explicit = str(details.get("investigation_id") or "").strip()
+    if explicit:
+        return explicit
+    if session_id:
+        return f"session:{session_id}"
+    if case_id is not None:
+        return f"case:{int(case_id)}"
+    return "global"
+
+
+def audit_details_for_hash(details: dict[str, Any] | None) -> dict[str, Any]:
+    details = dict(details or {})
+    for key in AUDIT_GENERATED_DETAIL_KEYS:
+        details.pop(key, None)
+    return details
+
+
+def audit_event_hash(*, created_at: str, actor: str, action: str, case_id: int | None, evidence_id: int | None, blocked_media_id: int | None, session_id: str | None, investigation_id: str, details: dict[str, Any], prev_hash: str, include_investigation_id: bool = True) -> str:
     event = {
-        "created_at": utcnow(),
+        "created_at": created_at,
         "actor": actor,
         "action": action,
         "case_id": case_id,
         "evidence_id": evidence_id,
         "blocked_media_id": blocked_media_id,
         "session_id": session_id,
-        "details": details,
+        "details": audit_details_for_hash(details),
         "prev_hash": prev_hash,
     }
-    event_hash = sha256_text(canonical(event))
-    execute("""INSERT INTO audit_events(created_at,actor,action,case_id,evidence_id,blocked_media_id,session_id,details_json,prev_hash,event_hash)
-               VALUES(?,?,?,?,?,?,?,?,?,?)""", (event["created_at"], actor, action, case_id, evidence_id, blocked_media_id, session_id, json.dumps(details, ensure_ascii=False), prev_hash, event_hash))
+    if include_investigation_id:
+        event["investigation_id"] = investigation_id
+    return sha256_text(canonical(event))
+
+
+def application_genesis_event_details(*, investigation_id: str, case_id: int | None = None, session_id: str | None = None, created_at: str | None = None) -> dict[str, Any]:
+    ident = application_build_identity()
+    created_at = created_at or utcnow()
+    details = {
+        "event_type": "application_genesis",
+        "feature_name": "Application Genesis Hash",
+        "seal_name": "Executable Genesis Seal",
+        "app_name": "BlindSite",
+        "app_title": APP_NAME,
+        "app_version": APP_VERSION,
+        "build_kind": ident.get("build_kind"),
+        "frozen_executable": bool(ident.get("frozen_executable")),
+        "executable_path": ident.get("executable_path") or "",
+        "source_path": ident.get("source_path") or "",
+        "executable_sha256": ident.get("executable_sha256") or "",
+        "source_component_hashes": ident.get("source_component_hashes") or [],
+        "hash_error": ident.get("hash_error") or "",
+        "git_commit": ident.get("git_commit") or "",
+        "release_tag": ident.get("release_tag") or "",
+        "custody_mode": custody_mode(),
+        "investigation_id": investigation_id,
+        "case_id": case_id,
+        "session_id": session_id,
+        "created_at": created_at,
+        "previous_hash": ZERO_HASH,
+        "verification_statement": "This investigation was initialized with BlindSite executable SHA-256: {hash}. Compare this hash against the published GitHub release SHA256SUMS for the claimed release.".format(hash=ident.get("executable_sha256") or "UNAVAILABLE"),
+        "warnings": ident.get("warnings") or [],
+    }
+    return details
+
+
+def ensure_application_genesis_event(investigation_id: str, *, case_id: int | None = None, session_id: str | None = None, actor: str = "system") -> dict[str, Any]:
+    investigation_id = investigation_id or infer_investigation_id(case_id, session_id)
+    existing = rowdict(fetchone("SELECT * FROM audit_events WHERE investigation_id=? AND action='application_genesis' ORDER BY id ASC LIMIT 1", (investigation_id,)))
+    if existing:
+        details = jloads(existing.get("details_json"), {})
+        details.setdefault("genesis_hash", existing.get("event_hash"))
+        return {"created": False, "event": existing, "details": details}
+
+    prior = rowdict(fetchone("SELECT * FROM audit_events WHERE investigation_id=? ORDER BY id ASC LIMIT 1", (investigation_id,)))
+    if prior:
+        # Backward compatibility: do not insert a retroactive genesis event after
+        # old audit events because that would make the existing chain look broken.
+        details = application_genesis_event_details(investigation_id=investigation_id, case_id=case_id, session_id=session_id)
+        details.setdefault("warnings", []).append("Application Genesis Hash warning: existing legacy audit events were present before this feature; genesis was not inserted retroactively.")
+        return {"created": False, "event": None, "details": details, "legacy_without_genesis": True}
+
+    created_at = utcnow()
+    details = application_genesis_event_details(investigation_id=investigation_id, case_id=case_id, session_id=session_id, created_at=created_at)
+    event_hash = audit_event_hash(created_at=created_at, actor=actor, action="application_genesis", case_id=case_id, evidence_id=None, blocked_media_id=None, session_id=session_id, investigation_id=investigation_id, details=details, prev_hash=ZERO_HASH)
+    details["genesis_hash"] = event_hash
+    details["event_hash"] = event_hash
+    try:
+        execute("""INSERT INTO audit_events(created_at,actor,action,case_id,evidence_id,blocked_media_id,session_id,investigation_id,details_json,prev_hash,event_hash)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (created_at, actor, "application_genesis", case_id, None, None, session_id, investigation_id, json.dumps(details, ensure_ascii=False), ZERO_HASH, event_hash))
+        ev = rowdict(fetchone("SELECT * FROM audit_events WHERE investigation_id=? AND action='application_genesis' ORDER BY id ASC LIMIT 1", (investigation_id,))) or {}
+        return {"created": True, "event": ev, "details": details}
+    except Exception as exc:
+        # Do not block startup/session creation. If SQLite insertion itself fails,
+        # the caller cannot rely on the audit table, so return a clear failure
+        # object for diagnostic surfaces.
+        details.setdefault("warnings", []).append(f"Executable Genesis Seal warning: genesis audit event could not be written: {exc}")
+        return {"created": False, "event": None, "details": details, "error": str(exc)}
+
+
+def application_genesis_report(*, case_id: int | None = None, session_id: str | None = None, investigation_id: str | None = None) -> dict[str, Any]:
+    investigation_id = investigation_id or infer_investigation_id(case_id, session_id)
+    row = rowdict(fetchone("SELECT * FROM audit_events WHERE investigation_id=? AND action='application_genesis' ORDER BY id ASC LIMIT 1", (investigation_id,)))
+    warnings: list[str] = []
+    if not row:
+        warnings.append("Application Genesis Hash warning: audit chain does not start with application_genesis or genesis event is missing.")
+        ident = application_build_identity()
+        return {
+            "present": False,
+            "investigation_id": investigation_id,
+            "current_application_identity": ident,
+            "warnings": warnings + list(ident.get("warnings") or []),
+            "verification_statement": "This investigation was initialized with BlindSite executable SHA-256: UNAVAILABLE. Compare this hash against the published GitHub release SHA256SUMS for the claimed release.",
+        }
+    details = jloads(row.get("details_json"), {})
+    executable_sha256 = details.get("executable_sha256") or ""
+    warnings.extend(details.get("warnings") or [])
+    if not executable_sha256:
+        warnings.append("Application Genesis Hash warning: executable hash could not be computed.")
+    if details.get("build_kind") == "source" or details.get("source_path"):
+        warnings.append("Application Genesis Hash warning: source mode was used instead of frozen/release executable.")
+    if not details.get("release_tag"):
+        warnings.append("Application Genesis Hash warning: release_tag is missing.")
+    if not details.get("git_commit"):
+        warnings.append("Application Genesis Hash warning: git_commit is missing.")
+    statement = "This investigation was initialized with BlindSite executable SHA-256: {hash}. Compare this hash against the published GitHub release SHA256SUMS for the claimed release.".format(hash=executable_sha256 or "UNAVAILABLE")
+    return {
+        "present": True,
+        "event_id": row.get("id"),
+        "investigation_id": investigation_id,
+        "event_hash": row.get("event_hash"),
+        "genesis_hash": details.get("genesis_hash") or row.get("event_hash"),
+        "created_at": row.get("created_at"),
+        "app_name": details.get("app_name") or "BlindSite",
+        "app_version": details.get("app_version") or APP_VERSION,
+        "build_kind": details.get("build_kind") or "",
+        "executable_path": details.get("executable_path") or "",
+        "source_path": details.get("source_path") or "",
+        "executable_sha256": executable_sha256,
+        "git_commit": details.get("git_commit") or "",
+        "release_tag": details.get("release_tag") or "",
+        "custody_mode": details.get("custody_mode") or custody_mode(),
+        "verification_statement": statement,
+        "warnings": sorted(set(warnings)),
+        "details": details,
+    }
+
+
+def log_event(actor: str, action: str, *, case_id: int | None = None, evidence_id: int | None = None, blocked_media_id: int | None = None, session_id: str | None = None, details: dict[str, Any] | None = None) -> str:
+    details = dict(details or {})
+    investigation_id = infer_investigation_id(case_id, session_id, details)
+    details.setdefault("investigation_id", investigation_id)
+    if action != "application_genesis" and details.get("event_type") != "application_genesis":
+        ensure_application_genesis_event(investigation_id, case_id=case_id, session_id=session_id)
+    prev = fetchone("SELECT event_hash FROM audit_events WHERE investigation_id=? ORDER BY id DESC LIMIT 1", (investigation_id,))
+    prev_hash = prev["event_hash"] if prev else ZERO_HASH
+    created_at = utcnow()
+    event_hash = audit_event_hash(created_at=created_at, actor=actor, action=action, case_id=case_id, evidence_id=evidence_id, blocked_media_id=blocked_media_id, session_id=session_id, investigation_id=investigation_id, details=details, prev_hash=prev_hash)
+    execute("""INSERT INTO audit_events(created_at,actor,action,case_id,evidence_id,blocked_media_id,session_id,investigation_id,details_json,prev_hash,event_hash)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (created_at, actor, action, case_id, evidence_id, blocked_media_id, session_id, investigation_id, json.dumps(details, ensure_ascii=False), prev_hash, event_hash))
     return event_hash
 
 
 def verify_audit_chain() -> dict[str, Any]:
-    rows = fetchall("SELECT * FROM audit_events ORDER BY id ASC")
-    prev = "GENESIS"
-    bad: list[dict[str, Any]] = []
+    rows = fetchall("SELECT * FROM audit_events ORDER BY investigation_id ASC, id ASC")
+    by_inv: dict[str, list[sqlite3.Row]] = {}
     for r in rows:
-        details = jloads(r["details_json"], {})
-        event = {"created_at": r["created_at"], "actor": r["actor"], "action": r["action"], "case_id": r["case_id"], "evidence_id": r["evidence_id"], "blocked_media_id": r["blocked_media_id"], "session_id": r["session_id"], "details": details, "prev_hash": r["prev_hash"]}
-        expected = sha256_text(canonical(event))
-        if r["prev_hash"] != prev or r["event_hash"] != expected:
-            bad.append({"id": r["id"], "expected": expected, "actual": r["event_hash"], "expected_prev": prev, "actual_prev": r["prev_hash"]})
-        prev = r["event_hash"]
-    return {"ok": not bad, "count": len(rows), "head": prev, "bad": bad[:20]}
+        inv = str(r["investigation_id"] or "global")
+        by_inv.setdefault(inv, []).append(r)
+    bad: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    heads: dict[str, str] = {}
+    genesis: dict[str, Any] = {}
+    for inv, inv_rows in by_inv.items():
+        prev_expected = ""
+        first = True
+        starts_with_genesis = False
+        for r in inv_rows:
+            details = jloads(r["details_json"], {})
+            is_genesis = r["action"] == "application_genesis" or details.get("event_type") == "application_genesis"
+            if first:
+                starts_with_genesis = bool(is_genesis and r["prev_hash"] == ZERO_HASH)
+                if not starts_with_genesis:
+                    warnings.append(f"Audit chain warning: investigation {inv} does not start with application_genesis.")
+                    # Preserve backward compatibility for legacy global audit rows.
+                    prev_expected = str(r["prev_hash"] or "GENESIS")
+                else:
+                    prev_expected = ZERO_HASH
+                    genesis[inv] = {"id": r["id"], "event_hash": r["event_hash"], "details": details}
+                first = False
+            if r["prev_hash"] != prev_expected:
+                bad.append({"id": r["id"], "investigation_id": inv, "expected_prev": prev_expected, "actual_prev": r["prev_hash"]})
+            expected = audit_event_hash(created_at=r["created_at"], actor=r["actor"], action=r["action"], case_id=r["case_id"], evidence_id=r["evidence_id"], blocked_media_id=r["blocked_media_id"], session_id=r["session_id"], investigation_id=inv, details=details, prev_hash=r["prev_hash"])
+            legacy_expected = audit_event_hash(created_at=r["created_at"], actor=r["actor"], action=r["action"], case_id=r["case_id"], evidence_id=r["evidence_id"], blocked_media_id=r["blocked_media_id"], session_id=r["session_id"], investigation_id=inv, details=details, prev_hash=r["prev_hash"], include_investigation_id=False)
+            if r["event_hash"] not in {expected, legacy_expected}:
+                bad.append({"id": r["id"], "investigation_id": inv, "expected": expected, "legacy_expected": legacy_expected, "actual": r["event_hash"]})
+            prev_expected = r["event_hash"]
+        if inv_rows:
+            heads[inv] = inv_rows[-1]["event_hash"]
+    global_head = ""
+    try:
+        last = fetchone("SELECT event_hash FROM audit_events ORDER BY id DESC LIMIT 1")
+        global_head = last["event_hash"] if last else ZERO_HASH
+    except Exception:
+        global_head = ZERO_HASH
+    return {"ok": not bad, "count": sum(len(v) for v in by_inv.values()), "head": global_head, "heads_by_investigation": heads, "genesis_by_investigation": genesis, "warnings": warnings[:50], "bad": bad[:20]}
 
 
 def storage_hash() -> str:
@@ -791,6 +1122,27 @@ app.add_middleware(SessionMiddleware, secret_key=app_secret(), same_site="lax", 
 serializer = URLSafeTimedSerializer(app_secret(), salt="blindsite-view-token")
 
 
+@app.middleware("http")
+async def local_webauthn_canonical_host_middleware(request: Request, call_next):
+    # WebAuthn/passkey APIs are strict about secure contexts and RP IDs. BlindSite
+    # remains bound to loopback for safety, but browser pages should use
+    # http://localhost rather than http://127.0.0.1 to avoid browser
+    # SecurityError / "The operation is insecure" during YubiKey enrollment.
+    try:
+        host = request.url.hostname or ""
+        accept = request.headers.get("accept", "")
+        if (
+            request.method == "GET"
+            and request.url.scheme == "http"
+            and host.strip().lower().strip("[]") in {"127.0.0.1", "::1", "0.0.0.0"}
+            and "text/html" in accept.lower()
+        ):
+            return RedirectResponse(webauthn_canonical_local_url(request), 303)
+    except Exception:
+        pass
+    return await call_next(request)
+
+
 def current_user(request: Request) -> dict[str, Any] | None:
     username = request.session.get("username")
     if not username:
@@ -815,6 +1167,446 @@ def require_admin(request: Request) -> dict[str, Any]:
     if not is_admin(u):
         raise HTTPException(403, "Admin/supervisor only")
     return u
+
+
+# ---------------------------------------------------------------------------
+# Simple YubiKey / WebAuthn step-up support
+# ---------------------------------------------------------------------------
+# Browser-native WebAuthn is intentionally implemented as an optional local
+# step-up layer. Existing installs keep working. Once a user enrolls a FIDO2
+# key, BlindSite can ask for that key before sensitive actions such as login,
+# full reveal, plaintext export, materialization, sealed export, and exact
+# renderer unlock. Localhost is a valid WebAuthn secure context for testing.
+
+WEBAUTHN_STEPUP_ACTION_LABELS = {
+    "login": "sign-in",
+    "full_reveal": "full evidence reveal",
+    "plaintext_export": "plaintext evidence export",
+    "materialize_original": "blocked-media materialization",
+    "sealed_export": "sealed evidence export",
+    "exact_page_render": "exact local page render",
+    "admin_settings": "admin/settings change",
+    "reviewer_import_unlock": "LE reviewer case unlock",
+}
+
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def b64url_decode(value: str) -> bytes:
+    value = (value or "").strip()
+    pad = "=" * ((4 - len(value) % 4) % 4)
+    return base64.urlsafe_b64decode((value + pad).encode("ascii"))
+
+
+class _CborReader:
+    def __init__(self, data: bytes):
+        self.data = data
+        self.i = 0
+
+    def read(self, n: int) -> bytes:
+        if self.i + n > len(self.data):
+            raise ValueError("CBOR truncated")
+        out = self.data[self.i:self.i + n]
+        self.i += n
+        return out
+
+    def read_len(self, add: int) -> int:
+        if add < 24:
+            return add
+        if add == 24:
+            return self.read(1)[0]
+        if add == 25:
+            return int.from_bytes(self.read(2), "big")
+        if add == 26:
+            return int.from_bytes(self.read(4), "big")
+        if add == 27:
+            return int.from_bytes(self.read(8), "big")
+        raise ValueError("Unsupported indefinite CBOR item")
+
+    def parse(self) -> Any:
+        ib = self.read(1)[0]
+        major = ib >> 5
+        add = ib & 31
+        if major == 0:
+            return self.read_len(add)
+        if major == 1:
+            return -1 - self.read_len(add)
+        if major == 2:
+            return self.read(self.read_len(add))
+        if major == 3:
+            return self.read(self.read_len(add)).decode("utf-8", errors="replace")
+        if major == 4:
+            return [self.parse() for _ in range(self.read_len(add))]
+        if major == 5:
+            return {self.parse(): self.parse() for _ in range(self.read_len(add))}
+        if major == 7:
+            if add == 20:
+                return False
+            if add == 21:
+                return True
+            if add == 22:
+                return None
+            if add == 23:
+                return None
+        raise ValueError(f"Unsupported CBOR major={major} add={add}")
+
+
+def cbor_decode(data: bytes) -> Any:
+    return _CborReader(data).parse()
+
+
+def webauthn_origin(request: Request) -> str:
+    return f"{request.url.scheme}://{request.url.netloc}"
+
+
+def webauthn_loopback_host(host: str | None) -> bool:
+    host = (host or "").strip().lower().strip("[]")
+    return host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def webauthn_public_host_for(host: str | None) -> str:
+    # Browser WebAuthn is strict about secure contexts and relying-party IDs.
+    # For local app use, prefer localhost over raw loopback IPs because some
+    # browsers reject ceremonies started from 127.0.0.1/::1 with SecurityError /
+    # "The operation is insecure" before the YubiKey prompt can appear.
+    return "localhost" if webauthn_loopback_host(host) else (host or "localhost")
+
+
+def webauthn_public_url_for(host: str | None, port: int | str, path: str = "") -> str:
+    public_host = webauthn_public_host_for(host)
+    suffix = path if str(path or "").startswith("/") else ("/" + str(path or "")) if path else ""
+    return f"http://{public_host}:{int(port)}{suffix}"
+
+
+def webauthn_canonical_local_url(request: Request) -> str:
+    port = request.url.port or DEFAULT_PORT
+    path = request.url.path or "/"
+    query = ("?" + request.url.query) if request.url.query else ""
+    return webauthn_public_url_for("localhost", port, path + query)
+
+
+def webauthn_canonical_redirect_if_needed(request: Request) -> RedirectResponse | None:
+    # If the user opened BlindSite at http://127.0.0.1:8765, most app routes are
+    # fine, but WebAuthn may fail in-browser. Redirect WebAuthn ceremonies to
+    # http://localhost:8765 before calling navigator.credentials.*.
+    host = request.url.hostname or ""
+    scheme = request.url.scheme or "http"
+    if scheme == "http" and host.strip().lower().strip("[]") in {"127.0.0.1", "::1", "0.0.0.0"}:
+        return RedirectResponse(webauthn_canonical_local_url(request), 303)
+    return None
+
+
+def webauthn_rp_id(request: Request) -> str:
+    return webauthn_public_host_for(request.url.hostname)
+
+
+def webauthn_public_key_rp_id(request: Request) -> str:
+    """Return the RP ID to explicitly send to navigator.credentials, or ''.
+
+    Local BlindSite normally runs on localhost/loopback over HTTP. Browsers treat
+    localhost as a special secure context, but some reject explicit RP IDs on
+    loopback origins and throw DOMException/SecurityError: "The operation is
+    insecure" before the YubiKey prompt appears. For loopback/local origins we
+    therefore omit rp.id/rpId and let the browser use the current origin's RP ID.
+    For non-local deployments, BlindSite still sends the current hostname.
+    """
+    host = (request.url.hostname or "localhost").strip().lower().strip("[]")
+    if webauthn_loopback_host(host):
+        return ""
+    return host or ""
+
+
+def webauthn_rp_id_candidates(request: Request) -> list[str]:
+    """Accept only current-host/local RP hashes during verification."""
+    host = (request.url.hostname or "localhost").strip().lower().strip("[]")
+    candidates: list[str] = []
+    for item in [webauthn_public_key_rp_id(request), host, webauthn_rp_id(request)]:
+        if item and item not in candidates:
+            candidates.append(item)
+    if webauthn_loopback_host(host):
+        for item in ["localhost", "127.0.0.1", "::1"]:
+            if item not in candidates:
+                candidates.append(item)
+    return candidates or ["localhost"]
+
+
+def webauthn_rp_hash_valid(request: Request, rp_hash: bytes) -> bool:
+    return any(hashlib.sha256(candidate.encode("utf-8")).digest() == rp_hash for candidate in webauthn_rp_id_candidates(request))
+
+
+def webauthn_secure_context_hint(request: Request) -> dict[str, Any]:
+    host = (request.url.hostname or "localhost").strip().lower().strip("[]")
+    scheme = (request.url.scheme or "http").lower()
+    loopback = webauthn_loopback_host(host)
+    secure_expected = bool(scheme == "https" or loopback)
+    warnings: list[str] = []
+    if not secure_expected:
+        warnings.append("WebAuthn/YubiKey requires HTTPS or localhost/loopback. Open BlindSite through http://localhost on this machine, or use HTTPS for a deployed instance.")
+    if scheme == "http" and host in {"127.0.0.1", "::1", "0.0.0.0"}:
+        warnings.append("If enrollment says 'The operation is insecure', reopen BlindSite at http://localhost:<port>/webauthn and retry.")
+    return {
+        "origin": webauthn_origin(request),
+        "host": host,
+        "scheme": scheme,
+        "loopback": loopback,
+        "secure_context_expected": secure_expected,
+        "explicit_rp_id_sent": webauthn_public_key_rp_id(request) or "",
+        "rp_id_candidates": webauthn_rp_id_candidates(request),
+        "canonical_local_url": webauthn_canonical_local_url(request) if loopback else "",
+        "warnings": warnings,
+    }
+
+
+def webauthn_credential_rows(username: str) -> list[sqlite3.Row]:
+    return fetchall("SELECT * FROM webauthn_credentials WHERE username=? ORDER BY id", (username,))
+
+
+def webauthn_credential_count(username: str) -> int:
+    row = fetchone("SELECT count(*) c FROM webauthn_credentials WHERE username=?", (username,))
+    return int(row["c"] or 0) if row else 0
+
+
+def webauthn_user_has_credentials(username: str) -> bool:
+    return webauthn_credential_count(username) > 0
+
+
+def webauthn_public_key_from_cose(cose: dict[Any, Any]) -> tuple[str, int]:
+    alg = int(cose.get(3) or 0)
+    kty = cose.get(1)
+    if kty == 2:  # EC2 / usually ES256 on YubiKey/FIDO2 keys
+        crv = cose.get(-1)
+        x = cose.get(-2)
+        y = cose.get(-3)
+        if crv != 1 or not isinstance(x, bytes) or not isinstance(y, bytes):
+            raise ValueError("Only P-256 EC2 WebAuthn keys are supported for this enrollment")
+        pub = ec.EllipticCurvePublicNumbers(int.from_bytes(x, "big"), int.from_bytes(y, "big"), ec.SECP256R1()).public_key()
+    elif kty == 3:  # RSA
+        n = cose.get(-1)
+        e = cose.get(-2)
+        if not isinstance(n, bytes) or not isinstance(e, bytes):
+            raise ValueError("Invalid RSA COSE key")
+        pub = rsa.RSAPublicNumbers(int.from_bytes(e, "big"), int.from_bytes(n, "big")).public_key()
+    else:
+        raise ValueError(f"Unsupported WebAuthn COSE key type: {kty!r}")
+    pem = pub.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode("ascii")
+    return pem, alg
+
+
+def webauthn_parse_authenticator_data(auth_data: bytes) -> dict[str, Any]:
+    if len(auth_data) < 37:
+        raise ValueError("Authenticator data is too short")
+    rp_hash = auth_data[0:32]
+    flags = auth_data[32]
+    sign_count = int.from_bytes(auth_data[33:37], "big")
+    out: dict[str, Any] = {"rp_id_hash": rp_hash, "flags": flags, "sign_count": sign_count}
+    if flags & 0x40:
+        if len(auth_data) < 55:
+            raise ValueError("Attested credential data is too short")
+        aaguid = auth_data[37:53]
+        cred_len = int.from_bytes(auth_data[53:55], "big")
+        cred_start = 55
+        cred_end = cred_start + cred_len
+        if len(auth_data) < cred_end:
+            raise ValueError("Credential ID is truncated")
+        credential_id = auth_data[cred_start:cred_end]
+        cose = cbor_decode(auth_data[cred_end:])
+        out.update({"aaguid": aaguid, "credential_id": credential_id, "cose_public_key": cose})
+    return out
+
+
+def webauthn_check_client_data(request: Request, encoded: str, expected_type: str, challenge_session_key: str) -> tuple[dict[str, Any], bytes]:
+    raw = b64url_decode(encoded)
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid WebAuthn client data: {exc}") from exc
+    if obj.get("type") != expected_type:
+        raise HTTPException(400, f"Unexpected WebAuthn ceremony type: {obj.get('type')!r}")
+    expected_challenge = request.session.get(challenge_session_key)
+    if not expected_challenge or obj.get("challenge") != expected_challenge:
+        raise HTTPException(400, "WebAuthn challenge mismatch or expired challenge")
+    origin = str(obj.get("origin") or "")
+    expected_origin = webauthn_origin(request)
+    if origin != expected_origin:
+        host = request.url.hostname or ""
+        localhost_ok = host in {"localhost", "127.0.0.1", "::1"} and origin.startswith(("http://localhost", "http://127.0.0.1", "http://[::1]"))
+        if not localhost_ok:
+            raise HTTPException(400, f"WebAuthn origin mismatch: {origin!r} != {expected_origin!r}")
+    return obj, raw
+
+
+def webauthn_verify_signature(public_key_pem: str, signature: bytes, signed_data: bytes) -> None:
+    pub = serialization.load_pem_public_key(public_key_pem.encode("ascii"))
+    if isinstance(pub, ec.EllipticCurvePublicKey):
+        pub.verify(signature, signed_data, ec.ECDSA(hashes.SHA256()))
+    elif isinstance(pub, rsa.RSAPublicKey):
+        pub.verify(signature, signed_data, padding.PKCS1v15(), hashes.SHA256())
+    else:
+        raise ValueError("Unsupported WebAuthn public key type")
+
+
+def webauthn_stepup_max_age() -> int:
+    return safe_int(get_setting("webauthn_stepup_max_age_seconds", "900"), 900, min_value=60, max_value=86400)
+
+
+def webauthn_step_up_valid(request: Request, user: dict[str, Any] | None = None, *, max_age: int | None = None) -> bool:
+    user = user or current_user(request)
+    if not user:
+        return False
+    try:
+        ts = float(request.session.get("webauthn_verified_at") or 0)
+    except Exception:
+        return False
+    if request.session.get("webauthn_verified_user") != user.get("username"):
+        return False
+    return bool(ts and time.time() - ts <= float(max_age or webauthn_stepup_max_age()))
+
+
+def webauthn_action_setting(action: str) -> str:
+    return {
+        "full_reveal": "webauthn_require_for_full_reveal",
+        "plaintext_export": "webauthn_require_for_plaintext_export",
+        "materialize_original": "webauthn_require_for_materialization",
+        "sealed_export": "webauthn_require_for_sealed_export",
+        "exact_page_render": "webauthn_require_for_exact_page_render",
+        "admin_settings": "webauthn_require_for_admin_settings",
+    }.get(action, "")
+
+
+def webauthn_action_requires_stepup(user: dict[str, Any], action: str) -> bool:
+    """Return True only when this account explicitly opted into YubiKey step-up.
+
+    YubiKey/WebAuthn is optional and additive. It never replaces the master
+    reveal key, approvals, custody locks, or existing policy checks. Enrolling a
+    key alone does not force prompts; the user must enable the account
+    requirement. Per-action settings let an admin narrow where the extra prompt
+    appears, but the user-level require_webauthn flag is the on/off switch.
+    """
+    if action == "reviewer_import_unlock":
+        return True
+    if not truthy(user.get("require_webauthn")):
+        return False
+    setting_key = webauthn_action_setting(action)
+    if setting_key:
+        return setting_bool(setting_key, "1")
+    return action in {"login", "step_up", "manual"}
+
+
+def webauthn_stepup_redirect_if_needed(request: Request, user: dict[str, Any], action: str, return_to: str) -> RedirectResponse | None:
+    if not webauthn_action_requires_stepup(user, action):
+        return None
+    if not webauthn_user_has_credentials(str(user.get("username") or "")):
+        raise HTTPException(403, "YubiKey/WebAuthn step-up is required for this account, but no key is enrolled. Open Settings → YubiKey to enroll a key or ask an admin to disable the policy.")
+    if webauthn_step_up_valid(request, user):
+        return None
+    label = WEBAUTHN_STEPUP_ACTION_LABELS.get(action, action.replace("_", " "))
+    log_event(user["username"], "YUBIKEY_STEP_UP_REQUIRED", details={"action": action, "label": label, "return_to": return_to})
+    return RedirectResponse(f"/webauthn/step-up?action={quote(action)}&return_to={quote(return_to or '/')}", 303)
+
+
+def webauthn_global_guard_script() -> str:
+    """Small global helper that turns annotated forms into browser YubiKey prompts.
+
+    Forms opt in with data-webauthn-action="full_reveal" etc. The server still
+    enforces step-up, but this gives the user the simple native browser pop-up
+    before the form posts so passwords/master keys are not lost to a redirect.
+    """
+    return r"""
+<script>
+(function(){
+  if (window.__blindsiteWebAuthnGuardInstalled) return;
+  window.__blindsiteWebAuthnGuardInstalled = true;
+  function b64ToBuf(s){
+    s = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out.buffer;
+  }
+  function bufToB64(buf){
+    const bytes = new Uint8Array(buf);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/[+]/g, '-').replace(/[/]/g, '_').replace(/=+$/g, '');
+  }
+  function ensureWebAuthnSafeOrigin(){
+    const host = (location.hostname || '').toLowerCase();
+    if (location.protocol === 'http:' && (host === '127.0.0.1' || host === '::1' || host === '0.0.0.0')) {
+      const target = 'http://localhost:' + location.port + location.pathname + location.search + location.hash;
+      window.location.replace(target);
+      throw new Error('Switching to localhost for YubiKey/WebAuthn. Try again after the page reloads.');
+    }
+    if (!window.isSecureContext) {
+      throw new Error('WebAuthn requires a secure browser context. Use http://localhost for local BlindSite, or HTTPS for deployed instances.');
+    }
+  }
+  async function runStepUp(action){
+    ensureWebAuthnSafeOrigin();
+    if (!navigator.credentials || !window.PublicKeyCredential) {
+      throw new Error('This browser does not expose WebAuthn. Use Chrome/Edge/Firefox on localhost or HTTPS.');
+    }
+    const r = await fetch('/webauthn/auth/options?action=' + encodeURIComponent(action || 'step_up'), {cache:'no-store'});
+    const opts = await r.json();
+    if (!opts.ok) throw new Error(opts.error || 'Could not start YubiKey/WebAuthn');
+    const pub = opts.publicKey;
+    pub.challenge = b64ToBuf(pub.challenge);
+    if (pub.allowCredentials) pub.allowCredentials = pub.allowCredentials.map(c => ({...c, id: b64ToBuf(c.id)}));
+    const assertion = await navigator.credentials.get({publicKey: pub});
+    const payload = {
+      mode: 'stepup',
+      action: action || '',
+      rawId: bufToB64(assertion.rawId),
+      id: assertion.id,
+      type: assertion.type,
+      response: {
+        clientDataJSON: bufToB64(assertion.response.clientDataJSON),
+        authenticatorData: bufToB64(assertion.response.authenticatorData),
+        signature: bufToB64(assertion.response.signature),
+        userHandle: assertion.response.userHandle ? bufToB64(assertion.response.userHandle) : ''
+      }
+    };
+    const vr = await fetch('/webauthn/auth/verify', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    const v = await vr.json();
+    if (!v.ok) throw new Error(v.error || 'YubiKey/WebAuthn verification failed');
+    return v;
+  }
+  document.addEventListener('submit', async function(ev){
+    const form = ev.target;
+    if (!form || !form.dataset || !form.dataset.webauthnAction || form.dataset.webauthnPassed === '1') return;
+    const conditional = form.dataset.webauthnIfChecked || '';
+    if (conditional) {
+      const field = form.querySelector('[name="' + conditional.replace(/"/g, '\"') + '"]');
+      if (!field || !field.checked) return;
+    }
+    ev.preventDefault();
+    const action = form.dataset.webauthnAction || 'step_up';
+    try {
+      const rr = await fetch('/webauthn/required?action=' + encodeURIComponent(action), {cache:'no-store'});
+      const req = await rr.json();
+      if (!req.required || req.verified) {
+        form.dataset.webauthnPassed = '1';
+        form.submit();
+        return;
+      }
+      if (!req.has_credentials) throw new Error('This account requires YubiKey/WebAuthn, but no key is enrolled. Open Settings → YubiKey.');
+      alert('BlindSite needs your YubiKey/security key before: ' + (req.label || action) + '. Touch the key when your browser asks.');
+      await runStepUp(action);
+      form.dataset.webauthnPassed = '1';
+      form.submit();
+    } catch(e) {
+      alert('YubiKey/WebAuthn verification failed or was cancelled: ' + (e && e.message ? e.message : e));
+    }
+  }, true);
+})();
+</script>
+"""
+
+
+def webauthn_recent_or_redirect(request: Request, user: dict[str, Any], action: str, return_to: str) -> RedirectResponse | None:
+    return webauthn_stepup_redirect_if_needed(request, user, action, return_to)
 
 
 @app.exception_handler(HTTPException)
@@ -847,6 +1639,50 @@ def flash(msg: str | None = None) -> str:
     return f"<div class='flash'>{h(msg)}</div>" if msg else ""
 
 
+def tor_global_status_widget(request: Request) -> str:
+    if not current_user(request):
+        return ""
+    return """<span id='global-tor-status' class='badge warn' title='Tor provider status'>Tor: checking…</span>
+      <span id='global-tor-progress-wrap' title='Tor bootstrap progress' style='display:inline-block;width:84px;height:8px;border:1px solid #475569;border-radius:999px;background:#020617;vertical-align:middle;overflow:hidden;margin-left:4px'>
+        <span id='global-tor-progress' style='display:block;width:0%;height:100%;background:#0284c7'></span>
+      </span>"""
+
+
+def tor_global_status_script(request: Request) -> str:
+    if not current_user(request):
+        return ""
+    return """<script>
+(function(){
+  const badge = document.getElementById('global-tor-status');
+  const bar = document.getElementById('global-tor-progress');
+  const wrap = document.getElementById('global-tor-progress-wrap');
+  if (!badge || !bar) return;
+  function esc(v){ return String(v || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function clsFor(state){ if (state === 'ready' || state === 'socks_open') return 'badge good'; if (state === 'bootstrapping' || state === 'starting') return 'badge warn'; return 'badge bad'; }
+  async function refreshTorStatus(){
+    try {
+      const r = await fetch('/tor/status', {cache:'no-store'});
+      if (!r.ok) return;
+      const j = await r.json();
+      badge.className = clsFor(j.state);
+      badge.textContent = j.label || 'Tor: unknown';
+      badge.title = j.message || 'Tor status';
+      const pct = (j.percent === null || j.percent === undefined) ? (j.ok ? 100 : 0) : Math.max(0, Math.min(100, Number(j.percent)||0));
+      bar.style.width = pct + '%';
+      if (wrap) wrap.title = (j.message || '') + (j.percent !== null && j.percent !== undefined ? ' | bootstrap ' + pct + '%' : '');
+    } catch(e) {
+      badge.className = 'badge bad';
+      badge.textContent = 'Tor: status unavailable';
+      badge.title = String(e);
+      bar.style.width = '0%';
+    }
+  }
+  refreshTorStatus();
+  setInterval(refreshTorStatus, 2500);
+})();
+</script>"""
+
+
 def layout(request: Request, title: str, body: str) -> HTMLResponse:
     edition = get_setting("edition", "lockdown")
     safe = get_setting("hard_default_safe_mode", "1")
@@ -861,8 +1697,8 @@ def layout(request: Request, title: str, body: str) -> HTMLResponse:
     .rv-thumb-small .thumb-label{position:absolute;left:2px;bottom:2px;background:rgba(0,0,0,.65);color:#fff;border-radius:4px;padding:1px 3px;font-size:9px}
     .thumb-doc,.thumb-audio{display:flex;flex-direction:column;gap:2px;align-items:center;justify-content:center;text-align:center;font-size:12px;color:#cbd5e1}.thumb-doc span{font-weight:800}.thumb-audio span{font-size:22px}.media-tools{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.media-tools input{max-width:260px}.starbtn{font-size:18px;padding:3px 8px}.tagline{display:flex;gap:5px;align-items:center;flex-wrap:wrap}.compact-input{max-width:220px}
     """
-    banner = f"<div class='card {'danger' if edition=='lockdown' else 'warn' if edition=='supervised' else ''}'><b>Custody:</b> {badge(custody_label(),'info')} <b>Edition:</b> {badge(edition,'good' if edition=='lockdown' else 'warn')} <b>Hard default safe mode:</b> {badge(safe,'good' if truthy(safe) else 'warn')} <b>Version:</b> {h(APP_VERSION)}</div>"
-    html = f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{h(title)} - {APP_NAME}</title><style>{css}</style></head><body>{nav(request)}<main class='wrap'>{banner}<h1>{h(title)}</h1>{body}</main></body></html>"""
+    banner = f"<div class='card {'danger' if edition=='lockdown' else 'warn' if edition=='supervised' else ''}'><b>Custody:</b> {badge(custody_label(),'info')} <b>Edition:</b> {badge(edition,'good' if edition=='lockdown' else 'warn')} <b>Hard default safe mode:</b> {badge(safe,'good' if truthy(safe) else 'warn')} <b>Version:</b> {h(APP_VERSION)} <b>Tor:</b> {tor_global_status_widget(request)}</div>"
+    html = f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{h(title)} - {APP_NAME}</title><style>{css}</style></head><body>{nav(request)}<main class='wrap'>{banner}<h1>{h(title)}</h1>{body}</main>{webauthn_global_guard_script()}{tor_global_status_script(request)}</body></html>"""
     return HTMLResponse(html)
 
 
@@ -1509,6 +2345,107 @@ def live_policy_blocks(browser_resource_type: str, policy: str, url: str = "") -
         else:
             return False
     return policy_blocks_resource(logical, policy)
+
+
+CAPTCHA_CHALLENGE_HOST_PATTERNS = [
+    "hcaptcha.com", "recaptcha.net", "arkoselabs.com", "funcaptcha.com",
+    "geetest.com", "captcha-delivery.com", "challenges.cloudflare.com",
+    "captcha", "anti-captcha", "anti_bot", "antibot",
+]
+CAPTCHA_CHALLENGE_PATH_PATTERNS = [
+    "captcha", "recaptcha", "hcaptcha", "funcaptcha", "arkose",
+    "challenge", "turnstile", "verification", "verify-human", "security-check",
+    "bot-detect", "botdetect", "anti-bot", "antibot", "puzzle",
+]
+CAPTCHA_CHALLENGE_INLINE_CONTEXT_PATTERNS = [
+    # Used only for inline data:image CAPTCHA exceptions. These are context
+    # words/classes/field names around the image, not a reason to allow all
+    # ordinary images. This keeps the exception narrow enough for civilian/
+    # lockdown use while still allowing darknet CAPTCHA images that are embedded
+    # as data:image/png;base64 or data:image/webp;base64.
+    "captcha", "recaptcha", "hcaptcha", "funcaptcha", "arkose",
+    "challenge", "verification", "verify-human", "security-check",
+    "bot-detect", "botdetect", "anti-bot", "antibot", "puzzle",
+    "robot", "not a robot", "are you not a robot", "human check",
+    "human verification", "captchabtn", "ring_id", "captcha answer",
+    "captcha expired", "misclick catcher",
+]
+CAPTCHA_INLINE_ORDINARY_IMAGE_PATTERNS = [
+    # Common labels for ordinary site imagery. These prevent broad page-level
+    # CAPTCHA wording from allowing unrelated inline logos/avatars.
+    "logo", "avatar", "banner", "background", "favicon", "icon",
+    "sprite", "decorative", "thumbnail", "profile", "advertisement", " ad ",
+]
+CAPTCHA_INLINE_STRONG_CONTEXT_PATTERNS = [
+    # Strong signals that can appear directly on/near a CAPTCHA image.
+    "captcha", "recaptcha", "hcaptcha", "funcaptcha", "arkose",
+    "captchabtn", "ring_id", "captcha answer", "captcha expired",
+    "misclick catcher", "not a robot", "are you not a robot",
+    "human verification", "verify-human", "botdetect", "anti-bot", "antibot",
+]
+
+
+def captcha_challenge_context_candidate(text: str) -> bool:
+    hay = (text or "").strip().lower()
+    if not hay:
+        return False
+    return any(pat in hay for pat in CAPTCHA_CHALLENGE_INLINE_CONTEXT_PATTERNS)
+
+
+def captcha_challenge_inline_data_candidate(src: str, context_text: str = "") -> bool:
+    raw = (src or "").strip().lower()
+    if not raw.startswith("data:image/"):
+        return False
+    hay = " " + (context_text or "").strip().lower() + " "
+    if not hay.strip():
+        return False
+    strong_hit = any(pat in hay for pat in CAPTCHA_INLINE_STRONG_CONTEXT_PATTERNS)
+    ordinary_hit = any(pat in hay for pat in CAPTCHA_INLINE_ORDINARY_IMAGE_PATTERNS)
+    direct_strong_hit = any(pat in hay for pat in [
+        "captchabtn", "ring_id", "captcha answer", "alt captcha", "id captcha",
+        "class captcha", "human verification", "verify-human", "misclick catcher",
+    ])
+    # If the context also looks like ordinary site media, broad page-level
+    # challenge wording must not turn it into a CAPTCHA exception. Require a
+    # direct/structural CAPTCHA signal such as captchabtn, ring_id, or alt captcha.
+    if ordinary_hit and not direct_strong_hit:
+        return False
+    return strong_hit or captcha_challenge_context_candidate(hay)
+
+
+def captcha_challenge_media_candidate(url: str, browser_resource_type: str = "") -> bool:
+    """Return True only for media requests that look like CAPTCHA/challenge assets.
+
+    This is intentionally narrow. It does not turn image loading back on. It
+    allows only likely CAPTCHA/challenge images so investigators can complete
+    access checks on darknet/high-risk sites while normal images/video/audio
+    remain blocked and, when configured, sealed-preserved.
+    """
+    raw = (url or "").strip()
+    if not raw or raw.startswith(("data:", "blob:", "javascript:")):
+        return False
+    rt = (browser_resource_type or "").lower().strip()
+    try:
+        p = urlparse(raw)
+    except Exception:
+        return False
+    path = unquote(p.path or "").lower()
+    query = unquote(p.query or "").lower()
+    host = (p.hostname or "").lower().strip(".")
+    ext = Path(path).suffix.lower()
+    # Minimal-scope rule: only visual CAPTCHA media is allowed. Documents,
+    # scripts, XHR/fetch, stylesheets, and ordinary page media remain governed
+    # by the existing policy.
+    if rt not in {"image"} and ext not in IMAGE_EXTS:
+        return False
+    text = " ".join([host, path, query]).lower()
+    host_hit = any(pat in host for pat in CAPTCHA_CHALLENGE_HOST_PATTERNS)
+    path_hit = any(pat in text for pat in CAPTCHA_CHALLENGE_PATH_PATTERNS)
+    # Avoid allowing all generic Google/Gstatic images; require recaptcha/captcha
+    # path keywords for those broad hosts.
+    if host.endswith(("google.com", "gstatic.com", "googleusercontent.com")):
+        return any(pat in text for pat in ["recaptcha", "captcha", "api2/payload"])
+    return bool(host_hit or path_hit)
 
 
 def ext_for_mime(mime_type: str) -> str:
@@ -3299,6 +4236,26 @@ def render_live_blocked_media_rows(rows: list[sqlite3.Row]) -> str:
 def render_live_blocked_media_stats(stats: dict[str, int]) -> str:
     return f"{badge('total '+str(stats.get('total',0)),'info')} {badge('downloaded '+str(stats.get('downloaded',0)),'warn')} {badge('not downloaded '+str(stats.get('not_downloaded',0)),'good')} {badge('queue full '+str(stats.get('queue_full',0)),'bad' if stats.get('queue_full',0) else 'info')} {badge('timeouts '+str(stats.get('timeouts',0)),'bad' if stats.get('timeouts',0) else 'info')}"
 
+
+def event_header_hash_html(headers_json: Any, header_sha256: Any) -> str:
+    """Return a clear live-event header-hash display.
+
+    Navigation/tab events often have no response headers; older UI still showed
+    SHA-256({}) which is 44136fa3... for every such row. That was technically
+    accurate but misleading because it looked like different sites shared the
+    same captured response headers. Keep the audit data unchanged, but show a
+    human-readable empty-header state in the live-session table.
+    """
+    raw = "" if headers_json is None else str(headers_json).strip()
+    parsed = jloads(raw, {}) if raw else {}
+    if isinstance(parsed, dict) and parsed:
+        return f"<code>{h(header_sha256 or header_hash(parsed))}</code>"
+    if raw and raw not in {"{}", "[]", "null", "None"}:
+        # Non-empty but unparsable/legacy header text: keep the stored hash visible
+        # while making clear the app could not parse a normal header dictionary.
+        return f"<code>{h(header_sha256 or '')}</code><br><span class='small muted'>unparsed headers</span>"
+    return "<span class='small muted'>No headers captured</span>"
+
 def build_case_saved_pages_index(case_id: int, data: dict[str, Any]) -> str:
     case = data.get("case") or {}
     captures = data.get("page_captures") or []
@@ -3322,12 +4279,37 @@ def build_case_media_index(data: dict[str, Any]) -> str:
     return f"""<!doctype html><html><head><meta charset='utf-8'><title>Media - case {h(case.get('id'))}</title><style>body{{font-family:Arial,sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}code{{word-break:break-all}}.muted{{color:#666}}</style></head><body><h1>Media inventory for case {h(case.get('name',''))}</h1><p class='muted'>Report-only media index. Original media bytes are not included in this export.</p><h2>Saved/materialized media evidence</h2><table><tr><th>Evidence</th><th>Filename</th><th>Kind</th><th>MIME</th><th>Storage</th><th>SHA-256</th><th>Source</th></tr>{''.join(saved_rows) or '<tr><td colspan="7">No saved media evidence.</td></tr>'}</table><h2>Blocked media metadata</h2><table><tr><th>ID</th><th>Type</th><th>State</th><th>Reason</th><th>URL SHA-256</th><th>URL</th></tr>{''.join(blocked_rows) or '<tr><td colspan="6">No blocked media.</td></tr>'}</table></body></html>"""
 
 
+def application_genesis_html_block(app_genesis: dict[str, Any] | None) -> str:
+    g = app_genesis or {}
+    warnings = g.get("warnings") or []
+    warning_rows = "".join(f"<li>{h(w)}</li>" for w in warnings)
+    return f"""<h2>Application Genesis Hash / Executable Genesis Seal</h2>
+<div class='warn'>
+<p><b>Verification helper:</b> {h(g.get('verification_statement') or 'This investigation was initialized with BlindSite executable SHA-256: UNAVAILABLE. Compare this hash against the published GitHub release SHA256SUMS for the claimed release.')}</p>
+<table>
+<tr><th>Investigation ID</th><td>{h(g.get('investigation_id') or '')}</td></tr>
+<tr><th>Genesis event hash</th><td><code>{h(g.get('genesis_hash') or g.get('event_hash') or '')}</code></td></tr>
+<tr><th>Executable/source SHA-256</th><td><code>{h(g.get('executable_sha256') or '')}</code></td></tr>
+<tr><th>Build kind</th><td>{h(g.get('build_kind') or '')}</td></tr>
+<tr><th>Executable path</th><td>{h(g.get('executable_path') or '')}</td></tr>
+<tr><th>Source path</th><td>{h(g.get('source_path') or '')}</td></tr>
+<tr><th>Git commit</th><td><code>{h(g.get('git_commit') or '')}</code></td></tr>
+<tr><th>Release tag</th><td>{h(g.get('release_tag') or '')}</td></tr>
+<tr><th>Custody mode</th><td>{h(g.get('custody_mode') or '')}</td></tr>
+</table>
+{('<h3>Warnings</h3><ul>' + warning_rows + '</ul>') if warnings else '<p>No Application Genesis Hash warnings recorded.</p>'}
+</div>"""
+
+
 def build_case_report_html(data: dict[str, Any]) -> str:
     case = data.get("case") or {}
     ev_rows = "".join(f"<tr><td>#{h(e.get('id'))}</td><td>{h(e.get('filename'))}</td><td>{h(e.get('kind'))}</td><td>{h(e.get('storage_mode'))}</td><td><code>{h(e.get('sha256'))}</code></td></tr>" for e in data.get("evidence", []))
     page_rows = "".join(f"<tr><td>#{h(c.get('evidence_id'))}</td><td><a href='saved_pages/evidence_{h(c.get('evidence_id'))}.html'>{h(c.get('title') or c.get('filename') or 'Saved page')}</a></td><td>{h(c.get('capture_mode'))}</td><td>{h(c.get('page_url'))}</td></tr>" for c in data.get("page_captures", []))
     blocked_rows = "".join(f"<tr><td>#{h(b.get('id'))}</td><td>{h(b.get('resource_type'))}</td><td>{'downloaded' if b.get('downloaded') else 'not downloaded'}</td><td><code>{h(b.get('metadata_record_hash'))}</code></td><td>{h(b.get('media_url'))}</td></tr>" for b in data.get("blocked_media", []))
-    return f"""<!doctype html><html><head><meta charset='utf-8'><title>Case report {h(case.get('id'))}</title><style>body{{font-family:Arial,sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}code{{word-break:break-all}}.good{{color:green}}.bad{{color:#b91c1c}}</style></head><body><h1>BlindSite case report</h1><h2>{h(case.get('name',''))}</h2><p>Generated: {h(data.get('generated_at'))}</p><p>Audit chain: <b class='{'good' if data.get('audit_verification',{}).get('ok') else 'bad'}'>{'verified' if data.get('audit_verification',{}).get('ok') else 'problem detected'}</b></p><h2>Saved pages</h2><table><tr><th>Evidence</th><th>Offline viewer</th><th>Capture mode</th><th>Source URL</th></tr>{page_rows or '<tr><td colspan="4">No saved pages.</td></tr>'}</table><h2>Evidence</h2><table><tr><th>ID</th><th>Filename</th><th>Kind</th><th>Storage</th><th>SHA-256</th></tr>{ev_rows}</table><h2>Blocked media</h2><table><tr><th>ID</th><th>Type</th><th>State</th><th>Metadata hash</th><th>URL</th></tr>{blocked_rows}</table></body></html>"""
+    genesis_block = application_genesis_html_block(data.get("application_genesis"))
+    audit_warnings = "".join(f"<li>{h(w)}</li>" for w in (data.get("audit_verification", {}).get("warnings") or []))
+    audit_warning_block = f"<h3>Audit warnings</h3><ul>{audit_warnings}</ul>" if audit_warnings else ""
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>Case report {h(case.get('id'))}</title><style>body{{font-family:Arial,sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}code{{word-break:break-all}}.good{{color:green}}.bad{{color:#b91c1c}}.warn{{background:#fff3cd;border:1px solid #d6b656;padding:10px;margin:12px 0}}</style></head><body><h1>BlindSite case report</h1><h2>{h(case.get('name',''))}</h2><p>Generated: {h(data.get('generated_at'))}</p><p>Audit chain: <b class='{'good' if data.get('audit_verification',{}).get('ok') else 'bad'}'>{'verified' if data.get('audit_verification',{}).get('ok') else 'problem detected'}</b></p>{genesis_block}{audit_warning_block}<h2>Saved pages</h2><table><tr><th>Evidence</th><th>Offline viewer</th><th>Capture mode</th><th>Source URL</th></tr>{page_rows or '<tr><td colspan="4">No saved pages.</td></tr>'}</table><h2>Evidence</h2><table><tr><th>ID</th><th>Filename</th><th>Kind</th><th>Storage</th><th>SHA-256</th></tr>{ev_rows}</table><h2>Blocked media</h2><table><tr><th>ID</th><th>Type</th><th>State</th><th>Metadata hash</th><th>URL</th></tr>{blocked_rows}</table></body></html>"""
 
 
 @dataclass
@@ -3670,7 +4652,7 @@ def expanded_remote_media_candidates(refs: list[dict[str, Any]], source_url: str
     return out[:max(1, limit)]
 
 class LiveBrowserSession:
-    def __init__(self, *, session_id: str, case_id: int | None, actor: str, start_url: str, browser_choice: str, use_tor: bool, media_policy: str, headless: bool, user_agent_profile: str | None = None, custom_user_agent: str | None = None, download_allowed_media: bool = False, auto_capture: bool = False, settle_before_capture: bool = True, sealed_media_preservation_session: bool = True, capture_auto_scroll_session: bool = False):
+    def __init__(self, *, session_id: str, case_id: int | None, actor: str, start_url: str, browser_choice: str, use_tor: bool, media_policy: str, headless: bool, user_agent_profile: str | None = None, custom_user_agent: str | None = None, download_allowed_media: bool = False, auto_capture: bool = False, settle_before_capture: bool = True, sealed_media_preservation_session: bool = True, capture_auto_scroll_session: bool = False, allow_captcha_challenge_media: bool = False):
         self.session_id = session_id
         self.case_id = case_id
         self.actor = actor
@@ -3688,6 +4670,9 @@ class LiveBrowserSession:
         self.auto_capture = bool(auto_capture)
         self.settle_before_capture = bool(settle_before_capture)
         self.capture_auto_scroll_session = bool(capture_auto_scroll_session)
+        self.allow_captcha_challenge_media = bool(allow_captcha_challenge_media)
+        self.captcha_challenge_allowed = 0
+        self.captcha_challenge_inline_seen: set[str] = set()
         self.sealed_media_preservation_session = bool(sealed_media_preservation_session)
         self.auto_capture_seen: set[str] = set()
         self.auto_capture_lock = threading.RLock()
@@ -3701,6 +4686,9 @@ class LiveBrowserSession:
         self.page = None
         self.active_page = None
         self.pages: list[Any] = []
+        self.tabs_snapshot_lock = threading.RLock()
+        self.last_tabs_snapshot: list[dict[str, Any]] = []
+        self.last_tabs_snapshot_time = 0.0
         self.context = None
         self.browser = None
         self.current_url = self.start_url
@@ -3802,20 +4790,29 @@ class LiveBrowserSession:
                     user_agent=self.user_agent,
                     bypass_csp=False,
                 )
+                if self.allow_captcha_challenge_media:
+                    try:
+                        await self.context.expose_binding("__blindsiteCaptchaChallengeAllowed", self._record_captcha_challenge_allowed_from_browser)
+                    except Exception:
+                        pass
                 # Extra visual block for inline SVG/CSS background/media elements that do not create separate network image requests.
                 # Network requests are still handled by the route layer; this prevents inline/data/cached SVG/images from flashing before route aborts land.
                 # The short documentElement boot veil is intentionally used only when a media-blocking policy is active.
                 visual_selectors: list[str] = []
                 css_bits: list[str] = []
                 if policy_blocks_resource("image", self.media_policy):
+                    captcha_exempt = ":not([data-blindsite-captcha-allow='1'])" if self.allow_captcha_challenge_media else ""
                     visual_selectors.extend([
-                        "img", "picture", "svg", "canvas",
-                        "object[type^='image/']", "object[data$='.svg' i]", "object[data*='.svg?' i]", "object[data*='.svg#' i]",
-                        "embed[type^='image/']", "embed[src$='.svg' i]", "embed[src*='.svg?' i]", "embed[src*='.svg#' i]",
-                        "iframe[src$='.svg' i]", "iframe[src*='.svg?' i]", "iframe[src*='.svg#' i]",
-                        "[role='img']",
+                        f"img{captcha_exempt}", f"picture{captcha_exempt}", f"svg{captcha_exempt}", f"canvas{captcha_exempt}",
+                        f"object[type^='image/']{captcha_exempt}", f"object[data$='.svg' i]{captcha_exempt}", f"object[data*='.svg?' i]{captcha_exempt}", f"object[data*='.svg#' i]{captcha_exempt}",
+                        f"embed[type^='image/']{captcha_exempt}", f"embed[src$='.svg' i]{captcha_exempt}", f"embed[src*='.svg?' i]{captcha_exempt}", f"embed[src*='.svg#' i]{captcha_exempt}",
+                        f"iframe[src$='.svg' i]{captcha_exempt}", f"iframe[src*='.svg?' i]{captcha_exempt}", f"iframe[src*='.svg#' i]{captcha_exempt}",
+                        f"[role='img']{captcha_exempt}",
                     ])
-                    css_bits.append("*,*::before,*::after{background-image:none!important;list-style-image:none!important;border-image-source:none!important;-webkit-mask-image:none!important;mask-image:none!important;}")
+                    if self.allow_captcha_challenge_media:
+                        css_bits.append("*:not([data-blindsite-captcha-allow='1']),*:not([data-blindsite-captcha-allow='1'])::before,*:not([data-blindsite-captcha-allow='1'])::after{background-image:none!important;list-style-image:none!important;border-image-source:none!important;-webkit-mask-image:none!important;mask-image:none!important;}")
+                    else:
+                        css_bits.append("*,*::before,*::after{background-image:none!important;list-style-image:none!important;border-image-source:none!important;-webkit-mask-image:none!important;mask-image:none!important;}")
                 if policy_blocks_resource("video", self.media_policy):
                     visual_selectors.append("video")
                 if policy_blocks_resource("audio", self.media_policy):
@@ -3828,9 +4825,197 @@ class LiveBrowserSession:
                     css = "\n".join(css_bits)
                     js = """(() => {
   const css = %s;
+  const allowCaptchaChallengeMedia = %s;
+  const CAPTCHA_HOST_PATTERNS = %s;
+  const CAPTCHA_PATH_PATTERNS = %s;
   const STYLE_ID = '__blindsite_live_media_block_css';
   let releasedBoot = false;
   function root(){ return document.documentElement || document.querySelector('html'); }
+  const CAPTCHA_CONTEXT_PATTERNS = %s;
+  function blindSiteCaptchaTextHit(text){
+    text = String(text || '').toLowerCase();
+    if (!text) return false;
+    return CAPTCHA_PATH_PATTERNS.some(p => text.includes(p)) || CAPTCHA_CONTEXT_PATTERNS.some(p => text.includes(p));
+  }
+  function blindSiteCaptchaUrl(raw){
+    try {
+      if (!allowCaptchaChallengeMedia || !raw || typeof raw !== 'string') return false;
+      const trimmed = raw.trim();
+      if (trimmed.toLowerCase().startsWith('data:image/')) return false;
+      const u = new URL(trimmed, location.href);
+      const host = (u.hostname || '').toLowerCase();
+      const text = (host + ' ' + decodeURIComponent(u.pathname || '') + ' ' + decodeURIComponent(u.search || '')).toLowerCase();
+      if ((host.endsWith('google.com') || host.endsWith('gstatic.com') || host.endsWith('googleusercontent.com')) && !(text.includes('recaptcha') || text.includes('captcha') || text.includes('api2/payload'))) return false;
+      return CAPTCHA_HOST_PATTERNS.some(p => host.includes(p)) || blindSiteCaptchaTextHit(text);
+    } catch(e) { return false; }
+  }
+  const ORDINARY_INLINE_MEDIA_PATTERNS = ["logo", "avatar", "banner", "background", "favicon", "icon", "sprite", "decorative", "thumbnail", "profile", "advertisement", " ad "];
+  function blindSiteHasOrdinaryInlineMediaHint(text){
+    text = (' ' + String(text || '').toLowerCase() + ' ');
+    if (!text.trim()) return false;
+    return ORDINARY_INLINE_MEDIA_PATTERNS.some(p => text.includes(p));
+  }
+  function blindSiteAttrsText(el, attrs){
+    const bits = [];
+    if (!el) return '';
+    for (const a of attrs) {
+      try {
+        const v = (a === 'className' ? el.className : el.getAttribute && el.getAttribute(a)) || '';
+        if (v && typeof v === 'string') bits.push(v);
+      } catch(e) {}
+    }
+    return bits.join(' ').toLowerCase();
+  }
+  function blindSiteCaptchaContext(el){
+    // Full context is retained for logging/reconstruction only. It must not be
+    // the sole reason to allow inline data:image elements because broad page
+    // text like "captcha" can contaminate ordinary logo/avatar images.
+    const bits = [];
+    try {
+      let cur = el;
+      for (let depth = 0; cur && depth < 5; depth++, cur = cur.parentElement) {
+        bits.push(blindSiteAttrsText(cur, ['id','class','className','name','alt','title','aria-label','placeholder','href','action','type','role','value']));
+        try { const txt = (cur.innerText || cur.textContent || '').replace(/\\s+/g, ' ').trim(); if (txt) bits.push(txt.slice(0, 500)); } catch(e) {}
+      }
+      try {
+        const form = el.closest && el.closest('form');
+        if (form) {
+          bits.push(form.getAttribute('action') || '');
+          bits.push((form.innerText || form.textContent || '').replace(/\\s+/g, ' ').slice(0, 700));
+          for (const input of Array.from(form.querySelectorAll('input,button,label,code,h1,h2,h3,h4,h5,span')).slice(0, 80)) {
+            bits.push(blindSiteAttrsText(input, ['name','id','class','placeholder','alt','title','value','type','role']));
+            const t = (input.innerText || input.textContent || '').replace(/\\s+/g, ' ').trim();
+            if (t) bits.push(t);
+          }
+        }
+      } catch(e) {}
+    } catch(e) {}
+    return bits.join(' ').toLowerCase();
+  }
+  function blindSiteInlineElementContext(el){
+    // Narrow context used for the inline/base64 allow decision: element attrs
+    // plus close clickable/label ancestors only, not the entire body/page.
+    const bits = [];
+    try {
+      bits.push(blindSiteAttrsText(el, ['id','class','className','name','alt','title','aria-label','placeholder','type','role','value']));
+      let cur = el ? el.parentElement : null;
+      for (let depth = 0; cur && depth < 3; depth++, cur = cur.parentElement) {
+        bits.push(blindSiteAttrsText(cur, ['id','class','className','name','title','aria-label','href','action','type','role','value']));
+        const tag = (cur.tagName || '').toLowerCase();
+        if (['a','button','label','code','span','h1','h2','h3','h4','h5'].includes(tag)) {
+          const t = (cur.innerText || cur.textContent || '').replace(/\\s+/g, ' ').trim();
+          if (t && t.length <= 300) bits.push(t);
+        }
+      }
+    } catch(e) {}
+    return bits.join(' ').toLowerCase();
+  }
+  function blindSiteInlineFormContext(el){
+    const bits = [];
+    try {
+      const form = el.closest && el.closest('form');
+      if (!form) return '';
+      bits.push(blindSiteAttrsText(form, ['id','class','className','name','title','aria-label','action','role']));
+      const formText = (form.innerText || form.textContent || '').replace(/\\s+/g, ' ').trim();
+      if (formText) bits.push(formText.slice(0, 600));
+      for (const input of Array.from(form.querySelectorAll('input,button,label,code,h1,h2,h3,h4,h5,span')).slice(0, 80)) {
+        bits.push(blindSiteAttrsText(input, ['name','id','class','placeholder','alt','title','value','type','role']));
+        const t = (input.innerText || input.textContent || '').replace(/\\s+/g, ' ').trim();
+        if (t) bits.push(t.slice(0, 160));
+      }
+    } catch(e) {}
+    return bits.join(' ').toLowerCase();
+  }
+  function blindSiteInlineFormHasSingleDataImage(el){
+    try {
+      const form = el.closest && el.closest('form');
+      if (!form) return false;
+      const dataImages = Array.from(form.querySelectorAll('img,source')).filter(n => String((n.currentSrc || n.getAttribute('src') || '')).trim().toLowerCase().startsWith('data:image/'));
+      return dataImages.length === 1 && (dataImages[0] === el || dataImages[0].contains(el) || el.contains(dataImages[0]));
+    } catch(e) { return false; }
+  }
+  function blindSiteCaptchaInlineDataImage(el, src, context){
+    try {
+      if (!allowCaptchaChallengeMedia || !src || typeof src !== 'string') return false;
+      const raw = src.trim().toLowerCase();
+      if (!raw.startsWith('data:image/')) return false;
+      const direct = blindSiteInlineElementContext(el);
+      const formCtx = blindSiteInlineFormContext(el);
+      const directHit = blindSiteCaptchaTextHit(direct);
+      const formHit = blindSiteCaptchaTextHit(formCtx);
+      const ordinaryHint = blindSiteHasOrdinaryInlineMediaHint(direct);
+      if (ordinaryHint && !directHit) return false;
+      // Direct local CAPTCHA evidence is enough. Form-wide CAPTCHA text is only
+      // a fallback when this is the sole inline data image in the form; otherwise
+      // a CAPTCHA form could accidentally whitelist ordinary inline logos/avatars.
+      return directHit || (formHit && blindSiteInlineFormHasSingleDataImage(el));
+    } catch(e) { return false; }
+  }
+  function blindSiteReportCaptchaAllow(el, src, reason, context){
+    try {
+      if (el.getAttribute('data-blindsite-captcha-reported') === '1') return;
+      el.setAttribute('data-blindsite-captcha-reported', '1');
+      const isData = String(src || '').trim().toLowerCase().startsWith('data:image/');
+      const payload = {
+        page_url: location.href,
+        tag: (el.tagName || '').toLowerCase(),
+        id: el.getAttribute('id') || '',
+        class_name: String(el.getAttribute('class') || ''),
+        name: el.getAttribute('name') || '',
+        alt: el.getAttribute('alt') || '',
+        title: el.getAttribute('title') || '',
+        role: el.getAttribute('role') || '',
+        reason: reason || 'captcha/challenge image allowed',
+        src_kind: isData ? 'inline_data_image' : 'network_or_relative_image',
+        src: isData && src.length <= 300000 ? src : '',
+        src_prefix: String(src || '').slice(0, 96),
+        src_length: String(src || '').length,
+        context_text: String(context || '').slice(0, 700)
+      };
+      if (window.__blindsiteCaptchaChallengeAllowed) window.__blindsiteCaptchaChallengeAllowed(payload).catch(() => {});
+    } catch(e) {}
+  }
+  function blindSiteMarkCaptchaNodes(){
+    if (!allowCaptchaChallengeMedia) return;
+    try {
+      const attrs = ['src','currentSrc','poster','data-src','data-lazy-src','data-original','data-url','data-blindsite-src'];
+      const nodes = Array.from(document.querySelectorAll('img,picture,source,svg,canvas,object,embed,iframe,[role="img"],[style]'));
+      for (const el of nodes) {
+        let matched = false;
+        let matchedSrc = '';
+        let matchedReason = '';
+        const context = blindSiteCaptchaContext(el);
+        for (const a of attrs) {
+          let v = '';
+          try { v = (a === 'currentSrc' ? el.currentSrc : el.getAttribute(a)) || ''; } catch(e) { v = ''; }
+          if (blindSiteCaptchaUrl(v)) { matched = true; matchedSrc = v; matchedReason = 'captcha/challenge URL pattern'; break; }
+          if (blindSiteCaptchaInlineDataImage(el, v, context)) { matched = true; matchedSrc = v; matchedReason = 'inline data:image CAPTCHA/challenge context'; break; }
+        }
+        try {
+          const ss = el.getAttribute('srcset') || el.getAttribute('data-srcset') || '';
+          if (!matched && ss) {
+            for (const part of ss.split(',')) {
+              const candidate = (part.trim().split(/\\s+/)[0] || '');
+              if (blindSiteCaptchaUrl(candidate) || blindSiteCaptchaInlineDataImage(el, candidate, context)) { matched = true; matchedSrc = candidate; matchedReason = 'captcha/challenge srcset/context'; break; }
+            }
+          }
+        } catch(e) {}
+        try {
+          const style = el.getAttribute('style') || '';
+          if (!matched && style) {
+            for (const m of style.matchAll(/url\\((['"]?)(.*?)\\1\\)/g)) {
+              if (blindSiteCaptchaUrl(m[2]) || blindSiteCaptchaInlineDataImage(el, m[2], context)) { matched = true; matchedSrc = m[2]; matchedReason = 'captcha/challenge CSS-url/context'; break; }
+            }
+          }
+        } catch(e) {}
+        if (matched) {
+          el.setAttribute('data-blindsite-captcha-allow', '1');
+          if (el.parentElement && el.parentElement.tagName && el.parentElement.tagName.toLowerCase() === 'picture') el.parentElement.setAttribute('data-blindsite-captcha-allow', '1');
+          blindSiteReportCaptchaAllow(el, matchedSrc, matchedReason, context);
+        }
+      }
+    } catch(e) {}
+  }
   function bootVeil(){
     try { const r = root(); if (r && !releasedBoot) r.setAttribute('data-blindsite-media-boot', '1'); } catch(e) {}
   }
@@ -3839,6 +5024,7 @@ class LiveBrowserSession:
   }
   function applyBlindSiteMediaBlock(){
     try {
+      blindSiteMarkCaptchaNodes();
       const r = root();
       if (!r) return false;
       let style = document.getElementById(STYLE_ID);
@@ -3869,14 +5055,14 @@ class LiveBrowserSession:
   const fastTimer = setInterval(() => { applyBlindSiteMediaBlock(); if (++ticks > 80) clearInterval(fastTimer); }, 25);
   setInterval(applyBlindSiteMediaBlock, 1000);
   setTimeout(releaseBoot, 1500);
-})();""" % json.dumps(css)
+})();""" % (json.dumps(css), json.dumps(bool(self.allow_captcha_challenge_media)), json.dumps(CAPTCHA_CHALLENGE_HOST_PATTERNS), json.dumps(CAPTCHA_CHALLENGE_PATH_PATTERNS), json.dumps(CAPTCHA_CHALLENGE_INLINE_CONTEXT_PATTERNS))
                     await self.context.add_init_script(js)
                 await self.context.route("**/*", self._route)
                 self.context.on("page", self._on_new_page)
                 self.page = await self.context.new_page()
                 await self._register_page(self.page, reason="initial")
                 execute("UPDATE browser_sessions SET status='running' WHERE session_id=?", (self.session_id,))
-                log_event(self.actor, "LIVE_SESSION_STARTED", case_id=self.case_id, session_id=self.session_id, details={"browser": self.browser_choice, "use_tor": self.use_tor, "media_policy": self.media_policy, "headless": self.headless, "download_allowed_media": self.download_allowed_media, "sealed_media_preservation": self.sealed_media_policy_cache, "user_agent_profile": self.user_agent_meta.get("profile"), "user_agent_sha256": self.user_agent_meta.get("user_agent_sha256")})
+                log_event(self.actor, "LIVE_SESSION_STARTED", case_id=self.case_id, session_id=self.session_id, details={"browser": self.browser_choice, "use_tor": self.use_tor, "media_policy": self.media_policy, "headless": self.headless, "download_allowed_media": self.download_allowed_media, "sealed_media_preservation": self.sealed_media_policy_cache, "allow_captcha_challenge_media": self.allow_captcha_challenge_media, "user_agent_profile": self.user_agent_meta.get("profile"), "user_agent_sha256": self.user_agent_meta.get("user_agent_sha256")})
                 self.ready.set()
                 try:
                     await self.page.goto(self.start_url, wait_until="domcontentloaded", timeout=int(get_setting("live_initial_navigation_timeout_ms", "60000") or "60000"))
@@ -3898,7 +5084,7 @@ class LiveBrowserSession:
                 except Exception:
                     pass
                 execute("UPDATE browser_sessions SET status='stopped', stopped_at=? WHERE session_id=?", (utcnow(), self.session_id))
-                log_event(self.actor, "LIVE_SESSION_STOPPED", case_id=self.case_id, session_id=self.session_id, details={"requests": self.requests, "blocked": self.blocked, "sealed_preserved": self.sealed_preserved, "sealed_preserved_bytes": self.sealed_preserved_bytes, "sealed_preserve_skipped": self.sealed_preserve_skipped, "current_url": self.current_url, "sealed_preserve_timeouts": self.sealed_preserve_timeout_count, "sealed_preserve_pending": len(self.sealed_preserve_bg_tasks)})
+                log_event(self.actor, "LIVE_SESSION_STOPPED", case_id=self.case_id, session_id=self.session_id, details={"requests": self.requests, "blocked": self.blocked, "sealed_preserved": self.sealed_preserved, "sealed_preserved_bytes": self.sealed_preserved_bytes, "sealed_preserve_skipped": self.sealed_preserve_skipped, "current_url": self.current_url, "sealed_preserve_timeouts": self.sealed_preserve_timeout_count, "sealed_preserve_pending": len(self.sealed_preserve_bg_tasks), "captcha_challenge_allowed": self.captcha_challenge_allowed})
         except Exception as exc:
             self.error = str(exc)
             self.ready.set()
@@ -3972,7 +5158,12 @@ class LiveBrowserSession:
                     out.append(p)
             except Exception:
                 pass
-        self.pages = out
+        # During active navigation, Playwright can briefly report/throw in a way
+        # that makes a poll look like there are zero pages. Do not wipe the
+        # tracked page object list on that transient empty read; the tab-status
+        # UI also keeps a last-known-good snapshot to prevent blinking.
+        if out or not candidates or self.stop_flag.is_set():
+            self.pages = out
         return out
 
     def _cache_asset_response(self, *, url: str, resource_type: str, status_code: int | None, headers: dict[str, Any], body: bytes) -> None:
@@ -4566,15 +5757,91 @@ class LiveBrowserSession:
             self.sealed_preserve_cancelled += cancelled
         return self.preservation_status()
 
+    async def _record_captcha_challenge_allowed_from_browser(self, source, payload: dict[str, Any] | None = None) -> None:
+        """Audit a browser-side CAPTCHA/challenge display exception.
+
+        Network CAPTCHA images are visible through the route allowlist and are
+        logged in _route. Inline darknet CAPTCHAs often arrive as data:image/*
+        elements, so Playwright never sees a network request. The init script
+        marks only inline images with CAPTCHA/challenge context and calls this
+        binding so the display exception is still visible in browser_events and
+        the custody audit log without storing the inline image itself.
+        """
+        if not self.allow_captcha_challenge_media:
+            return
+        payload = payload or {}
+        try:
+            page_url = str(payload.get("page_url") or getattr(source.get("page"), "url", "") or self.current_url or "")
+        except Exception:
+            page_url = str(payload.get("page_url") or self.current_url or "")
+        tag = str(payload.get("tag") or "").lower()[:40]
+        src_kind = str(payload.get("src_kind") or "").lower()[:80]
+        src = str(payload.get("src") or "")
+        src_prefix = str(payload.get("src_prefix") or "")[:140]
+        src_length = safe_int(payload.get("src_length", 0), 0, min_value=0, max_value=100000000)
+        context_text = str(payload.get("context_text") or "")[:700]
+        reason = str(payload.get("reason") or "inline CAPTCHA/challenge display exception")[:300]
+        # Keep the full data URL out of logs. If the browser passed it, hash it
+        # and discard it immediately. The prefix/length are enough for human
+        # debugging without persisting the CAPTCHA image.
+        src_sha256 = sha256_text(src) if src else ""
+        dedupe_key = sha256_text(canonical({
+            "session_id": self.session_id,
+            "page_url": page_url,
+            "tag": tag,
+            "src_kind": src_kind,
+            "src_sha256": src_sha256,
+            "src_prefix": src_prefix,
+            "context_text": context_text[:160],
+        }))
+        if dedupe_key in self.captcha_challenge_inline_seen:
+            return
+        self.captcha_challenge_inline_seen.add(dedupe_key)
+        self.captcha_challenge_allowed += 1
+        details = {
+            "reason": reason,
+            "minimal_exception": True,
+            "inline_data_image": src_kind == "inline_data_image",
+            "src_kind": src_kind,
+            "src_length": src_length,
+            "src_sha256": src_sha256,
+            "src_prefix": src_prefix,
+            "tag": tag,
+            "id": str(payload.get("id") or "")[:120],
+            "class_name": str(payload.get("class_name") or "")[:180],
+            "name": str(payload.get("name") or "")[:80],
+            "alt": str(payload.get("alt") or "")[:160],
+            "title": str(payload.get("title") or "")[:160],
+            "role": str(payload.get("role") or "")[:80],
+            "context_sha256": sha256_text(context_text),
+            "context_sample": context_text[:300],
+            "page_url_sha256": sha256_text(page_url),
+            "media_policy": self.media_policy,
+        }
+        try:
+            execute("INSERT INTO browser_events(session_id,created_at,event_type,url,resource_type,method,status_code,headers_json,header_sha256,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (self.session_id, utcnow(), "captcha_challenge_inline_media_allowed", page_url, "image", "INLINE", None, "{}", header_hash({}), pretty(details)))
+            log_event(self.actor, "CAPTCHA_CHALLENGE_INLINE_MEDIA_ALLOWED", case_id=self.case_id, session_id=self.session_id, details=details)
+        except Exception:
+            pass
+
     async def _route(self, route, request) -> None:
         self.requests += 1
         rt = request.resource_type
         req_headers = dict(request.headers or {})
         if live_policy_blocks(rt, self.media_policy, request.url):
-            self.blocked += 1
             logical = classify_resource(request.url, browser_type=rt)
             if logical in {"document", "xhr", "fetch", "other"}:
                 logical = classify_resource(request.url)
+            if self.allow_captcha_challenge_media and captcha_challenge_media_candidate(request.url, rt):
+                self.captcha_challenge_allowed += 1
+                try:
+                    execute("INSERT INTO browser_events(session_id,created_at,event_type,url,resource_type,method,status_code,headers_json,header_sha256,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (self.session_id, utcnow(), "captcha_challenge_media_allowed", request.url, logical, request.method, None, "{}", header_hash({}), pretty({"reason": "minimal CAPTCHA/challenge display exception; ordinary media remains blocked", "url_sha256": sha256_text(request.url), "media_policy": self.media_policy})))
+                    log_event(self.actor, "CAPTCHA_CHALLENGE_MEDIA_ALLOWED", case_id=self.case_id, session_id=self.session_id, details={"url_sha256": sha256_text(request.url), "resource_type": logical, "media_policy": self.media_policy, "reason": "minimal CAPTCHA/challenge display exception"})
+                except Exception:
+                    pass
+                await route.continue_()
+                return
+            self.blocked += 1
             try:
                 self._queue_blocked_preservation_fast(media_url=request.url, logical=logical, method=request.method, req_headers=req_headers, page_url=self.current_url, browser_resource_type=rt)
                 if self.log_blocked_browser_events:
@@ -5104,12 +6371,32 @@ class LiveBrowserSession:
         fut = asyncio.run_coroutine_threadsafe(self._capture_all_open_tabs(), self.loop)
         return list(fut.result(timeout=300))
 
+    def _remember_tabs_snapshot(self, tabs: list[dict[str, Any]]) -> None:
+        if not tabs:
+            return
+        with self.tabs_snapshot_lock:
+            self.last_tabs_snapshot = [dict(t) for t in tabs]
+            self.last_tabs_snapshot_time = time.time()
+
+    def _last_known_tabs_snapshot(self, max_age_s: float = 120.0) -> list[dict[str, Any]]:
+        with self.tabs_snapshot_lock:
+            if not self.last_tabs_snapshot or not self.last_tabs_snapshot_time:
+                return []
+            age = time.time() - self.last_tabs_snapshot_time
+            if age > max_age_s or self.stop_flag.is_set():
+                return []
+            cached = [dict(t) for t in self.last_tabs_snapshot]
+        for t in cached:
+            t["transient_snapshot"] = True
+        return cached
+
     async def _tab_info(self) -> list[dict[str, Any]]:
         """Return a robust snapshot of open browser tabs/pages.
 
-        Firefox can leave pages in a loading state where title() waits too long.
-        This keeps the tracked-tabs UI responsive by timing out title lookup per tab
-        while still returning the URL and capture index.
+        Firefox/Chromium can briefly give an empty or half-ready page list while
+        a tab is navigating. The UI polls this every few seconds, so a single
+        transient empty read used to make the table blink to "No tracked tabs".
+        Keep returning a short last-known-good snapshot during those gaps.
         """
         out: list[dict[str, Any]] = []
         pages = self._live_pages_snapshot()
@@ -5137,15 +6424,18 @@ class LiveBrowserSession:
                 "is_current": bool(p == self.active_page or p == self.page),
                 "capturable": bool(url and not url.startswith(("about:", "chrome:", "edge:", "devtools:"))),
             })
-        return out
+        if out:
+            self._remember_tabs_snapshot(out)
+            return out
+        return self._last_known_tabs_snapshot()
 
     def open_tabs_sync(self) -> list[dict[str, Any]]:
         if self.loop is None or self.loop.is_closed():
-            return []
+            return self._last_known_tabs_snapshot()
         try:
             return list(asyncio.run_coroutine_threadsafe(self._tab_info(), self.loop).result(timeout=10))
         except Exception:
-            return []
+            return self._last_known_tabs_snapshot()
 
     async def _capture_tab_index(self, tab_index: int) -> int:
         pages = self._live_pages_snapshot()
@@ -5180,7 +6470,7 @@ class LiveBrowserSession:
         self.stop_flag.set()
 
 
-def start_live_session(*, actor: str, case_id: int | None, start_url: str, browser_choice: str, use_tor: bool, media_policy: str, headless: bool, user_agent_profile: str | None = None, custom_user_agent: str | None = None, download_allowed_media: bool = False, auto_capture: bool = False, settle_before_capture: bool = True, sealed_media_preservation_session: bool = True, capture_auto_scroll_session: bool = False) -> LiveBrowserSession:
+def start_live_session(*, actor: str, case_id: int | None, start_url: str, browser_choice: str, use_tor: bool, media_policy: str, headless: bool, user_agent_profile: str | None = None, custom_user_agent: str | None = None, download_allowed_media: bool = False, auto_capture: bool = False, settle_before_capture: bool = True, sealed_media_preservation_session: bool = True, capture_auto_scroll_session: bool = False, allow_captcha_challenge_media: bool = False) -> LiveBrowserSession:
     case = case_for(case_id)
     if browser_choice in {"torbrowser", "tor_managed_chromium", "tor_managed_firefox"}:
         use_tor = True
@@ -5195,9 +6485,11 @@ def start_live_session(*, actor: str, case_id: int | None, start_url: str, brows
         download_allowed_media = False
     sid = uuid.uuid4().hex[:16]
     ua_meta = user_agent_info(user_agent_profile, custom_user_agent)
+    ensure_application_genesis_event(f"session:{sid}", case_id=case_id, session_id=sid, actor="system")
+    session_genesis = application_genesis_report(investigation_id=f"session:{sid}")
     execute("""INSERT INTO browser_sessions(session_id,case_id,actor,browser_choice,start_url,use_tor,media_policy,headless,status,current_url,created_at,meta_json)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (sid, case_id, actor, browser_choice, normalize_url(start_url), 1 if use_tor else 0, policy, 1 if headless else 0, "starting", normalize_url(start_url), utcnow(), pretty({"version": APP_VERSION, "user_agent_profile": ua_meta["profile"], "user_agent_label": ua_meta["label"], "user_agent_sha256": ua_meta["user_agent_sha256"], "user_agent": ua_meta["user_agent"], "download_allowed_media": bool(download_allowed_media), "sealed_media_preservation": sealed_media_preservation_policy(case), "auto_capture": bool(auto_capture), "settle_before_capture": bool(settle_before_capture), "sealed_media_preservation_session": bool(sealed_media_preservation_session), "capture_settle_timeout_ms": get_setting("capture_settle_timeout_ms", "30000"), "capture_auto_scroll_enabled": get_setting("capture_auto_scroll_enabled", "0"), "capture_auto_scroll_session": bool(capture_auto_scroll_session), "tor_browser_path": str(detect_tor_browser_executable() or "") if browser_choice == "torbrowser" else ""})))
-    session = LiveBrowserSession(session_id=sid, case_id=case_id, actor=actor, start_url=start_url, browser_choice=browser_choice, use_tor=use_tor, media_policy=policy, headless=headless, user_agent_profile=ua_meta["profile"], custom_user_agent=custom_user_agent or "", download_allowed_media=download_allowed_media, auto_capture=auto_capture, settle_before_capture=settle_before_capture, sealed_media_preservation_session=sealed_media_preservation_session, capture_auto_scroll_session=capture_auto_scroll_session)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (sid, case_id, actor, browser_choice, normalize_url(start_url), 1 if use_tor else 0, policy, 1 if headless else 0, "starting", normalize_url(start_url), utcnow(), pretty({"version": APP_VERSION, "user_agent_profile": ua_meta["profile"], "user_agent_label": ua_meta["label"], "user_agent_sha256": ua_meta["user_agent_sha256"], "user_agent": ua_meta["user_agent"], "download_allowed_media": bool(download_allowed_media), "sealed_media_preservation": sealed_media_preservation_policy(case), "auto_capture": bool(auto_capture), "settle_before_capture": bool(settle_before_capture), "sealed_media_preservation_session": bool(sealed_media_preservation_session), "capture_settle_timeout_ms": get_setting("capture_settle_timeout_ms", "30000"), "capture_auto_scroll_enabled": get_setting("capture_auto_scroll_enabled", "0"), "capture_auto_scroll_session": bool(capture_auto_scroll_session), "allow_captcha_challenge_media": bool(allow_captcha_challenge_media), "application_genesis": session_genesis, "tor_browser_path": str(detect_tor_browser_executable() or "") if browser_choice == "torbrowser" else ""})))
+    session = LiveBrowserSession(session_id=sid, case_id=case_id, actor=actor, start_url=start_url, browser_choice=browser_choice, use_tor=use_tor, media_policy=policy, headless=headless, user_agent_profile=ua_meta["profile"], custom_user_agent=custom_user_agent or "", download_allowed_media=download_allowed_media, auto_capture=auto_capture, settle_before_capture=settle_before_capture, sealed_media_preservation_session=sealed_media_preservation_session, capture_auto_scroll_session=capture_auto_scroll_session, allow_captcha_challenge_media=allow_captcha_challenge_media)
     with LIVE_LOCK:
         LIVE[sid] = session
     session.start()
@@ -5244,7 +6536,8 @@ def live_tabs_status_for(sid: str) -> dict[str, Any]:
         row = rowdict(fetchone("SELECT * FROM browser_sessions WHERE session_id=?", (sid,)))
         return {"ok": False, "session_id": sid, "running": False, "tabs": [], "message": "Live session is not running in this app process", "db_status": row.get("status") if row else "missing"}
     tabs = session.open_tabs_sync()
-    return {"ok": True, "session_id": sid, "running": not session.stop_flag.is_set(), "tabs": tabs, "count": len(tabs), "current_url": session.current_url}
+    transient = any(bool(t.get("transient_snapshot")) for t in tabs)
+    return {"ok": True, "session_id": sid, "running": not session.stop_flag.is_set(), "tabs": tabs, "count": len(tabs), "current_url": session.current_url, "transient_snapshot": transient}
 
 
 def live_preservation_status_for(sid: str) -> dict[str, Any]:
@@ -5284,7 +6577,7 @@ def retry_live_blocked_media(sid: str, *, actor: str, blocked_ids: list[int] | N
 def early_access_warning_html() -> str:
     return """
     <div class='card warn' style='text-align:center;max-width:980px;margin:14px auto;'>
-      <h2 style='margin-top:0'>Early-Access Safety Notice</h2>
+      <h2 style='margin-top:0'>Early-access safety notice</h2>
       <p><b>BlindSite is an early-access evidence-preservation tool.</b> Use it only for lawful investigations and only under policies you understand. File and media workflows can be risky depending on the content, facts, and jurisdiction.</p>
       <p><b>Sealed Sender / file-download mode</b> keeps media blocked from normal live viewing while preserving selected blocked files encrypted for sealed export and cleared-reviewer access. In Civilian Unknown Master Key mode, hard-sealed originals cannot be decrypted by the local civilian installation.</p>
       <p><b>Civilian use of Organization-Controlled Key mode:</b> use it only for lawful, non-risky investigations where no illegal or high-risk content will be downloaded or viewed. It can be appropriate when intentionally viewing ordinary, non-risky images/media is necessary.</p>
@@ -5307,15 +6600,26 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     row = fetchone("SELECT * FROM users WHERE username=?", (username.strip(),))
     if not row or not check_password(password, row["password_hash"]):
         return RedirectResponse("/login?error=Invalid%20login", 303)
+    sealed_sender_enabled = str(sealed_sender_file_downloads or "enabled").strip().lower() != "disabled"
+    if truthy(row["require_webauthn"]):
+        if not webauthn_user_has_credentials(row["username"]):
+            log_event(row["username"], "YUBIKEY_LOGIN_BLOCKED_NO_CREDENTIAL", details={"username": row["username"]})
+            return RedirectResponse("/login?error=YubiKey%20is%20required%20for%20this%20account%20but%20no%20key%20is%20enrolled", 303)
+        request.session.clear()
+        request.session["pending_webauthn_login_username"] = row["username"]
+        request.session["pending_login_init_tor"] = "1" if init_tor_session else "0"
+        request.session["pending_login_force_tor_all_cases"] = "1" if force_tor_all_cases else "0"
+        request.session["pending_login_sealed_sender_enabled"] = "1" if sealed_sender_enabled else "0"
+        log_event(row["username"], "YUBIKEY_LOGIN_REQUIRED", details={"init_tor_session": bool(init_tor_session), "force_tor_all_cases": bool(force_tor_all_cases), "sealed_sender_file_downloads_enabled": sealed_sender_enabled})
+        return RedirectResponse("/webauthn/login", 303)
     request.session["username"] = row["username"]
+    request.session["sealed_sender_file_downloads_enabled"] = "1" if sealed_sender_enabled else "0"
+    set_setting("sealed_media_preservation_enabled", "1" if sealed_sender_enabled else "0")
     if force_tor_all_cases:
         request.session["force_tor_all_cases"] = "1"
     else:
         request.session.pop("force_tor_all_cases", None)
-    sealed_sender_enabled = str(sealed_sender_file_downloads or "enabled").strip().lower() != "disabled"
-    request.session["sealed_sender_file_downloads_enabled"] = "1" if sealed_sender_enabled else "0"
-    set_setting("sealed_media_preservation_enabled", "1" if sealed_sender_enabled else "0")
-    log_event(row["username"], "LOGIN", details={"init_tor_session": bool(init_tor_session), "force_tor_all_cases": bool(force_tor_all_cases), "sealed_sender_file_downloads_enabled": sealed_sender_enabled})
+    log_event(row["username"], "LOGIN", details={"init_tor_session": bool(init_tor_session), "force_tor_all_cases": bool(force_tor_all_cases), "sealed_sender_file_downloads_enabled": sealed_sender_enabled, "yubikey_login": False})
     # Optional Tor prewarm is intentionally non-blocking. It starts/verifies the
     # Tor provider in the background so sign-in remains fast and normal traffic
     # is not forced through Tor unless a Tor browser/session is explicitly used.
@@ -5500,7 +6804,8 @@ def create_case(request: Request, name: str = Form(...), description: str = Form
     compliance = 1 if mode == "lockdown" or setting_bool("hard_default_safe_mode", "1") else 0
     cid = execute("""INSERT INTO cases(name,description,mode,compliance_safe,irreversible_lock,never_materialize_originals,no_plaintext_export,raw_root_allowed,default_media_policy,force_tor,quarantine_default,sealed_media_preservation_enabled,sealed_media_preserve_images,sealed_media_preserve_video,sealed_media_preserve_audio,sealed_media_preserve_max_bytes,hashtags,created_by,created_at)
                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (name.strip(), description, mode, compliance, 1 if mode == "lockdown" else 0, 1 if mode in {"lockdown", "supervised"} else 0, 1 if mode in {"lockdown", "supervised"} else 0, 1 if raw_root_allowed else 0, media_policy, 1 if (force_tor or request.session.get("force_tor_all_cases")) else 0, 1, 1 if sealed_media_preservation_enabled else 0, 1 if sealed_media_preserve_images else 0, 1 if sealed_media_preserve_video else 0, 1 if sealed_media_preserve_audio else 0, safe_int(sealed_media_preserve_max_bytes, safe_int(get_setting("sealed_media_preserve_max_bytes", "52428800"), 52428800, min_value=1048576), min_value=1048576), normalize_hashtags(hashtags), user["username"], utcnow()))
-    log_event(user["username"], "CASE_CREATED", case_id=cid, details={"mode": mode, "media_policy": media_policy, "force_tor": bool(force_tor or request.session.get("force_tor_all_cases")), "sealed_media_preservation_enabled": bool(sealed_media_preservation_enabled), "hashtags": normalize_hashtags(hashtags)})
+    ensure_application_genesis_event(f"case:{cid}", case_id=cid, actor="system")
+    log_event(user["username"], "CASE_CREATED", case_id=cid, details={"mode": mode, "media_policy": media_policy, "force_tor": bool(force_tor or request.session.get("force_tor_all_cases")), "sealed_media_preservation_enabled": bool(sealed_media_preservation_enabled), "hashtags": normalize_hashtags(hashtags), "application_genesis": application_genesis_report(case_id=cid)})
     return RedirectResponse(f"/cases/{cid}", 303)
 
 
@@ -5546,10 +6851,10 @@ def case_detail(request: Request, case_id: int, msg: str | None = None) -> HTMLR
     if captures:
         latest = captures[0]
         quick_viewer = f"""<div class='card good'><h2>Latest saved page quick viewer</h2><p>{badge('safe render','good')} <span class='small muted'>This embedded preview uses the safe no-network renderer. Open the full case page viewer to unlock exact local rendering with saved images/video/CSS.</span></p><p><a class='button good' href='/cases/{case_id}/pages?eid={latest['evidence_id']}'>Open full case page viewer</a> <a class='button' href='/evidence/{latest['evidence_id']}/page-render'>Open renderer controls</a></p><iframe class='render-frame' sandbox='allow-same-origin' src='/evidence/{latest['evidence_id']}/page-render-frame?render=safe'></iframe></div>"""
-    body = f"""{flash(msg)}<div class='card'><h2>{h(case['name'])}</h2><p>{badge(case['mode'],'good' if case['mode']=='lockdown' else 'warn')} {badge('compliance-safe','good') if case['compliance_safe'] else badge('review/lab','warn')} {badge('force Tor','info') if case['force_tor'] else ''} {badge('irreversible lock','warn') if case['irreversible_lock'] else ''} {hashtag_badges(case.get('hashtags') or '')}</p><form method='post' action='/cases/{case_id}/hashtags' class='noprint'><label>Case hashtags</label><input name='hashtags' value='{h(normalize_hashtags(case.get('hashtags') or ''))}' placeholder='#priority #agency #casework'><button class='secondary'>Save case hashtags</button></form><pre>{h(pretty(case))}</pre><p><a class='button' href='/cases/{case_id}/report'>Case report</a> <a class='button' href='/cases/{case_id}/report.zip'>Report-only ZIP</a> <a class='button good' href='/cases/{case_id}/pages'>Case page viewer</a> <a class='button good' href='/captures?case_id={case_id}'>Saved pages</a> <a class='button' href='/media?case_id={case_id}'>Media</a> <a class='button warn' href='/cases/{case_id}/sealed-export'>Sealed LE Export</a></p><form method='post' action='/cases/{case_id}/rendered-export' class='noprint'><h3>Export offline saved-page viewer ZIP</h3><label><input type='checkbox' name='include_assets' value='1'> Include saved local image/video/audio/style/font assets where policy permits</label><label>Master key required if including viewable assets</label><input type='password' name='master_key'><button class='warn'>Export viewer ZIP</button></form></div>{sealed_form}{quick_viewer}
+    body = f"""{flash(msg)}<div class='card'><h2>{h(case['name'])}</h2><p>{badge(case['mode'],'good' if case['mode']=='lockdown' else 'warn')} {badge('compliance-safe','good') if case['compliance_safe'] else badge('review/lab','warn')} {badge('force Tor','info') if case['force_tor'] else ''} {badge('irreversible lock','warn') if case['irreversible_lock'] else ''} {hashtag_badges(case.get('hashtags') or '')}</p><form method='post' action='/cases/{case_id}/hashtags' class='noprint'><label>Case hashtags</label><input name='hashtags' value='{h(normalize_hashtags(case.get('hashtags') or ''))}' placeholder='#priority #agency #casework'><button class='secondary'>Save case hashtags</button></form><pre>{h(pretty(case))}</pre><p><a class='button' href='/cases/{case_id}/report'>Case report</a> <a class='button' href='/cases/{case_id}/report.zip'>Report-only ZIP</a> <a class='button good' href='/cases/{case_id}/pages'>Case page viewer</a> <a class='button good' href='/captures?case_id={case_id}'>Saved pages</a> <a class='button' href='/media?case_id={case_id}'>Media</a> <a class='button warn' href='/cases/{case_id}/sealed-export'>Sealed LE Export</a></p><form method='post' action='/cases/{case_id}/rendered-export' class='noprint' data-webauthn-action='plaintext_export' data-webauthn-if-checked='include_assets'><h3>Export offline saved-page viewer ZIP</h3><label><input type='checkbox' name='include_assets' value='1'> Include saved local image/video/audio/style/font assets where policy permits</label><label>Master key required if including viewable assets</label><input type='password' name='master_key'><button class='warn'>Export viewer ZIP</button></form></div>{sealed_form}{quick_viewer}
     <div class='grid'><div class='card'><h2>Upload evidence</h2><form method='post' action='/upload' enctype='multipart/form-data'><input type='hidden' name='case_id' value='{case_id}'><label>File</label><input type='file' name='file' required><label><input type='checkbox' name='quarantine' value='1' checked> Quarantine on intake</label><button>Upload</button></form></div>
     <div class='card'><h2>Direct URL capture</h2><form method='post' action='/capture'><input type='hidden' name='case_id' value='{case_id}'><label>URL</label><input name='url' placeholder='https://example.org' required><div class='row'><div><label>Mode</label><select name='capture_mode'><option value='metadata_only'>Metadata only</option><option value='safe_summary'>Sanitized summary</option><option value='evidence_safe'>Evidence safe</option><option value='full_forensic'>Full forensic</option></select></div><div><label>Media policy</label><select name='media_policy'><option value='{h(case['default_media_policy'])}'>{h(case['default_media_policy'])} (case default)</option><option value='block_images_video'>Block images + video/audio</option><option value='block_all_media'>Block all media + fonts</option><option value='block_images'>Block images only</option><option value='allow_all'>Allow all</option></select></div></div><div class='row'><div><label>User agent</label><select name='user_agent_profile'>{ua_select_html('user_agent_profile')}</select></div><div><label>Custom UA, if selected</label><input name='custom_user_agent' placeholder='optional custom user agent'></div></div><label><input type='checkbox' name='use_tor' value='1' {'checked' if case['force_tor'] or request.session.get('force_tor_all_cases') else ''}> Use Tor SOCKS</label><label><input type='checkbox' name='download_allowed_media' value='1'> In lab/full-forensic only: download allowed original media unblurred</label><button>Capture URL</button></form></div>
-    <div class='card good'><h2>Start visible live browser</h2><form method='post' action='/live/start'><input type='hidden' name='case_id' value='{case_id}'><label>Start URL</label><input name='start_url' value='https://www.google.com' required><div class='row'><div><label>Browser</label><select name='browser_choice'>{browser_select_html('browser_choice')}</select></div><div><label>Media policy</label><select name='media_policy'><option value='{h(case['default_media_policy'])}'>{h(case['default_media_policy'])} (case default)</option><option value='block_images_video'>Block images + video/audio</option><option value='block_all_media'>Block all media + fonts</option><option value='block_images'>Block images only</option><option value='allow_all'>Allow all</option></select></div></div><div class='row'><div><label>User agent</label><select name='user_agent_profile'>{ua_select_html('user_agent_profile')}</select></div><div><label>Custom UA, if selected</label><input name='custom_user_agent' placeholder='optional custom user agent'></div></div><label><input type='checkbox' name='use_tor' value='1' {'checked' if case['force_tor'] or request.session.get('force_tor_all_cases') else ''}> Route browser through Tor</label><label><input type='checkbox' name='download_allowed_media' value='1' {'checked' if setting_bool('live_download_allowed_media_default','0') else ''}> Lab/full-forensic only: save allowed images/video/audio for exact page renderer</label><label><input type='checkbox' name='sealed_media_preservation_session' value='1' {'checked' if sealed_media_preservation_policy(case).get('enabled') else ''}> Block display, preserve blocked media encrypted for sealed export in this session</label><label><input type='checkbox' name='settle_before_capture' value='1' {'checked' if setting_bool('capture_settle_before_save','1') else ''}> Before manual/auto capture, wait for page load/DOM settle</label><label><input type='checkbox' name='capture_auto_scroll_session' value='1' {'checked' if setting_bool('capture_auto_scroll_enabled','0') else ''}> Before capture, auto-scroll to trigger lazy-loaded content</label><label><input type='checkbox' name='auto_capture' value='1' {'checked' if setting_bool('live_auto_capture_default','0') else ''}> Auto-capture each new page after it settles</label><label><input type='checkbox' name='headless' value='1'> Headless instead of visible</label><button class='good'>Open controlled browser</button></form></div></div>
+    <div class='card good'><h2>Start visible live browser</h2><form method='post' action='/live/start'><input type='hidden' name='case_id' value='{case_id}'><label>Start URL</label><input name='start_url' value='https://www.google.com' required><div class='row'><div><label>Browser</label><select name='browser_choice'>{browser_select_html('browser_choice')}</select></div><div><label>Media policy</label><select name='media_policy'><option value='{h(case['default_media_policy'])}'>{h(case['default_media_policy'])} (case default)</option><option value='block_images_video'>Block images + video/audio</option><option value='block_all_media'>Block all media + fonts</option><option value='block_images'>Block images only</option><option value='allow_all'>Allow all</option></select></div></div><div class='row'><div><label>User agent</label><select name='user_agent_profile'>{ua_select_html('user_agent_profile')}</select></div><div><label>Custom UA, if selected</label><input name='custom_user_agent' placeholder='optional custom user agent'></div></div><label><input type='checkbox' name='use_tor' value='1' {'checked' if case['force_tor'] or request.session.get('force_tor_all_cases') else ''}> Route browser through Tor</label><label><input type='checkbox' name='download_allowed_media' value='1' {'checked' if setting_bool('live_download_allowed_media_default','0') else ''}> Lab/full-forensic only: save allowed images/video/audio for exact page renderer</label><label><input type='checkbox' name='sealed_media_preservation_session' value='1' {'checked' if sealed_media_preservation_policy(case).get('enabled') else ''}> Block display, preserve blocked media encrypted for sealed export in this session</label><label><input type='checkbox' name='allow_captcha_challenge_media' value='1' {'checked' if setting_bool('live_allow_captcha_challenge_media_default','0') else ''}> Allow only CAPTCHA/challenge images, including inline/base64 data images, while other media remains blocked</label><label><input type='checkbox' name='settle_before_capture' value='1' {'checked' if setting_bool('capture_settle_before_save','1') else ''}> Before manual/auto capture, wait for page load/DOM settle</label><label><input type='checkbox' name='capture_auto_scroll_session' value='1' {'checked' if setting_bool('capture_auto_scroll_enabled','0') else ''}> Before capture, auto-scroll to trigger lazy-loaded content</label><label><input type='checkbox' name='auto_capture' value='1' {'checked' if setting_bool('live_auto_capture_default','0') else ''}> Auto-capture each new page after it settles</label><label><input type='checkbox' name='headless' value='1'> Headless instead of visible</label><button class='good'>Open controlled browser</button></form></div></div>
     <div class='card'><h2>Saved page captures / case page viewer</h2><p class='small muted'>Open case page viewer to render the captured page from locally saved bytes. In lab/full-forensic captures with saved media, the renderer can show saved images/video/audio without contacting the live site.</p><div class='table-scroll'><table><tr><th>Case viewer</th><th>Full renderer</th><th>Evidence</th><th>Title</th><th>Mode</th><th>Renderer state</th><th>URL</th></tr>{cap_rows or '<tr><td colspan="7" class="muted">No saved pages yet. Start a live session and click Capture Current Page, or use Direct URL capture.</td></tr>'}</table></div></div><div class='card'><h2>Evidence</h2><table><tr><th>ID</th><th>File</th><th>Kind</th><th>Storage</th><th>Status</th></tr>{ev_rows}</table></div><div class='card'><h2>Blocked media records</h2><table><tr><th>ID</th><th>Type</th><th>URL</th><th>URL hash</th></tr>{b_rows}</table></div>"""
     return layout(request, f"Case #{case_id}", body)
 
@@ -5594,6 +6899,7 @@ def live_page(request: Request, msg: str | None = None) -> HTMLResponse:
       <label><input type='checkbox' name='use_tor' value='1' {'checked' if request.session.get('force_tor_all_cases') else ''}> Route browser through Tor SOCKS {'(forced for this sign-in session)' if request.session.get('force_tor_all_cases') else ''}</label>
       <label><input type='checkbox' name='download_allowed_media' value='1' {'checked' if setting_bool('live_download_allowed_media_default','0') else ''}> Lab/full-forensic only: save allowed images/video/audio/CSS for exact page renderer</label>
       <label><input type='checkbox' name='sealed_media_preservation_session' value='1' {'checked' if setting_bool('sealed_media_preservation_enabled','0') else ''}> Block display, preserve blocked media encrypted for sealed export in this session</label>
+      <label><input type='checkbox' name='allow_captcha_challenge_media' value='1' {'checked' if setting_bool('live_allow_captcha_challenge_media_default','0') else ''}> Allow only CAPTCHA/challenge images, including inline/base64 data images, while other media remains blocked</label>
       <label><input type='checkbox' name='settle_before_capture' value='1' {'checked' if setting_bool('capture_settle_before_save','1') else ''}> Before manual/auto capture, wait for page load/DOM settle</label>
       <label><input type='checkbox' name='capture_auto_scroll_session' value='1' {'checked' if setting_bool('capture_auto_scroll_enabled','0') else ''}> Before capture, auto-scroll to trigger lazy-loaded content</label>
       <label><input type='checkbox' name='auto_capture' value='1' {'checked' if setting_bool('live_auto_capture_default','0') else ''}> Auto-capture each new page after it settles</label>
@@ -5604,10 +6910,10 @@ def live_page(request: Request, msg: str | None = None) -> HTMLResponse:
 
 
 @app.post("/live/start")
-def live_start(request: Request, case_id: str = Form(""), start_url: str = Form(...), browser_choice: str = Form("chromium"), media_policy: str = Form("block_images_video"), use_tor: str | None = Form(None), headless: str | None = Form(None), download_allowed_media: str | None = Form(None), sealed_media_preservation_session: str | None = Form(None), auto_capture: str | None = Form(None), settle_before_capture: str | None = Form(None), capture_auto_scroll_session: str | None = Form(None), user_agent_profile: str = Form(""), custom_user_agent: str = Form("")) -> RedirectResponse:
+def live_start(request: Request, case_id: str = Form(""), start_url: str = Form(...), browser_choice: str = Form("chromium"), media_policy: str = Form("block_images_video"), use_tor: str | None = Form(None), headless: str | None = Form(None), download_allowed_media: str | None = Form(None), sealed_media_preservation_session: str | None = Form(None), allow_captcha_challenge_media: str | None = Form(None), auto_capture: str | None = Form(None), settle_before_capture: str | None = Form(None), capture_auto_scroll_session: str | None = Form(None), user_agent_profile: str = Form(""), custom_user_agent: str = Form("")) -> RedirectResponse:
     user = require_user(request)
     cid = int(case_id) if str(case_id).strip() else None
-    sess = start_live_session(actor=user["username"], case_id=cid, start_url=start_url, browser_choice=browser_choice, use_tor=bool(use_tor or request.session.get("force_tor_all_cases")), media_policy=media_policy, headless=bool(headless), download_allowed_media=bool(download_allowed_media), auto_capture=bool(auto_capture), settle_before_capture=bool(settle_before_capture), capture_auto_scroll_session=bool(capture_auto_scroll_session), sealed_media_preservation_session=bool(sealed_media_preservation_session), user_agent_profile=user_agent_profile or get_setting("default_user_agent_profile", "chrome_windows"), custom_user_agent=custom_user_agent)
+    sess = start_live_session(actor=user["username"], case_id=cid, start_url=start_url, browser_choice=browser_choice, use_tor=bool(use_tor or request.session.get("force_tor_all_cases")), media_policy=media_policy, headless=bool(headless), download_allowed_media=bool(download_allowed_media), auto_capture=bool(auto_capture), settle_before_capture=bool(settle_before_capture), capture_auto_scroll_session=bool(capture_auto_scroll_session), sealed_media_preservation_session=bool(sealed_media_preservation_session), allow_captcha_challenge_media=bool(allow_captcha_challenge_media), user_agent_profile=user_agent_profile or get_setting("default_user_agent_profile", "chrome_windows"), custom_user_agent=custom_user_agent)
     return RedirectResponse(f"/live/{sess.session_id}?msg=Browser%20session%20started", 303)
 
 
@@ -5638,14 +6944,21 @@ def live_detail(request: Request, sid: str, msg: str | None = None) -> HTMLRespo
         tabs_html = "".join(tab_row(t) for t in tabs)
         runtime = f"""<p>{badge('in-memory running','good') if running else badge('in-memory stopped','warn')} {badge('requests '+str(mem.requests),'info')} {badge('blocked '+str(mem.blocked),'warn')} <span id='live-tabs-badge'>{badge('tabs '+str(len(tabs)),'info')}</span> {badge('current '+mem.current_url[:120],'info')}</p><details class='card' open><summary>Tracked browser tabs</summary><p class='small muted'>This list refreshes automatically and works around Firefox tabs that do not update the static page view. Use Capture tab if the browser's selected tab is not the one BlindSite last tracked.</p><table><thead><tr><th>#</th><th>Action</th><th>Title</th><th>URL</th></tr></thead><tbody id='tracked-tabs-body'>{tabs_html or '<tr><td colspan="4" class="muted">No tracked tabs yet.</td></tr>'}</tbody></table></details><script>(function(){{
   const sid = {json.dumps(sid)};
+  const initialTabsBody = document.getElementById('tracked-tabs-body');
+  if (initialTabsBody && initialTabsBody.querySelector('tr') && !initialTabsBody.textContent.includes('No tracked tabs yet')) initialTabsBody.dataset.lastHadRows = '1';
+  let trackedTabsRefreshInFlight = false;
   function esc(v){{ return String(v || '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c])); }}
   async function refreshTrackedTabs(){{
+    if (trackedTabsRefreshInFlight) return;
+    trackedTabsRefreshInFlight = true;
     try{{
       const r = await fetch('/live/' + encodeURIComponent(sid) + '/tabs', {{cache:'no-store'}});
       const j = await r.json();
       const body = document.getElementById('tracked-tabs-body');
       const badge = document.getElementById('live-tabs-badge');
-      if (badge) badge.innerHTML = `<span class="badge info">tabs ${{j.count || 0}}</span>`;
+      const tabCount = Number(j.count || 0);
+      const transient = Boolean(j.transient_snapshot);
+      if (badge) badge.innerHTML = `<span class="badge info">tabs ${{tabCount}}${{transient ? ' refreshing' : ''}}</span>`;
       if (!body) return;
       const rows = (j.tabs || []).map(t => {{
         const idx = Number(t.index || 0);
@@ -5653,9 +6966,18 @@ def live_detail(request: Request, sid: str, msg: str | None = None) -> HTMLRespo
         const active = t.is_current ? ` style="background:#082f49"` : '';
         return `<tr${{active}}><td>${{esc(idx)}}</td><td>${{cap}}</td><td>${{esc(t.title || '')}}</td><td class="urlcell">${{esc(t.url || '')}}</td></tr>`;
       }}).join('');
-      body.innerHTML = rows || '<tr><td colspan="4" class="muted">No tracked tabs yet.</td></tr>';
+      if (rows) {{
+        body.innerHTML = rows;
+        body.dataset.lastHadRows = '1';
+      }} else if (j.running && body.dataset.lastHadRows === '1') {{
+        if (badge) badge.innerHTML = `<span class="badge info">tabs refreshing</span>`;
+      }} else {{
+        body.innerHTML = '<tr><td colspan="4" class="muted">No tracked tabs yet.</td></tr>';
+        body.dataset.lastHadRows = '';
+      }}
       if (!j.running) clearInterval(window.__blindsiteTabsTimer);
     }}catch(e){{}}
+    finally{{ trackedTabsRefreshInFlight = false; }}
   }}
   refreshTrackedTabs();
   window.__blindsiteTabsTimer = setInterval(refreshTrackedTabs, 2000);
@@ -5695,7 +7017,7 @@ def live_detail(request: Request, sid: str, msg: str | None = None) -> HTMLRespo
       </script>
     </div>"""
     cap_rows = "".join(f"<tr><td><a href='/evidence/{c['evidence_id']}/page-render'>Open renderer</a></td><td><a href='/evidence/{c['evidence_id']}'>Evidence #{c['evidence_id']}</a></td><td>{h(c['capture_mode'])}</td><td>{badge('raw','warn') if c['raw_persisted'] else badge('safe summary','good')}</td><td>{h(c['created_at'])}</td><td class='urlcell'>{h(c['page_url'])}</td><td class='hashcell'><code>{h(c['sha256'])}</code></td></tr>" for c in captures)
-    ev_rows = "".join(f"<tr><td>{h(e['created_at'])}</td><td>{h(e['event_type'])}</td><td>{h(e['resource_type'])}</td><td>{h(e['status_code'] or '')}</td><td class='urlcell'>{h(e['url'] or '')}</td><td class='hashcell'><code>{h(e['header_sha256'] or '')}</code></td></tr>" for e in events)
+    ev_rows = "".join(f"<tr><td>{h(e['created_at'])}</td><td>{h(e['event_type'])}</td><td>{h(e['resource_type'])}</td><td>{h(e['status_code'] or '')}</td><td class='urlcell'>{h(e['url'] or '')}</td><td class='hashcell'>{event_header_hash_html(e['headers_json'], e['header_sha256'])}</td></tr>" for e in events)
     bm_stats = blocked_media_session_stats(sid)
     bm_type_counts = blocked_media_session_file_type_counts(sid)
     bm_type_chips = render_blocked_media_type_chips(bm_type_counts)
@@ -5718,7 +7040,13 @@ def live_detail(request: Request, sid: str, msg: str | None = None) -> HTMLRespo
           <button name='action' value='selected' class='warn'>Retry selected</button>
           <button name='action' value='all_not_downloaded' class='good' onclick='return confirm("Retry all not-downloaded media in this live session? This queues as many as the current background limit allows.")'>Retry all not downloaded in session</button>
           <button name='action' value='all_queue_full' class='good' onclick='return confirm("Retry all queue-full media in this live session? This queues as many as the current background limit allows.")'>Retry all queue-full in session</button>
-          <button type='button' class='good' id='autoRetryBtn' onclick='toggleAutoRetryBlockedMedia()'>Auto refresh + retry queue-full</button>
+          <label class='small'>Auto retry mode
+            <select id='autoRetryMode' class='compact-input' style='max-width:190px'>
+              <option value='all_queue_full' selected>Queue-full only</option>
+              <option value='all_not_downloaded'>All not-downloaded</option>
+            </select>
+          </label>
+          <button type='button' class='good' id='autoRetryBtn' onclick='toggleAutoRetryBlockedMedia()'>Start auto retry</button>
           <span id='autoRetryStatus' class='small muted'></span>
         </div>
         <div class='table-scroll'><table><tr><th>Select</th><th>ID</th><th>Type</th><th>File type</th><th>State</th><th>Reason</th><th>URL</th><th>URL Hash</th></tr><tbody id='blocked-media-rows'>{bm_rows}</tbody></table></div>
@@ -5776,17 +7104,23 @@ def live_detail(request: Request, sid: str, msg: str | None = None) -> HTMLRespo
         }} catch(e) {{}}
       }}
       let blindSiteAutoRetryTimer = null;
-      async function retryQueueFullOnce(){{
+      let blindSiteAutoRetryAdvancedConfirmed = false;
+      function autoRetryActionLabel(action){{
+        return action === 'all_not_downloaded' ? 'all not-downloaded' : 'queue-full only';
+      }}
+      async function retryAutoOnce(){{
         const status = document.getElementById('autoRetryStatus');
+        const mode = document.getElementById('autoRetryMode');
+        const action = mode ? mode.value : 'all_queue_full';
         try {{
           const fd = new FormData();
-          fd.append('action','all_queue_full');
+          fd.append('action', action);
           const r = await fetch('/live/{sid}/blocked-media/retry-json', {{method:'POST', body:fd, cache:'no-store'}});
           const j = await r.json();
           if (status) {{
             if (j.ok) {{
               const res = j.result || {{}};
-              status.textContent = `auto-retry: queued=${{res.queued || 0}}, queue-full=${{res.queue_full || 0}}, errors=${{res.errors || 0}}`;
+              status.textContent = `auto-retry (${{autoRetryActionLabel(action)}}): queued=${{res.queued || 0}}, queue-full=${{res.queue_full || 0}}, skipped=${{res.skipped || 0}}, errors=${{res.errors || 0}}`;
             }} else {{
               status.textContent = 'auto-retry unavailable: ' + (j.error || 'unknown error');
             }}
@@ -5797,24 +7131,36 @@ def live_detail(request: Request, sid: str, msg: str | None = None) -> HTMLRespo
       function toggleAutoRetryBlockedMedia(){{
         const btn = document.getElementById('autoRetryBtn');
         const status = document.getElementById('autoRetryStatus');
+        const mode = document.getElementById('autoRetryMode');
+        const action = mode ? mode.value : 'all_queue_full';
         if (blindSiteAutoRetryTimer) {{
           clearInterval(blindSiteAutoRetryTimer);
           blindSiteAutoRetryTimer = null;
-          if (btn) btn.textContent = 'Auto refresh + retry queue-full';
+          if (btn) btn.textContent = 'Start auto retry';
+          if (mode) mode.disabled = false;
           if (status) status.textContent = 'auto-retry stopped';
           return;
         }}
+        if (action === 'all_not_downloaded' && !blindSiteAutoRetryAdvancedConfirmed) {{
+          const ok = confirm('Auto retry all not-downloaded media is aggressive. It can repeatedly retry items that may have failed because of MIME rules, size limits, server errors, auth failures, or unsupported references. Continue?');
+          if (!ok) {{
+            if (status) status.textContent = 'auto-retry not started';
+            return;
+          }}
+          blindSiteAutoRetryAdvancedConfirmed = true;
+        }}
         if (btn) btn.textContent = 'Stop auto retry';
-        if (status) status.textContent = 'auto-retry running every 5s';
-        retryQueueFullOnce();
-        blindSiteAutoRetryTimer = setInterval(retryQueueFullOnce, 5000);
+        if (mode) mode.disabled = true;
+        if (status) status.textContent = `auto-retry running every 5s (${{autoRetryActionLabel(action)}})`;
+        retryAutoOnce();
+        blindSiteAutoRetryTimer = setInterval(retryAutoOnce, 5000);
       }}
       setInterval(refreshBlockedMediaTable, 2500);
       </script>
     </div>"""
     body = f"""{flash(msg)}<div class='card'><h2>Live session {h(sid)}</h2><p>{badge(row['status'],'good' if row['status']=='running' else 'warn')} {badge(row['browser_choice'])} {badge('Tor','info') if row['use_tor'] else badge('Direct')} {badge(row['media_policy'],'good')} {badge('saves allowed media','warn') if jloads(row.get('meta_json'),{}).get('download_allowed_media') else ""}</p><p><b>Case:</b> {h(row.get('case_name') or '')}</p><p><b>Start:</b> <span class='mono'>{h(row['start_url'])}</span></p><p><b>Current:</b> <span class='mono'>{h(row.get('current_url') or '')}</span></p><p><b>User agent:</b> <span class='mono'>{h((jloads(row.get('meta_json'),{}).get('user_agent_label') or jloads(row.get('meta_json'),{}).get('user_agent_profile') or 'default'))}</span> <span class='small muted'>SHA-256 {h((jloads(row.get('meta_json'),{}).get('user_agent_sha256') or '')[:24])}</span></p><p><a class='button good' href='/live/{sid}/pages'>Open session page viewer</a></p>{runtime}<div class='noprint'>{controls}</div>{preservation_panel}<p class='small muted'>Browse in the popped-up browser. Each time you click Capture Current Page, a saved-page evidence item is created below. This build does not block scripts, stylesheets, documents, XHR, or fetch requests.</p></div>
     <div class='card'><h2>Saved page captures from this session</h2><p class='small muted'>Click Open saved page to load the capture exactly as the program saved it: raw HTML in lab mode or a safe reconstructed summary in compliance-safe mode.</p><div class='table-scroll'><table><tr><th>Viewer</th><th>Evidence</th><th>Capture mode</th><th>Raw state</th><th>Captured</th><th>Page URL</th><th>Evidence SHA-256</th></tr>{cap_rows or '<tr><td colspan="7" class="muted">No saved pages yet. Use Capture Current Page while the session is running.</td></tr>'}</table></div></div>
-    <div class='grid'><div class='card'><h2>Network/session events</h2><p class='small muted'>Scroll sideways for full URLs and header hashes.</p><div class='table-scroll'><table><tr><th>Time</th><th>Event</th><th>Type</th><th>Status</th><th>URL</th><th>Header hash</th></tr>{ev_rows}</table></div></div>{blocked_media_panel}</div>"""
+    <div class='grid'><div class='card'><h2>Network/session events</h2><p class='small muted'>Scroll sideways for full URLs. Navigation-only rows may show “No headers captured”; response rows with captured headers show a header SHA-256.</p><div class='table-scroll'><table><tr><th>Time</th><th>Event</th><th>Type</th><th>Status</th><th>URL</th><th>Header hash</th></tr>{ev_rows}</table></div></div>{blocked_media_panel}</div>"""
     return layout(request, f"Live {sid}", body)
 
 
@@ -5921,8 +7267,8 @@ def sessions_alias(request: Request) -> HTMLResponse:
 
 
 @app.post("/sessions/start")
-def sessions_start_alias(request: Request, case_id: str = Form(""), start_url: str = Form(...), browser_choice: str = Form("chromium"), media_policy: str = Form("block_images_video"), use_tor: str | None = Form(None), headless: str | None = Form(None), download_allowed_media: str | None = Form(None), sealed_media_preservation_session: str | None = Form(None), auto_capture: str | None = Form(None), settle_before_capture: str | None = Form(None), capture_auto_scroll_session: str | None = Form(None), user_agent_profile: str = Form(""), custom_user_agent: str = Form("")) -> RedirectResponse:
-    return live_start(request, case_id, start_url, browser_choice, media_policy, use_tor, headless, download_allowed_media, sealed_media_preservation_session, auto_capture, settle_before_capture, capture_auto_scroll_session, user_agent_profile, custom_user_agent)
+def sessions_start_alias(request: Request, case_id: str = Form(""), start_url: str = Form(...), browser_choice: str = Form("chromium"), media_policy: str = Form("block_images_video"), use_tor: str | None = Form(None), headless: str | None = Form(None), download_allowed_media: str | None = Form(None), sealed_media_preservation_session: str | None = Form(None), allow_captcha_challenge_media: str | None = Form(None), auto_capture: str | None = Form(None), settle_before_capture: str | None = Form(None), capture_auto_scroll_session: str | None = Form(None), user_agent_profile: str = Form(""), custom_user_agent: str = Form("")) -> RedirectResponse:
+    return live_start(request, case_id, start_url, browser_choice, media_policy, use_tor, headless, download_allowed_media, sealed_media_preservation_session, allow_captcha_challenge_media, auto_capture, settle_before_capture, capture_auto_scroll_session, user_agent_profile, custom_user_agent)
 
 
 @app.get("/sessions/{sid}", response_class=HTMLResponse)
@@ -6073,8 +7419,6 @@ def reveal_allowed(user: dict[str, Any], ev: dict[str, Any], mode: str, master_k
                 return False, "approved full reveal request required"
             if not verify_master_key(master_key):
                 return False, "organization master reveal key required for sealed-preserved media"
-            if user.get("require_webauthn"):
-                return False, "hardware-key/WebAuthn step-up required by account policy"
             return True, "sealed-preserved media full reveal allowed by organization master-key workflow"
         return False, "sealed-preserved media supports only blocked mode or master-key full reveal in organization mode"
     if mode == "blur":
@@ -6099,9 +7443,6 @@ def reveal_allowed(user: dict[str, Any], ev: dict[str, Any], mode: str, master_k
         if setting_bool("require_master_key_full_reveal", "1") or user.get("require_master_key"):
             if not verify_master_key(master_key):
                 return False, "admin master reveal key required"
-        if user.get("require_webauthn"):
-            # Hook exists; full enforcement can be backed by fido2/WebAuthn enrollment.
-            return False, "hardware-key/WebAuthn step-up required by account policy"
         return True, "full reveal allowed"
     return False, "unknown view mode"
 
@@ -6179,8 +7520,8 @@ def evidence_page(request: Request, eid: int, mode: str = "blocked", token: str 
     meta_pre = h(pretty(meta_of(ev))[:20000])
     page_view_link = f"<p class='noprint'><a class='button good' href='/evidence/{eid}/page-render'>Open page renderer</a> <a class='button' href='/evidence/{eid}/capture-view'>Capture data</a> <a class='button' href='/evidence/{eid}/capture-frame' target='_blank'>Open safe frame</a></p>" if is_page_capture_evidence(ev) else ""
     body = f"""{flash(msg)}<div class='card'><h2>Evidence #{eid}</h2><p>{badge(ev['kind'])} {badge(ev['mime_type'])} {badge(ev['storage_mode'])} {badge('encrypted','good') if ev['encrypted'] else badge('not encrypted','warn')} {badge('raw persisted','warn') if ev['raw_persisted'] else badge('no raw root persisted','good')} {badge('quarantined','warn') if ev['quarantined'] else ''}</p><table><tr><th>Case</th><td>{('<a href="/cases/'+str(ev['case_id'])+'">#'+str(ev['case_id'])+'</a>') if ev.get('case_id') else ''}</td></tr><tr><th>Filename</th><td>{h(ev['filename'])}</td></tr><tr><th>Source</th><td>{h(ev['source_type'])}: {h(ev['source_ref'])}</td></tr><tr><th>SHA-256</th><td><code>{h(ev['sha256'])}</code></td></tr><tr><th>Size</th><td>{h(ev['size'])} bytes</td></tr><tr><th>Created</th><td>{h(ev['created_at'])}</td></tr></table>{page_view_link}</div>
-    <div class='card noprint'><h2>Controlled viewer</h2><p>{badge('compliance-safe','good') if case_safe(case) else badge('review/lab','warn')} {badge('original locked','warn') if ev['lock_direct_original_access'] else badge('original policy-dependent','info')}</p><div class='row'><form method='post' action='/evidence/{eid}/issue-token'><input type='hidden' name='mode' value='blocked'><button class='secondary'>Confirm blocked mode</button></form><form method='post' action='/evidence/{eid}/issue-token'><input type='hidden' name='mode' value='blur'><button {'disabled' if not can_blur else ''}>Blur preview</button><p class='small muted'>{h(blur_why)}</p></form></div><form method='post' action='/evidence/{eid}/issue-token' class='card danger'><h3>Full reveal/original bytes</h3><input type='hidden' name='mode' value='full'><label>Reason</label><input name='reason'><label>Admin master reveal key</label><input type='password' name='master_key'><button class='danger' {'disabled' if full_disabled else ''}>Issue full reveal token</button><p class='small muted'>{h(full_why_static)}</p></form><form method='post' action='/approvals/request'><input type='hidden' name='action' value='full_reveal'><input type='hidden' name='case_id' value='{h(ev.get('case_id') or '')}'><input type='hidden' name='evidence_id' value='{eid}'><label>Request supervisor approval</label><input name='reason' placeholder='Why access is needed'><button class='warn'>Request approval</button></form></div>{viewer}
-    <div class='card noprint'><h2>Export</h2><form method='post' action='/evidence/{eid}/export'><label><input type='checkbox' name='include_plaintext' value='1'> Include decrypted plaintext/originals where policy permits</label><label>Master key for plaintext export</label><input name='master_key' type='password'><button>Export evidence ZIP</button></form><form method='post' action='/evidence/{eid}/quarantine'><button class='warn'>{'Release from quarantine' if ev['quarantined'] else 'Quarantine'}</button></form></div>
+    <div class='card noprint'><h2>Controlled viewer</h2><p>{badge('compliance-safe','good') if case_safe(case) else badge('review/lab','warn')} {badge('original locked','warn') if ev['lock_direct_original_access'] else badge('original policy-dependent','info')}</p><div class='row'><form method='post' action='/evidence/{eid}/issue-token'><input type='hidden' name='mode' value='blocked'><button class='secondary'>Confirm blocked mode</button></form><form method='post' action='/evidence/{eid}/issue-token'><input type='hidden' name='mode' value='blur'><button {'disabled' if not can_blur else ''}>Blur preview</button><p class='small muted'>{h(blur_why)}</p></form></div><form method='post' action='/evidence/{eid}/issue-token' class='card danger' data-webauthn-action='full_reveal'><h3>Full reveal/original bytes</h3><input type='hidden' name='mode' value='full'><label>Reason</label><input name='reason'><label>Admin master reveal key</label><input type='password' name='master_key'><button class='danger' {'disabled' if full_disabled else ''}>Issue full reveal token</button><p class='small muted'>{h(full_why_static)}</p></form><form method='post' action='/approvals/request'><input type='hidden' name='action' value='full_reveal'><input type='hidden' name='case_id' value='{h(ev.get('case_id') or '')}'><input type='hidden' name='evidence_id' value='{eid}'><label>Request supervisor approval</label><input name='reason' placeholder='Why access is needed'><button class='warn'>Request approval</button></form></div>{viewer}
+    <div class='card noprint'><h2>Export</h2><form method='post' action='/evidence/{eid}/export' data-webauthn-action='plaintext_export' data-webauthn-if-checked='include_plaintext'><label><input type='checkbox' name='include_plaintext' value='1'> Include decrypted plaintext/originals where policy permits</label><label>Master key for plaintext export</label><input name='master_key' type='password'><button>Export evidence ZIP</button></form><form method='post' action='/evidence/{eid}/quarantine'><button class='warn'>{'Release from quarantine' if ev['quarantined'] else 'Quarantine'}</button></form></div>
     <div class='grid'><div class='card'><h2>Metadata</h2><pre>{meta_pre}</pre></div><div class='card'><h2>Derived artifacts</h2><table><tr><th>ID</th><th>Kind</th><th>MIME</th><th>SHA</th></tr>{d_rows}</table></div></div><div class='card'><h2>Child evidence</h2><table><tr><th>ID</th><th>Name</th><th>Kind</th><th>Storage</th></tr>{c_rows}</table></div><div class='card'><h2>Blocked media tied to this evidence</h2><table><tr><th>ID</th><th>Type</th><th>URL</th><th>Metadata hash</th><th>State</th></tr>{b_rows}</table></div><div class='card'><h2>Audit for this evidence</h2><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Event hash</th></tr>{a_rows}</table></div>"""
     return layout(request, f"Evidence #{eid}", body)
 
@@ -6288,7 +7629,7 @@ def page_viewer_render_block(request: Request, selected_id: int, *, back_url: st
     )
     exact_controls = ""
     if ok and not unlocked:
-        exact_controls = f"""<form class='card warn noprint' method='post' action='{back_url}/{selected_id}/unlock'>
+        exact_controls = f"""<form class='card warn noprint' method='post' action='{back_url}/{selected_id}/unlock' data-webauthn-action='exact_page_render'>
           <h3>Unlock exact local page render</h3>
           <p class='small muted'>Exact mode can show locally saved images, video, audio, CSS, and fonts from this capture. It does <b>not</b> contact the source website. Unlock is temporary and logged.</p>
           <input type='hidden' name='return_to' value='{h(str(request.url))}'>
@@ -6332,6 +7673,9 @@ def case_pages_unlock(request: Request, case_id: int, eid: int, master_key: str 
     ev = evidence_for(eid)
     if not ev or int(ev.get('case_id') or 0) != int(case_id):
         raise HTTPException(404, "Saved page not found in this case")
+    redir = webauthn_recent_or_redirect(request, user, "exact_page_render", f"/cases/{case_id}/pages?eid={eid}")
+    if redir:
+        return redir
     ok, why = render_assets_allowed(user, ev)
     if not ok:
         log_event(user["username"], "PAGE_RENDER_UNLOCK_DENIED", case_id=case_id, evidence_id=eid, details={"reason": why})
@@ -6371,6 +7715,9 @@ def live_pages_unlock(request: Request, sid: str, eid: int, master_key: str = Fo
     model = saved_capture_model(ev)
     if str((model.get('metadata') or {}).get('session_id') or '') != sid:
         raise HTTPException(403, "Saved page is not linked to this session")
+    redir = webauthn_recent_or_redirect(request, user, "exact_page_render", f"/live/{sid}/pages?eid={eid}")
+    if redir:
+        return redir
     ok, why = render_assets_allowed(user, ev)
     if not ok:
         log_event(user["username"], "PAGE_RENDER_UNLOCK_DENIED", case_id=ev.get('case_id'), evidence_id=eid, session_id=sid, details={"reason": why})
@@ -6401,7 +7748,7 @@ def evidence_page_renderer(request: Request, eid: int, msg: str | None = None, r
     asset_rows = "".join(f"<tr><td><a href='/evidence/{a['resource_evidence_id']}'>#{a['resource_evidence_id']}</a></td><td>{h(a['resource_type'])}</td><td>{h(a['mime_type'])}</td><td>{h(a['size'])}</td><td class='hashcell'><code>{h(a['sha256'])}</code></td><td class='urlcell'>{h(a['original_url'])}</td></tr>" for a in assets)
     unlock_form = ""
     if exact_available and not unlocked:
-        unlock_form = f"""<form class='card warn noprint' method='post' action='/evidence/{eid}/page-render/unlock'><h3>Unlock exact local renderer</h3><p class='small muted'>This uses saved local original assets only. It does not contact the source website. It can reveal locally saved images/video/audio from this capture.</p><label>Reason</label><input name='reason' placeholder='case note / reason'><label>Admin master key</label><input type='password' name='master_key' required><button class='warn'>Unlock for this session</button></form>"""
+        unlock_form = f"""<form class='card warn noprint' method='post' action='/evidence/{eid}/page-render/unlock' data-webauthn-action='exact_page_render'><h3>Unlock exact local renderer</h3><p class='small muted'>This uses saved local original assets only. It does not contact the source website. It can reveal locally saved images/video/audio from this capture.</p><label>Reason</label><input name='reason' placeholder='case note / reason'><label>Admin master key</label><input type='password' name='master_key' required><button class='warn'>Unlock for this session</button></form>"""
     elif exact_available and unlocked:
         unlock_form = f"<div class='card good noprint'><b>Exact local renderer unlocked for this browser session.</b> <a class='button good' href='/evidence/{eid}/page-render?render=exact'>Load exact local renderer</a></div>"
     else:
@@ -6417,6 +7764,9 @@ def evidence_page_renderer_unlock(request: Request, eid: int, master_key: str = 
     ev = evidence_for(eid)
     if not ev:
         raise HTTPException(404, "Evidence not found")
+    redir = webauthn_recent_or_redirect(request, user, "exact_page_render", f"/evidence/{eid}/page-render")
+    if redir:
+        return redir
     ok, why = render_assets_allowed(user, ev)
     if not ok:
         log_event(user["username"], "PAGE_RENDER_UNLOCK_DENIED", case_id=ev.get("case_id"), evidence_id=eid, details={"reason": why})
@@ -6532,6 +7882,10 @@ def issue_token(request: Request, eid: int, mode: str = Form(...), master_key: s
     ev = evidence_for(eid)
     if not ev:
         raise HTTPException(404, "Evidence not found")
+    if mode == "full":
+        redir = webauthn_recent_or_redirect(request, user, "full_reveal", f"/evidence/{eid}")
+        if redir:
+            return redir
     ok, why = reveal_allowed(user, ev, mode, master_key)
     if not ok:
         log_event(user["username"], "VIEW_TOKEN_DENIED", case_id=ev.get("case_id"), evidence_id=eid, details={"mode": mode, "reason": why, "user_reason": reason})
@@ -6595,6 +7949,9 @@ def export_evidence(request: Request, eid: int, include_plaintext: str | None = 
     case = case_for(ev.get("case_id"))
     want_plain = bool(include_plaintext)
     if want_plain:
+        redir = webauthn_recent_or_redirect(request, user, "plaintext_export", f"/evidence/{eid}")
+        if redir:
+            return redir
         if hard_sealed_escrow_evidence(ev):
             raise HTTPException(403, "Hard-sealed escrow evidence cannot be plaintext-exported from the local app; use sealed export and reviewer decrypt workflow")
         if sealed_preserved_media_evidence(ev):
@@ -6611,8 +7968,10 @@ def export_evidence(request: Request, eid: int, include_plaintext: str | None = 
             raise HTTPException(403, "Master key required for plaintext export")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        manifest = {"exported_at": utcnow(), "exported_by": user["username"], "evidence": ev, "case": case, "include_plaintext": want_plain, "audit_verification": verify_audit_chain()}
+        app_genesis = application_genesis_report(case_id=ev.get("case_id")) if ev.get("case_id") else application_genesis_report(investigation_id="global")
+        manifest = {"exported_at": utcnow(), "exported_by": user["username"], "evidence": ev, "case": case, "include_plaintext": want_plain, "audit_verification": verify_audit_chain(), "application_genesis": app_genesis, "executable_genesis_seal": app_genesis}
         z.writestr("manifest.json", pretty(manifest))
+        z.writestr("integrity/application_genesis.json", pretty(app_genesis))
         z.write(data_path(ev["object_path"]), f"encrypted_or_stored/{Path(ev['object_path']).name}")
         z.writestr("audit_for_evidence.json", pretty([dict(r) for r in fetchall("SELECT * FROM audit_events WHERE evidence_id=? ORDER BY id", (eid,))]))
         if want_plain:
@@ -6657,7 +8016,7 @@ def blocked_detail(request: Request, bid: int, msg: str | None = None) -> HTMLRe
     can_materialize = not (lockdown() and setting_bool("disable_materialization_in_lockdown", "1")) and not (case and (case.get("compliance_safe") or case.get("never_materialize_originals")))
     form = "<div class='card safe'><h2>Original materialization disabled</h2><p>This record remains metadata-only under current safe/lockdown policy.</p></div>"
     if can_materialize:
-        form = f"""<div class='card danger'><h2>Materialize original bytes</h2><p>This downloads the original body into evidence. Use only for approved lab/supervised workflows.</p><form method='post' action='/blocked/{bid}/materialize'><label>Reason</label><input name='reason' required><label>Master reveal key</label><input name='master_key' type='password'><label><input type='checkbox' name='use_tor' value='1'> Use Tor</label><button class='danger'>Download original into evidence</button></form><form method='post' action='/approvals/request'><input type='hidden' name='action' value='materialize_original'><input type='hidden' name='case_id' value='{h(bm.get('case_id') or '')}'><input type='hidden' name='blocked_media_id' value='{bid}'><label>Request approval</label><input name='reason'><button class='warn'>Request materialization approval</button></form></div>"""
+        form = f"""<div class='card danger'><h2>Materialize original bytes</h2><p>This downloads the original body into evidence. Use only for approved lab/supervised workflows.</p><form method='post' action='/blocked/{bid}/materialize' data-webauthn-action='materialize_original'><label>Reason</label><input name='reason' required><label>Master reveal key</label><input name='master_key' type='password'><label><input type='checkbox' name='use_tor' value='1'> Use Tor</label><button class='danger'>Download original into evidence</button></form><form method='post' action='/approvals/request'><input type='hidden' name='action' value='materialize_original'><input type='hidden' name='case_id' value='{h(bm.get('case_id') or '')}'><input type='hidden' name='blocked_media_id' value='{bid}'><label>Request approval</label><input name='reason'><button class='warn'>Request materialization approval</button></form></div>"""
     body = f"{flash(msg)}<div class='card'><h2>Blocked media #{bid}</h2><p>{badge(bm['resource_type'])} {badge('not downloaded','good') if not bm['downloaded'] else badge('downloaded','warn')}</p><table><tr><th>URL</th><td>{h(bm['media_url'])}</td></tr><tr><th>URL SHA-256</th><td><code>{h(bm['url_sha256'])}</code></td></tr><tr><th>Metadata record SHA-256</th><td><code>{h(bm['metadata_record_hash'])}</code></td></tr><tr><th>Header SHA-256</th><td><code>{h(bm['header_sha256'])}</code></td></tr><tr><th>Content SHA-256</th><td>{h(bm['content_sha256'] or 'not available because body was not downloaded')}</td></tr></table><pre>{h(pretty(bm))}</pre></div>{form}"
     return layout(request, f"Blocked #{bid}", body)
 
@@ -6665,6 +8024,9 @@ def blocked_detail(request: Request, bid: int, msg: str | None = None) -> HTMLRe
 @app.post("/blocked/{bid}/materialize")
 def blocked_materialize(request: Request, bid: int, reason: str = Form(...), master_key: str = Form(""), use_tor: str | None = Form(None)) -> RedirectResponse:
     user = require_user(request)
+    redir = webauthn_recent_or_redirect(request, user, "materialize_original", f"/blocked/{bid}")
+    if redir:
+        return redir
     bm = rowdict(fetchone("SELECT * FROM blocked_media WHERE id=?", (bid,)))
     if not bm:
         raise HTTPException(404, "Blocked media record not found")
@@ -6702,7 +8064,8 @@ def approval_request(request: Request, action: str = Form(...), reason: str = Fo
     eid = int(evidence_id) if str(evidence_id).strip() else None
     bid = int(blocked_media_id) if str(blocked_media_id).strip() else None
     aid = execute("INSERT INTO approvals(case_id,evidence_id,blocked_media_id,action,requested_by,reason,status,created_at) VALUES(?,?,?,?,?,?,?,?)", (cid, eid, bid, action, user["username"], reason, "pending", utcnow()))
-    log_event(user["username"], "APPROVAL_REQUESTED", case_id=cid, evidence_id=eid, blocked_media_id=bid, details={"approval_id": aid, "action": action, "reason": reason})
+    app_genesis = application_genesis_report(case_id=cid) if cid else application_genesis_report(investigation_id="global")
+    log_event(user["username"], "APPROVAL_REQUESTED", case_id=cid, evidence_id=eid, blocked_media_id=bid, details={"approval_id": aid, "action": action, "reason": reason, "custody_access_request_json": {"approval_id": aid, "action": action, "reason": reason, "case_id": cid, "evidence_id": eid, "blocked_media_id": bid, "requested_by": user["username"], "custody_mode": custody_mode(), "application_genesis": app_genesis}})
     target = f"/evidence/{eid}" if eid else f"/blocked/{bid}" if bid else "/approvals"
     return RedirectResponse(target + "?msg=Approval%20requested", 303)
 
@@ -6755,7 +8118,28 @@ def report_data(case_id: int | None = None) -> dict[str, Any]:
         audit = [dict(r) for r in fetchall("SELECT * FROM audit_events ORDER BY id DESC LIMIT 1000")]
         page_captures = [dict(r) for r in page_capture_rows(limit=1000)]
         media_evidence = [dict(r) for r in saved_media_rows(limit=1000)]
-    return {"generated_at": utcnow(), "app": APP_NAME, "version": APP_VERSION, "case": case, "evidence": evidence, "page_captures": page_captures, "media_evidence": media_evidence, "blocked_media": blocked, "approvals": approvals, "audit_events": audit, "audit_verification": verify_audit_chain(), "settings_summary": {"edition": edition(), "hard_default_safe_mode": get_setting("hard_default_safe_mode", "1"), "default_media_policy": get_setting("default_media_policy", "block_images_video"), "default_user_agent_profile": get_setting("default_user_agent_profile", "chrome_windows")}}
+    app_genesis = application_genesis_report(case_id=case_id) if case_id else application_genesis_report(investigation_id="global")
+    return {
+        "generated_at": utcnow(),
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "case": case,
+        "evidence": evidence,
+        "page_captures": page_captures,
+        "media_evidence": media_evidence,
+        "blocked_media": blocked,
+        "approvals": approvals,
+        "audit_events": audit,
+        "audit_verification": verify_audit_chain(),
+        "application_genesis": app_genesis,
+        "executable_genesis_seal": app_genesis,
+        "settings_summary": {
+            "edition": edition(),
+            "hard_default_safe_mode": get_setting("hard_default_safe_mode", "1"),
+            "default_media_policy": get_setting("default_media_policy", "block_images_video"),
+            "default_user_agent_profile": get_setting("default_user_agent_profile", "chrome_windows"),
+        },
+    }
 
 
 @app.get("/reports", response_class=HTMLResponse)
@@ -6789,7 +8173,8 @@ def case_report(request: Request, case_id: int) -> HTMLResponse:
     bm_rows = "".join(f"<tr><td>#{r['id']}</td><td>{h(r['resource_type'])}</td><td>{h(r['policy'])}</td><td>{'yes' if r['downloaded'] else 'no'}</td><td><code>{h(r['metadata_record_hash'][:20])}…</code></td></tr>" for r in data["blocked_media"])
     page_rows = "".join(f"<tr><td><a href='/evidence/{r['evidence_id']}/page-render'>Open renderer</a></td><td>#{r['evidence_id']}</td><td>{h(r['title'] or r['filename'])}</td><td>{h(r['capture_mode'])}</td><td class='urlcell'>{h(r['page_url'])}</td></tr>" for r in data.get("page_captures", []))
     media_rows = "".join(f"<tr><td><a href='/evidence/{r['id']}'>#{r['id']}</a></td><td>{h(r['filename'])}</td><td>{h(r['kind'])}</td><td>{h(r['mime_type'])}</td><td><code>{h(r['sha256'][:20])}…</code></td></tr>" for r in data.get("media_evidence", []))
-    body = f"<div class='card'><h2>Case report: {h(data['case']['name'])}</h2><p>{badge('audit verified','good') if data['audit_verification']['ok'] else badge('audit problem','bad')}</p><p><a class='button' href='/cases/{case_id}/report.json'>JSON</a> <a class='button' href='/cases/{case_id}/report.csv'>CSV</a> <a class='button' href='/cases/{case_id}/report.zip'>Report-only ZIP with saved pages</a> <a class='button good' href='/captures?case_id={case_id}'>Saved pages</a> <a class='button' href='/media?case_id={case_id}'>Media</a> <a class='button warn' href='/cases/{case_id}/sealed-export'>Sealed LE Export</a></p><pre>{h(pretty(data['case']))}</pre></div><div class='card'><h2>Saved pages</h2><div class='table-scroll'><table><tr><th>Viewer</th><th>Evidence</th><th>Title</th><th>Mode</th><th>URL</th></tr>{page_rows or '<tr><td colspan="5" class="muted">No saved pages.</td></tr>'}</table></div></div><div class='card'><h2>Media evidence</h2><table><tr><th>ID</th><th>Filename</th><th>Kind</th><th>MIME</th><th>SHA</th></tr>{media_rows or '<tr><td colspan="5" class="muted">No saved media evidence.</td></tr>'}</table></div><div class='card'><h2>Evidence</h2><table><tr><th>ID</th><th>Filename</th><th>Kind</th><th>Storage</th><th>SHA</th></tr>{ev_rows}</table></div><div class='card'><h2>Blocked media</h2><table><tr><th>ID</th><th>Type</th><th>Policy</th><th>Downloaded</th><th>Metadata hash</th></tr>{bm_rows}</table></div>"
+    genesis_block = application_genesis_html_block(data.get("application_genesis"))
+    body = f"<div class='card'><h2>Case report: {h(data['case']['name'])}</h2><p>{badge('audit verified','good') if data['audit_verification']['ok'] else badge('audit problem','bad')}</p><p><a class='button' href='/cases/{case_id}/report.json'>JSON</a> <a class='button' href='/cases/{case_id}/report.csv'>CSV</a> <a class='button' href='/cases/{case_id}/report.zip'>Report-only ZIP with saved pages</a> <a class='button good' href='/captures?case_id={case_id}'>Saved pages</a> <a class='button' href='/media?case_id={case_id}'>Media</a> <a class='button warn' href='/cases/{case_id}/sealed-export'>Sealed LE Export</a></p><pre>{h(pretty(data['case']))}</pre></div><div class='card'>{genesis_block}</div><div class='card'><h2>Saved pages</h2><div class='table-scroll'><table><tr><th>Viewer</th><th>Evidence</th><th>Title</th><th>Mode</th><th>URL</th></tr>{page_rows or '<tr><td colspan="5" class="muted">No saved pages.</td></tr>'}</table></div></div><div class='card'><h2>Media evidence</h2><table><tr><th>ID</th><th>Filename</th><th>Kind</th><th>MIME</th><th>SHA</th></tr>{media_rows or '<tr><td colspan="5" class="muted">No saved media evidence.</td></tr>'}</table></div><div class='card'><h2>Evidence</h2><table><tr><th>ID</th><th>Filename</th><th>Kind</th><th>Storage</th><th>SHA</th></tr>{ev_rows}</table></div><div class='card'><h2>Blocked media</h2><table><tr><th>ID</th><th>Type</th><th>Policy</th><th>Downloaded</th><th>Metadata hash</th></tr>{bm_rows}</table></div>"
     return layout(request, f"Case {case_id} Report", body)
 
 
@@ -6826,6 +8211,10 @@ def csv_response(data: dict[str, Any], filename: str) -> StreamingResponse:
 @app.post("/cases/{case_id}/rendered-export")
 def case_rendered_export(request: Request, case_id: int, include_assets: str | None = Form(None), master_key: str = Form("")) -> StreamingResponse:
     user = require_user(request)
+    if include_assets:
+        redir = webauthn_recent_or_redirect(request, user, "exact_page_render", f"/cases/{case_id}")
+        if redir:
+            return redir
     case = case_for(case_id)
     if not case:
         raise HTTPException(404, "Case not found")
@@ -7038,7 +8427,8 @@ def sealed_html_summary(manifest: dict[str, Any]) -> str:
     case = manifest.get("case") or {}
     ev_rows = "".join(f"<tr><td>#{h(o.get('id'))}</td><td>{h(o.get('filename'))}</td><td>{h(o.get('object_class'))}</td><td>{h(o.get('mime_type'))}</td><td><code>{h(o.get('logical_sha256'))}</code></td><td>{h(o.get('zip_path'))}</td></tr>" for o in manifest.get("objects", []))
     bm_rows = "".join(f"<tr><td>#{h(b.get('id'))}</td><td>{h(b.get('resource_type'))}</td><td>{h(b.get('downloaded'))}</td><td>{h(b.get('media_url'))}</td><td><code>{h(b.get('metadata_record_hash'))}</code></td></tr>" for b in manifest.get("blocked_media", [])[:1000])
-    return f"""<!doctype html><html><head><meta charset='utf-8'><title>BlindSite Sealed Export</title><style>body{{font-family:Arial;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:6px;vertical-align:top}}code{{word-break:break-all}}.warn{{background:#fff3cd;border:1px solid #d6b656;padding:10px}}</style></head><body><h1>BlindSite Sealed Evidence Export</h1><div class='warn'>This report is metadata only. Original evidence bytes are included only as encrypted vault objects.</div><h2>Case</h2><p><b>ID:</b> {h(case.get('id'))}<br><b>Name:</b> {h(case.get('name'))}<br><b>Custody:</b> {h(manifest.get('custody_mode'))}<br><b>Escrow fingerprint:</b> <code>{h(manifest.get('escrow_public_key_fingerprint'))}</code></p><h2>Encrypted objects</h2><table><tr><th>ID</th><th>Filename</th><th>Class</th><th>MIME</th><th>Logical SHA-256</th><th>ZIP path</th></tr>{ev_rows}</table><h2>Blocked/media records</h2><table><tr><th>ID</th><th>Type</th><th>Downloaded</th><th>URL</th><th>Metadata hash</th></tr>{bm_rows}</table></body></html>"""
+    genesis_block = application_genesis_html_block(manifest.get("application_genesis"))
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>BlindSite Sealed Export</title><style>body{{font-family:Arial;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:6px;vertical-align:top}}code{{word-break:break-all}}.warn{{background:#fff3cd;border:1px solid #d6b656;padding:10px;margin:12px 0}}</style></head><body><h1>BlindSite Sealed Evidence Export</h1><div class='warn'>This report is metadata only. Original evidence bytes are included only as encrypted vault objects.</div><h2>Case</h2><p><b>ID:</b> {h(case.get('id'))}<br><b>Name:</b> {h(case.get('name'))}<br><b>Custody:</b> {h(manifest.get('custody_mode'))}<br><b>Escrow fingerprint:</b> <code>{h(manifest.get('escrow_public_key_fingerprint'))}</code></p>{genesis_block}<h2>Encrypted objects</h2><table><tr><th>ID</th><th>Filename</th><th>Class</th><th>MIME</th><th>Logical SHA-256</th><th>ZIP path</th></tr>{ev_rows}</table><h2>Blocked/media records</h2><table><tr><th>ID</th><th>Type</th><th>Downloaded</th><th>URL</th><th>Metadata hash</th></tr>{bm_rows}</table></body></html>"""
 
 
 def build_sealed_case_package(case_id: int, actor: str, recipient: str = "", reason: str = "", recipient_public_key_pem: str = "") -> tuple[bytes, dict[str, Any]]:
@@ -7050,6 +8440,7 @@ def build_sealed_case_package(case_id: int, actor: str, recipient: str = "", rea
     if hard_fps and keymat["escrow_public_key_fingerprint"] not in hard_fps:
         raise HTTPException(400, "This case contains hard-sealed evidence encrypted to escrow fingerprint(s) " + ", ".join(sorted(hard_fps)) + ". Use the matching escrow public key for sealed export so the reviewer private key can recover all objects.")
     created_at = utcnow()
+    app_genesis = application_genesis_report(case_id=case_id)
     objects: list[dict[str, Any]] = []
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -7068,6 +8459,8 @@ def build_sealed_case_package(case_id: int, actor: str, recipient: str = "", rea
             "recipient": recipient,
             "reason": reason,
             "case_id": case_id,
+            "application_genesis": app_genesis,
+            "executable_genesis_seal": app_genesis,
             "case": data["case"],
             "custody_mode": custody_mode(),
             "civilian_unknown_master_key_mode": civilian_unknown_master_mode(),
@@ -7103,6 +8496,7 @@ def build_sealed_case_package(case_id: int, actor: str, recipient: str = "", rea
         manifest_text = pretty(manifest)
         z.writestr("manifest.json", manifest_text)
         z.writestr("manifest_sha256.txt", sha256_text(manifest_text) + "\n")
+        z.writestr("integrity/application_genesis.json", pretty(app_genesis))
         z.writestr("case/report.json", pretty(report_data(case_id)))
         z.writestr("case/all_case_records.json", pretty(data))
         z.writestr("reports/sealed_export_summary.html", sealed_html_summary(manifest))
@@ -7121,6 +8515,11 @@ Created by: {actor}
 Recipient: {recipient or 'not specified'}
 Custody mode: {custody_label()}
 Escrow public key fingerprint: {keymat['escrow_public_key_fingerprint']}
+Application Genesis Hash: {app_genesis.get('executable_sha256') or 'UNAVAILABLE'}
+Executable Genesis Seal: {app_genesis.get('genesis_hash') or app_genesis.get('event_hash') or 'UNAVAILABLE'}
+
+Verification helper:
+{app_genesis.get('verification_statement') or ''}
 
 This package is intended for law enforcement, counsel, USCM, or another cleared reviewer.
 It contains actual stored evidence objects, but only in encrypted form. It does not include plaintext originals.
@@ -7139,7 +8538,7 @@ Suggested review command:
 python BlindSite.py decrypt-sealed blindsite_case_{case_id}_sealed_evidence.zip --private-key escrow_private_key.pem --out decrypted_case_{case_id} --decrypt-evidence --i-understand
 """)
     payload = buf.getvalue()
-    summary = {"case_id": case_id, "package_sha256": sha256_bytes(payload), "package_size": len(payload), "object_count": len(objects), "sealed_preserved_media_count": sum(1 for e in data["evidence"] if e.get("storage_mode") == SEALED_PRESERVED_STORAGE_MODE), "hard_sealed_escrow_evidence_count": sum(1 for o in objects if o.get("hard_sealed_escrow_evidence")), "hard_sealed_civilian_evidence_count": sum(1 for o in objects if o.get("hard_sealed_civilian_evidence")), "hard_sealed_organization_media_count": sum(1 for o in objects if o.get("hard_sealed_organization_media")), "recipient": recipient, "reason": reason, "custody_mode": custody_mode(), "escrow_public_key_fingerprint": keymat["escrow_public_key_fingerprint"]}
+    summary = {"case_id": case_id, "package_sha256": sha256_bytes(payload), "package_size": len(payload), "application_genesis": app_genesis, "object_count": len(objects), "sealed_preserved_media_count": sum(1 for e in data["evidence"] if e.get("storage_mode") == SEALED_PRESERVED_STORAGE_MODE), "hard_sealed_escrow_evidence_count": sum(1 for o in objects if o.get("hard_sealed_escrow_evidence")), "hard_sealed_civilian_evidence_count": sum(1 for o in objects if o.get("hard_sealed_civilian_evidence")), "hard_sealed_organization_media_count": sum(1 for o in objects if o.get("hard_sealed_organization_media")), "recipient": recipient, "reason": reason, "custody_mode": custody_mode(), "escrow_public_key_fingerprint": keymat["escrow_public_key_fingerprint"]}
     return payload, summary
 
 
@@ -7155,13 +8554,16 @@ def sealed_export_page(request: Request, case_id: int) -> HTMLResponse:
     else:
         fp = get_setting("escrow_public_key_fingerprint", "") or escrow_public_fingerprint(get_setting("escrow_public_key_pem", "") or load_bundled_escrow_public_key())
         fp_note = "Paste a recipient/agency public key below for Organization-Controlled exports if no default is configured."
-    body = f"""<div class='card safe'><h2>Sealed law-enforcement evidence export</h2><p>This exports the actual stored evidence blobs in encrypted form so a civilian can hand evidence to law enforcement/USCM without local plaintext reveal.</p><p>{badge(custody_label(),'info')} {badge('No plaintext originals in ZIP','good')} {badge('Encrypted evidence blobs included','warn')}</p><p><b>Default escrow public-key fingerprint:</b> <code>{h(fp or 'not configured')}</code><br><span class='small muted'>{h(fp_note)}</span></p><form method='post' action='/cases/{case_id}/sealed-export'><label>Recipient / agency</label><input name='recipient' placeholder='Law enforcement / agency / counsel'><label>Reason / handoff note</label><textarea name='reason'></textarea><label>Optional recipient/agency public key PEM</label><textarea name='recipient_public_key_pem' rows='8' placeholder='Organization mode can paste a recipient public key here. Civilian mode uses the USCM escrow public key only.'></textarea><button class='good'>Download sealed encrypted evidence ZIP</button></form></div>"""
+    body = f"""<div class='card safe'><h2>Sealed law-enforcement evidence export</h2><p>This exports the actual stored evidence blobs in encrypted form so a civilian can hand evidence to law enforcement/USCM without local plaintext reveal.</p><p>{badge(custody_label(),'info')} {badge('No plaintext originals in ZIP','good')} {badge('Encrypted evidence blobs included','warn')}</p><p><b>Default escrow public-key fingerprint:</b> <code>{h(fp or 'not configured')}</code><br><span class='small muted'>{h(fp_note)}</span></p><form method='post' action='/cases/{case_id}/sealed-export' data-webauthn-action='sealed_export'><label>Recipient / agency</label><input name='recipient' placeholder='Law enforcement / agency / counsel'><label>Reason / handoff note</label><textarea name='reason'></textarea><label>Optional recipient/agency public key PEM</label><textarea name='recipient_public_key_pem' rows='8' placeholder='Organization mode can paste a recipient public key here. Civilian mode uses the USCM escrow public key only.'></textarea><button class='good'>Download sealed encrypted evidence ZIP</button></form></div>"""
     return layout(request, "Sealed Evidence Export", body)
 
 
 @app.post("/cases/{case_id}/sealed-export")
 def sealed_export_download(request: Request, case_id: int, recipient: str = Form(""), reason: str = Form(""), recipient_public_key_pem: str = Form("")) -> StreamingResponse:
     user = require_user(request)
+    redir = webauthn_recent_or_redirect(request, user, "sealed_export", f"/cases/{case_id}/sealed-export")
+    if redir:
+        return redir
     package, summary = build_sealed_case_package(case_id, user["username"], recipient.strip(), reason.strip(), recipient_public_key_pem.strip())
     log_event(user["username"], "SEALED_EVIDENCE_PACKAGE_EXPORTED", case_id=case_id, details=summary)
     return StreamingResponse(io.BytesIO(package), media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=blindsite_case_{case_id}_sealed_evidence.zip"})
@@ -7225,15 +8627,78 @@ def reviewer_import_is_password_protected(imp: dict[str, Any] | None) -> bool:
     return bool(reviewer_import_password_hash(imp))
 
 
+def reviewer_import_webauthn_protected(imp: dict[str, Any] | None) -> bool:
+    notes = reviewer_import_notes(imp)
+    return truthy(notes.get("review_case_webauthn_protected", "0"))
+
+
+def reviewer_import_is_protected(imp: dict[str, Any] | None) -> bool:
+    return reviewer_import_is_password_protected(imp) or reviewer_import_webauthn_protected(imp)
+
+
+def reviewer_import_unlock_timeout_seconds() -> int:
+    # 0 disables inactivity locking. Default is 15 minutes.
+    return safe_int(get_setting("reviewer_import_unlock_timeout_seconds", "900"), 900, min_value=0, max_value=86400)
+
+
 def reviewer_import_session_key(import_id: int) -> str:
     return f"reviewer_import_unlocked_{int(import_id)}"
 
 
+def reviewer_import_unlock_session(request: Request, import_id: int, username: str, method: str) -> None:
+    now = time.time()
+    request.session[reviewer_import_session_key(import_id)] = {
+        "unlocked": True,
+        "user": username,
+        "method": method,
+        "unlocked_at": now,
+        "last_activity": now,
+    }
+
+
+def reviewer_import_lock_session(request: Request, import_id: int) -> None:
+    request.session.pop(reviewer_import_session_key(import_id), None)
+
+
+def reviewer_import_session_info(request: Request, import_id: int) -> dict[str, Any]:
+    raw = request.session.get(reviewer_import_session_key(import_id))
+    if isinstance(raw, dict):
+        return dict(raw)
+    if raw:
+        # Backward-compatible legacy unlock session value from earlier builds.
+        now = time.time()
+        info = {"unlocked": True, "user": request.session.get("username") or "", "method": "legacy", "unlocked_at": now, "last_activity": now}
+        request.session[reviewer_import_session_key(import_id)] = info
+        return info
+    return {}
+
+
 def reviewer_import_is_unlocked(request: Request, import_id: int, imp: dict[str, Any] | None = None) -> bool:
     imp = imp or reviewer_import_for(import_id)
-    if not reviewer_import_is_password_protected(imp):
+    if not reviewer_import_is_protected(imp):
         return True
-    return bool(request.session.get(reviewer_import_session_key(import_id)))
+    info = reviewer_import_session_info(request, import_id)
+    if not info.get("unlocked"):
+        return False
+    username = str(request.session.get("username") or "")
+    if info.get("user") and username and str(info.get("user")) != username:
+        reviewer_import_lock_session(request, import_id)
+        return False
+    timeout_s = reviewer_import_unlock_timeout_seconds()
+    now = time.time()
+    try:
+        last_activity = float(info.get("last_activity") or info.get("unlocked_at") or 0)
+    except Exception:
+        last_activity = 0.0
+    if timeout_s and last_activity and now - last_activity > timeout_s:
+        reviewer_import_lock_session(request, import_id)
+        user = current_user(request)
+        if user:
+            log_event(user["username"], "REVIEWER_IMPORT_UNLOCK_TIMEOUT", details={"reviewer_import_id": import_id, "timeout_seconds": timeout_s})
+        return False
+    info["last_activity"] = now
+    request.session[reviewer_import_session_key(import_id)] = info
+    return True
 
 
 def require_reviewer_import_unlocked(request: Request, import_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -7241,7 +8706,7 @@ def require_reviewer_import_unlocked(request: Request, import_id: int) -> tuple[
     imp = reviewer_import_for(import_id)
     if not imp:
         raise HTTPException(404, "Reviewer import not found")
-    if reviewer_import_is_password_protected(imp) and not reviewer_import_is_unlocked(request, import_id, imp):
+    if reviewer_import_is_protected(imp) and not reviewer_import_is_unlocked(request, import_id, imp):
         raise HTTPException(423, f"Reviewer import is locked. Unlock at /reviewer/imports/{import_id}/unlock")
     return user, imp
 
@@ -7257,6 +8722,46 @@ def set_reviewer_import_password(import_id: int, password: str, actor: str = "")
     if actor:
         notes["review_case_password_set_by"] = actor
     execute("UPDATE reviewer_imports SET notes_json=? WHERE id=?", (pretty(notes), import_id))
+
+
+def set_reviewer_import_webauthn_protection(import_id: int, enabled: bool, actor: str = "") -> None:
+    imp = reviewer_import_for(import_id)
+    notes = reviewer_import_notes(imp)
+    notes["review_case_webauthn_protected"] = bool(enabled)
+    notes["review_case_webauthn_updated_at"] = utcnow()
+    if actor:
+        notes["review_case_webauthn_updated_by"] = actor
+    execute("UPDATE reviewer_imports SET notes_json=? WHERE id=?", (pretty(notes), import_id))
+
+
+def reviewer_import_protection_badges(request: Request, imp: dict[str, Any] | sqlite3.Row | None) -> str:
+    impd = dict(imp) if isinstance(imp, sqlite3.Row) else (imp or {})
+    import_id = int(impd.get("id") or 0)
+    bits: list[str] = []
+    if reviewer_import_is_password_protected(impd):
+        bits.append(badge("password protected", "warn"))
+    if reviewer_import_webauthn_protected(impd):
+        bits.append(badge("YubiKey protected", "warn"))
+    if reviewer_import_is_protected(impd):
+        bits.append(badge("unlocked", "good") if reviewer_import_is_unlocked(request, import_id, impd) else badge("locked", "bad"))
+        timeout_s = reviewer_import_unlock_timeout_seconds()
+        bits.append(badge(("timeout off" if timeout_s == 0 else f"timeout {timeout_s}s"), "info"))
+    else:
+        bits.append(badge("no local reviewer lock", "info"))
+    return " ".join(bits)
+
+
+def reviewer_import_protection_panel(request: Request, import_id: int, imp: dict[str, Any]) -> str:
+    user = current_user(request) or {}
+    has_yubi = webauthn_user_has_credentials(str(user.get("username") or "")) if user else False
+    timeout_s = reviewer_import_unlock_timeout_seconds()
+    info = reviewer_import_session_info(request, import_id)
+    last = float(info.get("last_activity") or 0) if info else 0.0
+    remaining = max(0, int(timeout_s - (time.time() - last))) if timeout_s and last else (0 if timeout_s else -1)
+    remaining_text = "timeout disabled" if timeout_s == 0 else (f"locks after about {remaining}s of inactivity" if remaining else f"timeout {timeout_s}s")
+    yubi_disabled = "" if has_yubi else "disabled"
+    yubi_note = "" if has_yubi else "<p class='small muted'>Enroll a YubiKey/security key first from Settings → YubiKey to enable YubiKey protection for this import.</p>"
+    return f"""<div class='card warn noprint'><h2>Reviewer case protection</h2><p>{reviewer_import_protection_badges(request, imp)} <span class='small muted'>{h(remaining_text)}</span></p><p class='small muted'>This protects access to the imported LE reviewer case inside BlindSite. Unlock can use the review-case password or this user's enrolled YubiKey/security key when enabled.</p><form method='post' action='/reviewer/imports/{import_id}/protection'><label><input type='checkbox' name='review_case_yubikey' value='1' {'checked' if reviewer_import_webauthn_protected(imp) else ''} {yubi_disabled}> Require YubiKey/WebAuthn unlock for this imported case</label>{yubi_note}<button class='secondary'>Save reviewer case protection</button></form><form method='post' action='/reviewer/imports/{import_id}/lock' style='display:inline'><button class='warn'>Lock reviewer case now</button></form></div>"""
 
 
 def reviewer_object_for(object_id: int) -> dict[str, Any] | None:
@@ -9228,14 +10733,17 @@ def reviewer_object_frame_html(import_id: int, obj: dict[str, Any], mode: str = 
 def reviewer_page(request: Request, msg: str | None = None) -> HTMLResponse:
     user = require_reviewer(request)
     rows = fetchall("SELECT * FROM reviewer_imports ORDER BY id DESC LIMIT 100")
-    trs = "".join(f"<tr><td><a href='/reviewer/imports/{r['id']}/viewer'>#{r['id']}</a></td><td>{h(r['package_name'])}</td><td>{badge(r['status'],'good' if r['status']=='imported' else 'warn' if r['status']=='imported_with_errors' else 'bad' if r['status']=='error' else 'info')} {badge('locked','warn') if reviewer_import_is_password_protected(dict(r)) and not reviewer_import_is_unlocked(request, int(r['id']), dict(r)) else badge('unlocked','good') if reviewer_import_is_password_protected(dict(r)) else ''}</td><td>{h(r['case_name'] or '')}</td><td>{h(r['recovered_count'])}/{h(r['object_count'])}</td><td><a class='button good' href='/reviewer/imports/{r['id']}/pages'>Pages</a> <a class='button secondary' href='/reviewer/imports/{r['id']}/viewer'>Objects</a></td><td><code>{h((r['package_sha256'] or '')[:24])}…</code></td><td>{h(r['created_at'])}</td></tr>" for r in rows)
-    body = f"""{flash(msg)}<div class='card safe'><h2>Law-enforcement / cleared reviewer import</h2><p>Import a sealed BlindSite evidence package with the escrow private key. Recovered plaintext is written only into this local review vault and indexed for browsing.</p><form method='post' action='/reviewer/import' enctype='multipart/form-data'><label>Sealed evidence ZIP</label><input type='file' name='package' accept='.zip' required><label>Escrow private key PEM</label><input type='file' name='private_key' accept='.pem,.key,.txt' required><label>Private-key passphrase, if any</label><input type='password' name='passphrase'><label>Review case password (optional but recommended)</label><input type='password' name='review_case_password' placeholder='Protect this imported case in the LE viewer'><label>Confirm review case password</label><input type='password' name='review_case_password_confirm'><p class='small muted'>This password protects access to the imported LE reviewer case inside BlindSite. It does not encrypt recovered case files in this version.</p><label>Import note</label><textarea name='note' placeholder='Agency/case note'></textarea><button class='good'>Import and decrypt into review vault</button></form></div><div class='card'><h2>Reviewer imports</h2><table><tr><th>ID</th><th>Package</th><th>Status</th><th>Case</th><th>Recovered</th><th>Open</th><th>Package SHA-256</th><th>Imported</th></tr>{trs or '<tr><td colspan="8" class="muted">No reviewer imports yet.</td></tr>'}</table></div>"""
+    trs = "".join(f"<tr><td><a href='/reviewer/imports/{r['id']}/viewer'>#{r['id']}</a></td><td>{h(r['package_name'])}</td><td>{badge(r['status'],'good' if r['status']=='imported' else 'warn' if r['status']=='imported_with_errors' else 'bad' if r['status']=='error' else 'info')} {reviewer_import_protection_badges(request, dict(r))}</td><td>{h(r['case_name'] or '')}</td><td>{h(r['recovered_count'])}/{h(r['object_count'])}</td><td><a class='button good' href='/reviewer/imports/{r['id']}/pages'>Pages</a> <a class='button secondary' href='/reviewer/imports/{r['id']}/viewer'>Objects</a></td><td><code>{h((r['package_sha256'] or '')[:24])}…</code></td><td>{h(r['created_at'])}</td></tr>" for r in rows)
+    yubi_ready = webauthn_user_has_credentials(user["username"])
+    yubi_import_disabled = "" if yubi_ready else "disabled"
+    yubi_import_note = "" if yubi_ready else "<p class='small muted'>Enroll a YubiKey/security key first from Settings → YubiKey to use YubiKey protection on import.</p>"
+    body = f"""{flash(msg)}<div class='card safe'><h2>Law-enforcement / cleared reviewer import</h2><p>Import a sealed BlindSite evidence package with the escrow private key. Recovered plaintext is written only into this local review vault and indexed for browsing.</p><form method='post' action='/reviewer/import' enctype='multipart/form-data'><label>Sealed evidence ZIP</label><input type='file' name='package' accept='.zip' required><label>Escrow private key PEM</label><input type='file' name='private_key' accept='.pem,.key,.txt' required><label>Private-key passphrase, if any</label><input type='password' name='passphrase'><label>Review case password (optional but recommended)</label><input type='password' name='review_case_password' placeholder='Protect this imported case in the LE viewer'><label>Confirm review case password</label><input type='password' name='review_case_password_confirm'><label><input type='checkbox' name='review_case_yubikey' value='1' {yubi_import_disabled}> Protect this imported case with my YubiKey/WebAuthn key</label>{yubi_import_note}<p class='small muted'>Password/YubiKey protection controls access to the imported LE reviewer case inside BlindSite. Unlock expires after the configured inactivity timeout. This does not replace package cryptography or evidence hashes.</p><label>Import note</label><textarea name='note' placeholder='Agency/case note'></textarea><button class='good'>Import and decrypt into review vault</button></form></div><div class='card'><h2>Reviewer imports</h2><table><tr><th>ID</th><th>Package</th><th>Status</th><th>Case</th><th>Recovered</th><th>Open</th><th>Package SHA-256</th><th>Imported</th></tr>{trs or '<tr><td colspan="8" class="muted">No reviewer imports yet.</td></tr>'}</table></div>"""
     log_event(user["username"], "REVIEWER_AREA_OPENED")
     return layout(request, "LE Reviewer", body)
 
 
 @app.post("/reviewer/import")
-async def reviewer_import_route(request: Request, package: UploadFile = File(...), private_key: UploadFile = File(...), passphrase: str = Form(""), note: str = Form(""), review_case_password: str = Form(""), review_case_password_confirm: str = Form("")) -> RedirectResponse:
+async def reviewer_import_route(request: Request, package: UploadFile = File(...), private_key: UploadFile = File(...), passphrase: str = Form(""), note: str = Form(""), review_case_password: str = Form(""), review_case_password_confirm: str = Form(""), review_case_yubikey: str | None = Form(None)) -> RedirectResponse:
     user = require_reviewer(request)
     package_bytes = await package.read()
     private_pem = await private_key.read()
@@ -9248,11 +10756,20 @@ async def reviewer_import_route(request: Request, package: UploadFile = File(...
             raise HTTPException(400, "Review case passwords did not match")
         if len(review_case_password) < 6:
             raise HTTPException(400, "Review case password must be at least 6 characters")
+    if review_case_yubikey and not webauthn_user_has_credentials(user["username"]):
+        raise HTTPException(400, "Enroll a YubiKey/WebAuthn security key before enabling YubiKey protection for a reviewer import")
     import_id = reviewer_import_package(package_bytes, package.filename or "sealed_evidence.zip", private_pem, passphrase, user["username"], note)
+    protected_methods: list[str] = []
     if review_case_password:
         set_reviewer_import_password(import_id, review_case_password, user["username"])
-        request.session[reviewer_import_session_key(import_id)] = "1"
+        protected_methods.append("password")
         log_event(user["username"], "REVIEWER_IMPORT_PASSWORD_PROTECTED", details={"reviewer_import_id": import_id})
+    if review_case_yubikey:
+        set_reviewer_import_webauthn_protection(import_id, True, user["username"])
+        protected_methods.append("yubikey")
+        log_event(user["username"], "REVIEWER_IMPORT_YUBIKEY_PROTECTED", details={"reviewer_import_id": import_id})
+    if protected_methods:
+        reviewer_import_unlock_session(request, import_id, user["username"], "+".join(protected_methods))
     return RedirectResponse(f"/reviewer/imports/{import_id}/pages?msg=Sealed%20package%20imported", 303)
 
 
@@ -9265,14 +10782,33 @@ def reviewer_import_detail_alias(request: Request, import_id: int) -> HTMLRespon
 
 @app.get("/reviewer/imports/{import_id}/unlock", response_class=HTMLResponse)
 def reviewer_import_unlock_page(request: Request, import_id: int, msg: str | None = None) -> HTMLResponse:
-    require_reviewer(request)
+    user = require_reviewer(request)
     imp = reviewer_import_for(import_id)
     if not imp:
         raise HTTPException(404, "Reviewer import not found")
-    if not reviewer_import_is_password_protected(imp):
-        request.session[reviewer_import_session_key(import_id)] = "1"
+    if not reviewer_import_is_protected(imp):
+        reviewer_import_unlock_session(request, import_id, user["username"], "unprotected")
         return RedirectResponse(f"/reviewer/imports/{import_id}/viewer", 303)
-    body = f"""{flash(msg)}<div class='card warn'><h2>Unlock LE reviewer case import #{import_id}</h2><p>This imported review case is password protected. Enter the review-case password to access recovered pages, objects, reports, and media.</p><form method='post' action='/reviewer/imports/{import_id}/unlock'><label>Review case password</label><input type='password' name='review_password' autofocus required><button class='good'>Unlock import</button></form><p><a class='button secondary' href='/reviewer'>Back to LE reviewer imports</a></p></div>"""
+    timeout_s = reviewer_import_unlock_timeout_seconds()
+    timeout_text = "timeout disabled" if timeout_s == 0 else f"will lock after {timeout_s} seconds of inactivity"
+    password_form = ""
+    if reviewer_import_is_password_protected(imp):
+        password_form = f"""<div class='card'><h3>Password unlock</h3><form method='post' action='/reviewer/imports/{import_id}/unlock'><label>Review case password</label><input type='password' name='review_password' autofocus required><button class='good'>Unlock with password</button></form></div>"""
+    yubikey_form = ""
+    yubi_script = ""
+    if reviewer_import_webauthn_protected(imp):
+        if webauthn_user_has_credentials(user["username"]):
+            return_to = f"/reviewer/imports/{import_id}/unlock-yubikey"
+            # Escape the JSON string before placing it inside the HTML attribute.
+            # Without this, the double quotes from json.dumps(return_to) terminate
+            # the onclick attribute and the YubiKey button appears ready but does
+            # nothing when clicked.
+            return_to_js = h(json.dumps(return_to))
+            yubikey_form = f"""<div class='card'><h3>YubiKey / WebAuthn unlock</h3><p>Use your enrolled YubiKey/security key to unlock this LE reviewer case.</p><div id='webauthn-status'>{badge('ready','info')}</div><button class='good' type='button' onclick="bsAuthenticateKey('stepup','reviewer_import_unlock',{return_to_js});return false;">Unlock with YubiKey</button></div>"""
+            yubi_script = webauthn_browser_script(purpose="manual")
+        else:
+            yubikey_form = "<div class='card danger'><h3>YubiKey required</h3><p>This import allows YubiKey unlock, but this account has no enrolled key. Enroll one from Settings → YubiKey, or unlock with the review-case password if one was set.</p><p><a class='button warn' href='/webauthn'>Open YubiKey settings</a></p></div>"
+    body = f"""{flash(msg)}<div class='card warn'><h2>Unlock LE reviewer case import #{import_id}</h2><p>{reviewer_import_protection_badges(request, imp)}</p><p>This imported review case is protected. Unlock with the configured review-case password or YubiKey/security key. The unlock session {h(timeout_text)}.</p>{password_form}{yubikey_form}<p><a class='button secondary' href='/reviewer'>Back to LE reviewer imports</a></p></div>{yubi_script}"""
     return layout(request, "Unlock reviewer import", body)
 
 
@@ -9283,18 +10819,48 @@ def reviewer_import_unlock(request: Request, import_id: int, review_password: st
     if not imp:
         raise HTTPException(404, "Reviewer import not found")
     pw_hash = reviewer_import_password_hash(imp)
-    if not pw_hash or check_password(review_password or "", pw_hash):
-        request.session[reviewer_import_session_key(import_id)] = "1"
-        log_event(user["username"], "REVIEWER_IMPORT_UNLOCKED", details={"reviewer_import_id": import_id})
+    if not pw_hash:
+        return RedirectResponse(f"/reviewer/imports/{import_id}/unlock?msg=Password%20unlock%20is%20not%20configured%20for%20this%20case", 303)
+    if check_password(review_password or "", pw_hash):
+        reviewer_import_unlock_session(request, import_id, user["username"], "password")
+        log_event(user["username"], "REVIEWER_IMPORT_UNLOCKED", details={"reviewer_import_id": import_id, "method": "password", "timeout_seconds": reviewer_import_unlock_timeout_seconds()})
         return RedirectResponse(f"/reviewer/imports/{import_id}/viewer?msg=Reviewer%20case%20unlocked", 303)
-    log_event(user["username"], "REVIEWER_IMPORT_UNLOCK_FAILED", details={"reviewer_import_id": import_id})
+    log_event(user["username"], "REVIEWER_IMPORT_UNLOCK_FAILED", details={"reviewer_import_id": import_id, "method": "password"})
     return RedirectResponse(f"/reviewer/imports/{import_id}/unlock?msg=Invalid%20review%20case%20password", 303)
+
+
+@app.get("/reviewer/imports/{import_id}/unlock-yubikey")
+def reviewer_import_unlock_yubikey(request: Request, import_id: int) -> RedirectResponse:
+    user = require_reviewer(request)
+    imp = reviewer_import_for(import_id)
+    if not imp:
+        raise HTTPException(404, "Reviewer import not found")
+    if not reviewer_import_webauthn_protected(imp):
+        return RedirectResponse(f"/reviewer/imports/{import_id}/unlock?msg=YubiKey%20unlock%20is%20not%20enabled%20for%20this%20case", 303)
+    if not webauthn_step_up_valid(request, user):
+        return RedirectResponse(f"/webauthn/step-up?action=reviewer_import_unlock&return_to={quote('/reviewer/imports/' + str(import_id) + '/unlock-yubikey')}", 303)
+    reviewer_import_unlock_session(request, import_id, user["username"], "yubikey")
+    log_event(user["username"], "REVIEWER_IMPORT_UNLOCKED", details={"reviewer_import_id": import_id, "method": "yubikey", "timeout_seconds": reviewer_import_unlock_timeout_seconds()})
+    return RedirectResponse(f"/reviewer/imports/{import_id}/viewer?msg=Reviewer%20case%20unlocked%20with%20YubiKey", 303)
+
+
+@app.post("/reviewer/imports/{import_id}/protection")
+def reviewer_import_protection_update(request: Request, import_id: int, review_case_yubikey: str | None = Form(None)) -> RedirectResponse:
+    user, imp = require_reviewer_import_unlocked(request, import_id)
+    enable_yubi = bool(review_case_yubikey)
+    if enable_yubi and not webauthn_user_has_credentials(user["username"]):
+        raise HTTPException(400, "Enroll a YubiKey/WebAuthn security key before enabling YubiKey protection for a reviewer import")
+    set_reviewer_import_webauthn_protection(import_id, enable_yubi, user["username"])
+    if enable_yubi:
+        reviewer_import_unlock_session(request, import_id, user["username"], "yubikey-protection-updated")
+    log_event(user["username"], "REVIEWER_IMPORT_PROTECTION_UPDATED", details={"reviewer_import_id": import_id, "yubikey_protected": enable_yubi, "timeout_seconds": reviewer_import_unlock_timeout_seconds()})
+    return RedirectResponse(f"/reviewer/imports/{import_id}/viewer?msg=Reviewer%20case%20protection%20saved", 303)
 
 
 @app.post("/reviewer/imports/{import_id}/lock")
 def reviewer_import_lock(request: Request, import_id: int) -> RedirectResponse:
     user = require_reviewer(request)
-    request.session.pop(reviewer_import_session_key(import_id), None)
+    reviewer_import_lock_session(request, import_id)
     log_event(user["username"], "REVIEWER_IMPORT_LOCKED", details={"reviewer_import_id": import_id})
     return RedirectResponse(f"/reviewer/imports/{import_id}/unlock?msg=Reviewer%20case%20locked", 303)
 
@@ -9349,7 +10915,8 @@ def reviewer_pages_viewer(request: Request, import_id: int, page: str = "", rend
         media_table = f"""<div class='card'><h2>Associated recovered media for selected page</h2><p class='small muted'>This table is filtered to media tied to the selected captured page, instead of making reviewers browse every recovered image/video/audio object.</p><div class='table-scroll'><table><tr><th>Open</th><th>Kind</th><th>Filename</th><th>MIME</th><th>Size</th><th>Source</th><th>Match reason</th><th>SHA-256</th></tr>{media_rows or '<tr><td colspan="8" class="muted">No recovered media was associated with this page.</td></tr>'}</table></div></div><div class='card'><h2>Blocked-media records for selected page</h2><div class='table-scroll'><table><tr><th>ID</th><th>Type</th><th>State</th><th>URL</th><th>URL SHA-256</th></tr>{blocked_rows or '<tr><td colspan="5" class="muted">No blocked-media records matched this page.</td></tr>'}</table></div></div>"""
         selected_info = f"""<div class='card good'><h2>Selected captured page</h2><p>{badge(selected.get('kind'),'info')} {badge(selected.get('mime_type') or '')} {badge('associated media '+str(len(associated)),'warn' if associated else 'info')}</p><table><tr><th>Title</th><td>{h(ctx.get('title') or selected.get('filename') or '')}</td></tr><tr><th>Source URL</th><td class='urlcell'>{h(ctx.get('page_url') or selected.get('source_ref') or '')}</td></tr><tr><th>Page object</th><td>Reviewer object #{h(selected.get('id'))} / original evidence #{h(selected.get('original_id'))}</td></tr><tr><th>SHA-256</th><td class='hashcell'><code>{h(selected.get('sha256') or '')}</code></td></tr></table><p><a class='button' href='/reviewer/imports/{import_id}/viewer?obj={selected['id']}'>Object details</a> <a class='button' href='/reviewer/imports/{import_id}/objects/{selected['id']}/raw?download=1'>Download page object</a></p></div>{render_controls}"""
         log_event(user["username"], "REVIEWER_PAGE_VIEWER_OPENED", details={"reviewer_import_id": import_id, "page_object_id": selected["id"], "render": render, "remote_capture": remote_capture_enabled, "associated_media": len(associated)})
-    body = f"""{flash(msg)}<div class='card safe'><h2>LE Captured Page Viewer — import #{import_id}</h2><p>{badge(imp['status'],'good' if imp['status']=='imported' else 'warn')} {badge('pages '+str(len(pages)),'info')} {badge('case '+str(imp.get('case_id_original') or ''),'info') if imp.get('case_id_original') else ''}</p><p class='small muted'>This workspace is organized around captured pages first. Select a page on the left; the viewer renders the recovered page content and groups recovered images/video/audio associated with that page.</p><p><a class='button' href='/reviewer/imports/{import_id}/viewer'>All recovered objects</a> <a class='button good' href='/reviewer/imports/{import_id}/pages'>Captured page viewer</a></p><table><tr><th>Package</th><td>{h(imp['package_name'])}</td></tr><tr><th>Case</th><td>{h(imp.get('case_name') or '')}</td></tr><tr><th>Package SHA-256</th><td class='hashcell'><code>{h(imp['package_sha256'])}</code></td></tr></table></div><div class='card noprint'><h2>Find captured pages</h2><form><input type='hidden' name='render' value='{h(render)}'><input type='hidden' name='remote_capture' value='{1 if remote_capture_enabled else 0}'><label>Search page title, URL, filename, hash, or MIME</label><input name='q' value='{h(q)}'><button>Search pages</button></form></div><div class='grid' style='grid-template-columns:minmax(430px,40%) minmax(560px,1fr)'><div class='card'><h2>Captured pages</h2><form method='post' action='/reviewer/imports/{import_id}/pages/pdf-report/start' class='noprint'><div class='media-tools'><button class='good'>Generate PDF report from selected pages</button><a class='button secondary' href='/reviewer/imports/{import_id}/pages/pdf-report/jobs'>View PDF report queue</a><select name='render_mode'><option value='scripts' selected>Remote callbacks + scripts screenshot</option><option value='safe'>Local safe screenshot</option><option value='remote'>Remote callbacks screenshot</option></select><label class='small'><input type='checkbox' name='encrypt_pdf' value='1'> Encrypt PDF report</label><input class='compact-input' type='password' name='pdf_password' placeholder='PDF password'><input class='compact-input' type='password' name='pdf_password_confirm' placeholder='Confirm PDF password'><span class='small muted'>PDF uses screenshots of the rendered reviewer page. Select up to 20 pages; generation runs in the background with progress. Encryption is opt-in.</span></div><div class='table-scroll'><table><tr><th>Select</th><th>Load</th><th>Title</th><th>Capture</th><th>URL</th><th>SHA-256</th></tr>{''.join(page_rows) or '<tr><td colspan="6" class="muted">No recovered page captures matched this filter.</td></tr>'}</table></div></form></div><div><div>{selected_info or '<div class="card"><p class="muted">Select a recovered page to view it.</p></div>'}</div><div class='card'><h2>Rendered captured page</h2>{frame}</div></div></div>{media_table}"""
+    protection_panel = reviewer_import_protection_panel(request, import_id, imp)
+    body = f"""{flash(msg)}<div class='card safe'><h2>LE Captured Page Viewer — import #{import_id}</h2><p>{badge(imp['status'],'good' if imp['status']=='imported' else 'warn')} {badge('pages '+str(len(pages)),'info')} {badge('case '+str(imp.get('case_id_original') or ''),'info') if imp.get('case_id_original') else ''} {reviewer_import_protection_badges(request, imp)}</p><p class='small muted'>This workspace is organized around captured pages first. Select a page on the left; the viewer renders the recovered page content and groups recovered images/video/audio associated with that page.</p><p><a class='button' href='/reviewer/imports/{import_id}/viewer'>All recovered objects</a> <a class='button good' href='/reviewer/imports/{import_id}/pages'>Captured page viewer</a></p><table><tr><th>Package</th><td>{h(imp['package_name'])}</td></tr><tr><th>Case</th><td>{h(imp.get('case_name') or '')}</td></tr><tr><th>Package SHA-256</th><td class='hashcell'><code>{h(imp['package_sha256'])}</code></td></tr></table></div>{protection_panel}<div class='card noprint'><h2>Find captured pages</h2><form><input type='hidden' name='render' value='{h(render)}'><input type='hidden' name='remote_capture' value='{1 if remote_capture_enabled else 0}'><label>Search page title, URL, filename, hash, or MIME</label><input name='q' value='{h(q)}'><button>Search pages</button></form></div><div class='grid' style='grid-template-columns:minmax(430px,40%) minmax(560px,1fr)'><div class='card'><h2>Captured pages</h2><form method='post' action='/reviewer/imports/{import_id}/pages/pdf-report/start' class='noprint'><div class='media-tools'><button class='good'>Generate PDF report from selected pages</button><a class='button secondary' href='/reviewer/imports/{import_id}/pages/pdf-report/jobs'>View PDF report queue</a><select name='render_mode'><option value='scripts' selected>Remote callbacks + scripts screenshot</option><option value='safe'>Local safe screenshot</option><option value='remote'>Remote callbacks screenshot</option></select><label class='small'><input type='checkbox' name='encrypt_pdf' value='1'> Encrypt PDF report</label><input class='compact-input' type='password' name='pdf_password' placeholder='PDF password'><input class='compact-input' type='password' name='pdf_password_confirm' placeholder='Confirm PDF password'><span class='small muted'>PDF uses screenshots of the rendered reviewer page. Select up to 20 pages; generation runs in the background with progress. Encryption is opt-in.</span></div><div class='table-scroll'><table><tr><th>Select</th><th>Load</th><th>Title</th><th>Capture</th><th>URL</th><th>SHA-256</th></tr>{''.join(page_rows) or '<tr><td colspan="6" class="muted">No recovered page captures matched this filter.</td></tr>'}</table></div></form></div><div><div>{selected_info or '<div class="card"><p class="muted">Select a recovered page to view it.</p></div>'}</div><div class='card'><h2>Rendered captured page</h2>{frame}</div></div></div>{media_table}"""
     return layout(request, f"LE Pages Import #{import_id}", body)
 
 
@@ -9441,39 +11008,182 @@ def pdf_report_job_cancelled(job_id: str) -> bool:
         return str(job.get("status") or "") == "cancelled" or bool(job.get("cancel_requested"))
 
 
-async def playwright_screenshot_no_font_hang(page: Any, *, full_page: bool = True, timeout_ms: int = 12000) -> bytes:
+async def playwright_screenshot_no_font_hang(page: Any, *, full_page: bool = True, timeout_ms: int = 12000, full_width: bool = False, max_width: int = 2400, max_height: int = 24000) -> bytes:
     """Take a screenshot without letting web-font waits hang PDF report generation.
 
-    Playwright's page.screenshot can wait on document fonts and time out on heavy
-    Reddit/YouTube-style pages. We first try the normal API, then fall back to
-    Chromium CDP Page.captureScreenshot, which does not wait for font loading.
+    PDF reports need slightly different behavior from ordinary browser screenshots:
+    heavy dynamic pages can hang on fonts, and recovered reviewer pages can have
+    horizontal overflow wider than the default viewport. When full_width is set,
+    this expands/captures to the document scroll width within safe admin-configured
+    limits so the right side of the page is not cut off.
     """
+    first_exc: Exception | None = None
     try:
         with contextlib.suppress(Exception):
             await page.add_style_tag(content="""
                 * { font-family: Arial, Helvetica, sans-serif !important; }
+                html, body { overflow-x: visible !important; }
                 .blindsite-inline-star, .blindsite-star-media-btn { display:none !important; }
             """)
-        try:
-            return await page.screenshot(full_page=full_page, type="png", timeout=timeout_ms, scale="device")
-        except TypeError:
-            return await page.screenshot(full_page=full_page, type="png", timeout=timeout_ms)
-    except Exception as first_exc:
+        if full_page and full_width:
+            with contextlib.suppress(Exception):
+                dims = await page.evaluate("""() => ({
+                    width: Math.ceil(Math.max(
+                        document.documentElement ? document.documentElement.scrollWidth : 0,
+                        document.body ? document.body.scrollWidth : 0,
+                        window.innerWidth || 0
+                    )),
+                    height: Math.ceil(Math.max(
+                        document.documentElement ? document.documentElement.scrollHeight : 0,
+                        document.body ? document.body.scrollHeight : 0,
+                        window.innerHeight || 0
+                    )),
+                    viewportWidth: window.innerWidth || 0,
+                    viewportHeight: window.innerHeight || 0
+                })""")
+                wanted_w = max(int(dims.get("viewportWidth") or 0), int(dims.get("width") or 0), 1)
+                wanted_w = max(640, min(int(max_width or 2400), wanted_w))
+                wanted_h = max(600, min(12000, int(dims.get("viewportHeight") or PDF_REPORT_VIEWPORT_HEIGHT or 1600)))
+                await page.set_viewport_size({"width": wanted_w, "height": wanted_h})
+                await page.wait_for_timeout(250)
+    except Exception as exc:
+        first_exc = exc
+
+    # For full-width PDF report captures, prefer CDP. It can capture beyond the
+    # viewport and avoids several Playwright screenshot/font wait edge cases.
+    if full_page and full_width:
         try:
             client = await page.context.new_cdp_session(page)
             metrics = await client.send("Page.getLayoutMetrics")
             clip = metrics.get("contentSize") or {}
-            width = max(1, int(clip.get("width") or 1280))
-            height = max(1, min(int(clip.get("height") or 1600), 12000))
+            width = max(1, min(int(max_width or 2400), int(clip.get("width") or 1280)))
+            height = max(1, min(int(max_height or 24000), int(clip.get("height") or 1600)))
+            result = await client.send("Page.captureScreenshot", {
+                "format": "png",
+                "fromSurface": True,
+                "captureBeyondViewport": True,
+                "clip": {"x": 0, "y": 0, "width": width, "height": height, "scale": 1},
+            })
+            data = base64.b64decode(result.get("data") or "")
+            if data:
+                return data
+        except Exception as exc:
+            first_exc = exc
+
+    try:
+        try:
+            return await page.screenshot(full_page=full_page, type="png", timeout=timeout_ms, scale="device")
+        except TypeError:
+            return await page.screenshot(full_page=full_page, type="png", timeout=timeout_ms)
+    except Exception as normal_exc:
+        if first_exc is None:
+            first_exc = normal_exc
+        try:
+            client = await page.context.new_cdp_session(page)
+            metrics = await client.send("Page.getLayoutMetrics")
+            clip = metrics.get("contentSize") or {}
+            width = max(1, min(int(max_width or 2400), int(clip.get("width") or 1280)))
+            height = max(1, min(int(max_height or 24000), int(clip.get("height") or 1600)))
             result = await client.send("Page.captureScreenshot", {
                 "format": "png",
                 "fromSurface": True,
                 "captureBeyondViewport": bool(full_page),
                 "clip": {"x": 0, "y": 0, "width": width, "height": height, "scale": 1},
             })
-            return base64.b64decode(result.get("data") or "")
+            data = base64.b64decode(result.get("data") or "")
+            if data:
+                return data
+            raise RuntimeError("CDP screenshot returned no image data")
         except Exception as cdp_exc:
-            raise RuntimeError(f"screenshot failed; normal={first_exc}; cdp={cdp_exc}")
+            raise RuntimeError(f"screenshot failed; preflight={first_exc}; normal={normal_exc}; cdp={cdp_exc}")
+
+
+def pdf_report_runtime_settings() -> dict[str, int]:
+    """Settings used by the LE reviewer PDF report screenshot pipeline."""
+    return {
+        "navigation_timeout_ms": safe_int(get_setting("pdf_report_navigation_timeout_ms", "60000"), 60000, min_value=5000, max_value=300000),
+        "domcontentloaded_timeout_ms": safe_int(get_setting("pdf_report_domcontentloaded_timeout_ms", "20000"), 20000, min_value=1000, max_value=180000),
+        "scripts_wait_ms": safe_int(get_setting("pdf_report_scripts_wait_ms", "12000"), 12000, min_value=0, max_value=120000),
+        "safe_wait_ms": safe_int(get_setting("pdf_report_safe_wait_ms", "3000"), 3000, min_value=0, max_value=60000),
+        "screenshot_timeout_ms": safe_int(get_setting("pdf_report_screenshot_timeout_ms", "30000"), 30000, min_value=3000, max_value=180000),
+        "fallback_timeout_ms": safe_int(get_setting("pdf_report_fallback_timeout_ms", "30000"), 30000, min_value=3000, max_value=180000),
+        "full_width_capture": 1 if setting_bool("pdf_report_full_width_capture", "1") else 0,
+        "max_capture_width": safe_int(get_setting("pdf_report_max_capture_width", "2400"), 2400, min_value=640, max_value=8000),
+        "max_capture_height": safe_int(get_setting("pdf_report_max_capture_height", "24000"), 24000, min_value=1200, max_value=60000),
+        "pdf_page_width_px": safe_int(get_setting("pdf_report_pdf_page_width_px", "1224"), 1224, min_value=480, max_value=5000),
+        "pdf_page_height_px": safe_int(get_setting("pdf_report_pdf_page_height_px", "1584"), 1584, min_value=640, max_value=7000),
+        "pdf_margin_px": safe_int(get_setting("pdf_report_pdf_margin_px", "36"), 36, min_value=0, max_value=400),
+        "split_overlap_px": safe_int(get_setting("pdf_report_split_overlap_px", "24"), 24, min_value=0, max_value=300),
+    }
+
+
+def pdf_report_error_png_fallback(oid: int, error_text: str, cfg: dict[str, int] | None = None) -> bytes:
+    cfg = cfg or pdf_report_runtime_settings()
+    width = max(640, int(cfg.get("pdf_page_width_px") or PDF_REPORT_VIEWPORT_WIDTH or 1224))
+    height = max(800, min(1800, int(cfg.get("pdf_page_height_px") or 1584)))
+    im = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(im)
+    lines = [
+        f"BlindSite PDF render fallback — reviewer object #{oid}",
+        "",
+        "This reviewer page could not be rendered before the PDF timeout.",
+        "The PDF report was not aborted; this page records the render error for review.",
+        "",
+        str(error_text or "")[:5000],
+    ]
+    y = 34
+    for block in lines:
+        wrapped = textwrap.wrap(block, width=110) if block else [""]
+        for line in wrapped:
+            draw.text((36, y), line, fill="black")
+            y += 22
+            if y > height - 45:
+                break
+        if y > height - 45:
+            break
+    out = io.BytesIO()
+    im.save(out, format="PNG")
+    return out.getvalue()
+
+
+def pdf_report_pngs_to_pdf_pages(shots: list[tuple[int, bytes]], cfg: dict[str, int]) -> list[Image.Image]:
+    """Convert full-page screenshots into standard-size PDF pages.
+
+    Older builds embedded each full-page screenshot as one huge PDF page. PDF
+    viewers then looked horizontally cut off or awkwardly zoomed. This scales
+    each screenshot to a normal page width and splits tall screenshots into
+    multiple standard pages so no right side is lost.
+    """
+    resample_filter = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.BICUBIC)
+    page_w = max(480, int(cfg.get("pdf_page_width_px") or 1224))
+    page_h = max(640, int(cfg.get("pdf_page_height_px") or 1584))
+    margin = max(0, min(int(cfg.get("pdf_margin_px") or 36), min(page_w, page_h) // 4))
+    content_w = max(64, page_w - margin * 2)
+    content_h = max(64, page_h - margin * 2)
+    overlap = max(0, min(int(cfg.get("split_overlap_px") or 24), max(0, content_h // 3)))
+    pdf_pages: list[Image.Image] = []
+    for oid, png in shots:
+        im = Image.open(io.BytesIO(png)).convert("RGB")
+        max_h = PDF_REPORT_MAX_IMAGE_HEIGHT
+        if im.height > max_h:
+            ratio = max_h / float(im.height)
+            im = im.resize((max(1, int(im.width * ratio)), max_h), resample_filter)
+        if im.width != content_w:
+            ratio = content_w / float(max(1, im.width))
+            im = im.resize((content_w, max(1, int(im.height * ratio))), resample_filter)
+        y = 0
+        step = max(1, content_h - overlap)
+        while y < im.height:
+            crop_h = min(content_h, im.height - y)
+            crop = im.crop((0, y, im.width, y + crop_h))
+            page_img = Image.new("RGB", (page_w, page_h), "white")
+            x = margin + max(0, (content_w - crop.width) // 2)
+            page_img.paste(crop, (x, margin))
+            pdf_pages.append(page_img)
+            if y + crop_h >= im.height:
+                break
+            y += step
+    return pdf_pages
 
 
 def build_reviewer_pages_pdf_report_core(
@@ -9490,6 +11200,7 @@ def build_reviewer_pages_pdf_report_core(
         raise HTTPException(400, "No valid reviewer page objects selected for PDF report")
     if len(valid_ids) > PDF_REPORT_MAX_PAGES:
         raise HTTPException(400, f"PDF report supports up to {PDF_REPORT_MAX_PAGES} pages at once")
+    cfg = pdf_report_runtime_settings()
 
     def emit(**data: Any) -> None:
         if progress:
@@ -9522,35 +11233,80 @@ def build_reviewer_pages_pdf_report_core(
             cookie_items = [{"name": n, "value": v, "url": base + "/"} for n, v in (cookies or {}).items()]
             if cookie_items:
                 await context.add_cookies(cookie_items)
-            page = await context.new_page()
+
+            async def _html_error_screenshot(oid: int, error_text: str) -> bytes:
+                fallback = f"""<!doctype html><html><head><meta charset='utf-8'><title>BlindSite PDF render fallback</title></head><body style='font-family:Arial,Helvetica,sans-serif;padding:40px;background:white;color:black;line-height:1.45'><h1>BlindSite PDF render fallback</h1><p><b>Reviewer object:</b> #{h(oid)}</p><p>This page could not be rendered before the PDF timeout. The report continues and records the error below.</p><pre style='white-space:pre-wrap;border:1px solid #ccc;padding:12px;background:#f5f5f5'>{html_mod.escape(error_text)}</pre></body></html>"""
+                err_page = None
+                try:
+                    err_page = await context.new_page()
+                    try:
+                        await err_page.set_content(fallback, wait_until="domcontentloaded", timeout=min(10000, int(cfg["fallback_timeout_ms"])))
+                    except Exception:
+                        await err_page.goto("data:text/html;charset=utf-8," + quote(fallback), wait_until="commit", timeout=min(10000, int(cfg["fallback_timeout_ms"])))
+                    await err_page.wait_for_timeout(250)
+                    return await playwright_screenshot_no_font_hang(err_page, full_page=True, timeout_ms=int(cfg["screenshot_timeout_ms"]), full_width=False, max_width=int(cfg["max_capture_width"]), max_height=int(cfg["max_capture_height"]))
+                except Exception as fallback_exc:
+                    return pdf_report_error_png_fallback(oid, f"{error_text}\nHTML fallback renderer error: {fallback_exc}", cfg)
+                finally:
+                    if err_page is not None:
+                        with contextlib.suppress(Exception):
+                            await err_page.close()
+
             try:
                 for idx, oid in enumerate(valid_ids, start=1):
                     check_cancelled()
                     emit(phase="rendering_page", current=idx - 1, total=len(valid_ids), page_object_id=oid, message=f"Rendering page {idx}/{len(valid_ids)}")
                     url = f"{base}/reviewer/imports/{import_id}/pages/{oid}/frame?mode={quote(render_mode)}&remote_capture={1 if render_mode == 'scripts' else 0}"
+                    page = await context.new_page()
                     try:
-                        await page.goto(url, wait_until="commit", timeout=35000)
-                        with contextlib.suppress(Exception):
-                            await page.wait_for_load_state("domcontentloaded", timeout=12000)
-                        await page.wait_for_timeout(9000 if render_mode == "scripts" else 2200)
-                        check_cancelled()
-                        emit(phase="screenshotting_page", current=idx - 1, total=len(valid_ids), page_object_id=oid, message=f"Screenshotting page {idx}/{len(valid_ids)}")
-                        png = await playwright_screenshot_no_font_hang(page, full_page=True, timeout_ms=12000)
-                        if render_mode == "scripts" and screenshot_is_mostly_blank_white(png):
-                            emit(phase="fallback_safe_render", current=idx - 1, total=len(valid_ids), page_object_id=oid, message=f"Dynamic render blanked; falling back to local safe render for page {idx}/{len(valid_ids)}")
-                            safe_url = f"{base}/reviewer/imports/{import_id}/pages/{oid}/frame?mode=safe&remote_capture=0"
-                            await page.goto(safe_url, wait_until="commit", timeout=30000)
+                        try:
+                            await page.goto(url, wait_until="commit", timeout=int(cfg["navigation_timeout_ms"]))
                             with contextlib.suppress(Exception):
-                                await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                            await page.wait_for_timeout(2500)
-                            png = await playwright_screenshot_no_font_hang(page, full_page=True, timeout_ms=12000)
-                        shots.append((oid, png))
-                        emit(phase="page_done", current=idx, total=len(valid_ids), page_object_id=oid, message=f"Captured page {idx}/{len(valid_ids)}")
-                    except Exception as exc:
-                        emit(phase="page_error", current=idx, total=len(valid_ids), page_object_id=oid, message=f"Page {idx}/{len(valid_ids)} failed: {str(exc)[:240]}")
-                        fallback = f"<html><body style='font-family:Arial;padding:40px'><h1>BlindSite PDF render error</h1><p>Reviewer object #{oid}</p><p>{html_mod.escape(str(exc))}</p></body></html>"
-                        await page.set_content(fallback)
-                        shots.append((oid, await playwright_screenshot_no_font_hang(page, full_page=True, timeout_ms=8000)))
+                                await page.wait_for_load_state("domcontentloaded", timeout=int(cfg["domcontentloaded_timeout_ms"]))
+                            wait_ms = int(cfg["scripts_wait_ms"] if render_mode == "scripts" else cfg["safe_wait_ms"])
+                            if wait_ms:
+                                await page.wait_for_timeout(wait_ms)
+                            check_cancelled()
+                            emit(phase="screenshotting_page", current=idx - 1, total=len(valid_ids), page_object_id=oid, message=f"Screenshotting page {idx}/{len(valid_ids)}")
+                            png = await playwright_screenshot_no_font_hang(page, full_page=True, timeout_ms=int(cfg["screenshot_timeout_ms"]), full_width=bool(cfg.get("full_width_capture")), max_width=int(cfg["max_capture_width"]), max_height=int(cfg["max_capture_height"]))
+                            if render_mode == "scripts" and screenshot_is_mostly_blank_white(png):
+                                emit(phase="fallback_safe_render", current=idx - 1, total=len(valid_ids), page_object_id=oid, message=f"Dynamic render blanked; falling back to local safe render for page {idx}/{len(valid_ids)}")
+                                safe_url = f"{base}/reviewer/imports/{import_id}/pages/{oid}/frame?mode=safe&remote_capture=0"
+                                await page.goto(safe_url, wait_until="commit", timeout=int(cfg["fallback_timeout_ms"]))
+                                with contextlib.suppress(Exception):
+                                    await page.wait_for_load_state("domcontentloaded", timeout=min(int(cfg["domcontentloaded_timeout_ms"]), int(cfg["fallback_timeout_ms"])))
+                                if int(cfg["safe_wait_ms"]):
+                                    await page.wait_for_timeout(int(cfg["safe_wait_ms"]))
+                                png = await playwright_screenshot_no_font_hang(page, full_page=True, timeout_ms=int(cfg["screenshot_timeout_ms"]), full_width=bool(cfg.get("full_width_capture")), max_width=int(cfg["max_capture_width"]), max_height=int(cfg["max_capture_height"]))
+                            shots.append((oid, png))
+                            emit(phase="page_done", current=idx, total=len(valid_ids), page_object_id=oid, message=f"Captured page {idx}/{len(valid_ids)}")
+                        except Exception as exc:
+                            primary_error = str(exc)
+                            emit(phase="page_error", current=idx, total=len(valid_ids), page_object_id=oid, message=f"Page {idx}/{len(valid_ids)} failed: {primary_error[:240]}")
+                            safe_error = ""
+                            if render_mode != "safe":
+                                try:
+                                    check_cancelled()
+                                    emit(phase="fallback_safe_render", current=idx - 1, total=len(valid_ids), page_object_id=oid, message=f"Dynamic render failed; trying local safe render for page {idx}/{len(valid_ids)}")
+                                    safe_url = f"{base}/reviewer/imports/{import_id}/pages/{oid}/frame?mode=safe&remote_capture=0"
+                                    await page.goto(safe_url, wait_until="commit", timeout=int(cfg["fallback_timeout_ms"]))
+                                    with contextlib.suppress(Exception):
+                                        await page.wait_for_load_state("domcontentloaded", timeout=min(int(cfg["domcontentloaded_timeout_ms"]), int(cfg["fallback_timeout_ms"])))
+                                    if int(cfg["safe_wait_ms"]):
+                                        await page.wait_for_timeout(int(cfg["safe_wait_ms"]))
+                                    png = await playwright_screenshot_no_font_hang(page, full_page=True, timeout_ms=int(cfg["screenshot_timeout_ms"]), full_width=bool(cfg.get("full_width_capture")), max_width=int(cfg["max_capture_width"]), max_height=int(cfg["max_capture_height"]))
+                                    shots.append((oid, png))
+                                    emit(phase="page_done", current=idx, total=len(valid_ids), page_object_id=oid, message=f"Captured page {idx}/{len(valid_ids)} with safe fallback")
+                                    continue
+                                except Exception as safe_exc:
+                                    safe_error = str(safe_exc)
+                                    emit(phase="fallback_safe_failed", current=idx - 1, total=len(valid_ids), page_object_id=oid, message=f"Safe fallback failed for page {idx}/{len(valid_ids)}: {safe_error[:220]}")
+                            fallback_text = f"Primary render error: {primary_error}" + (f"\nSafe fallback error: {safe_error}" if safe_error else "")
+                            shots.append((oid, await _html_error_screenshot(oid, fallback_text)))
+                            emit(phase="page_done_with_fallback", current=idx, total=len(valid_ids), page_object_id=oid, message=f"Captured render-error fallback for page {idx}/{len(valid_ids)}")
+                    finally:
+                        with contextlib.suppress(Exception):
+                            await page.close()
             finally:
                 await browser.close()
         return shots
@@ -9566,15 +11322,9 @@ def build_reviewer_pages_pdf_report_core(
     if not shots:
         raise HTTPException(500, "No page screenshots were produced for PDF report")
     emit(phase="building_pdf", current=len(valid_ids), total=len(valid_ids), message="Building PDF from screenshots")
-    images = []
-    resample_filter = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.BICUBIC)
-    for oid, png in shots:
-        im = Image.open(io.BytesIO(png)).convert("RGB")
-        max_h = PDF_REPORT_MAX_IMAGE_HEIGHT
-        if im.height > max_h:
-            ratio = max_h / float(im.height)
-            im = im.resize((max(1, int(im.width * ratio)), max_h), resample_filter)
-        images.append(im)
+    images = pdf_report_pngs_to_pdf_pages(shots, cfg)
+    if not images:
+        raise HTTPException(500, "No PDF pages were produced from screenshots")
     out = io.BytesIO()
     images[0].save(
         out,
@@ -9584,9 +11334,11 @@ def build_reviewer_pages_pdf_report_core(
         resolution=PDF_REPORT_DPI,
         quality=PDF_REPORT_JPEG_QUALITY,
     )
+    for im in images:
+        with contextlib.suppress(Exception):
+            im.close()
     emit(phase="pdf_done", current=len(valid_ids), total=len(valid_ids), message="PDF report generated")
     return out.getvalue()
-
 
 def encrypt_pdf_report_bytes(pdf: bytes, password: str) -> bytes:
     password = password or ""
@@ -9630,6 +11382,7 @@ def run_reviewer_pdf_report_job(job_id: str) -> None:
     try:
         pdf_report_job_update(job_id, status="running", phase="starting", current=0, total=len(valid_ids), progress_percent=0, started_at=utcnow(), message="Starting PDF report")
         pdf_report_job_log(job_id, f"Starting PDF report job with {len(valid_ids)} page(s), render mode {render_mode}")
+        pdf_report_job_log(job_id, "PDF settings: " + json.dumps(pdf_report_runtime_settings(), sort_keys=True))
 
         def progress(ev: dict[str, Any]) -> None:
             current = int(ev.get("current") or 0)
@@ -9700,6 +11453,7 @@ def reviewer_pages_pdf_report_start(request: Request, import_id: int, page_ids: 
             "updated_at": utcnow(),
             "logs": [{"time": utcnow(), "message": "PDF report job queued"}],
             "message": "PDF report job queued",
+            "pdf_report_settings": pdf_report_runtime_settings(),
         }
     threading.Thread(target=run_reviewer_pdf_report_job, args=(job_id,), name=f"blindsite-pdf-report-{job_id}", daemon=True).start()
     log_event(user["username"], "REVIEWER_PAGES_PDF_REPORT_QUEUED", details={"reviewer_import_id": import_id, "page_object_ids": valid_ids, "render_mode": render_mode, "job_id": job_id, "encrypt_pdf": encrypt_pdf_enabled})
@@ -9980,7 +11734,8 @@ def reviewer_viewer(request: Request, import_id: int, kind: str = "all", q: str 
         selected_tags = normalize_hashtags(selected.get("hashtags") or "")
         selected_star = bool(selected.get("starred"))
         selected_info = f"""<div class='card'><h2>Selected object #{selected['id']}</h2><p>{badge(selected['kind'],'info')} {badge(reviewer_effective_mime_type(selected))} {badge('hash ok','good') if selected['hash_ok'] else badge('hash mismatch','bad')} {badge('starred','warn') if selected_star else ''} {hashtag_badges(selected_tags)}</p><p class='small muted'>Star and hashtag controls are in the Recovered objects table on the left.</p><table><tr><th>Filename</th><td>{h(selected['filename'])}</td></tr><tr><th>Source / URL</th><td class='urlcell'>{h(selected.get('source_ref') or selected.get('page_url') or selected.get('original_url') or '')}</td></tr><tr><th>SHA-256</th><td class='hashcell'><code>{h(selected['sha256'])}</code></td></tr><tr><th>Original package object</th><td>{h(selected['object_class'])} #{h(selected['original_id'])}</td></tr></table><p><a class='button' href='/reviewer/imports/{import_id}/objects/{selected['id']}/raw?download=1'>Download recovered object</a>{' <a class="button good" href="/reviewer/imports/'+str(import_id)+'/pages?page='+str(selected['id'])+'">Open captured-page viewer</a>' if selected.get('kind') == 'page' else ''}</p></div>{render_controls}<div class='card'><h2>Embedded viewer</h2>{panel}</div><div class='card'><h2>Object metadata</h2><pre>{selected_meta}</pre></div>"""
-    body = f"""{flash(msg)}<div class='card safe'><h2>LE Case Viewer — import #{import_id}</h2><p>{badge(imp['status'],'good' if imp['status']=='imported' else 'warn')} {badge('objects '+str(imp['recovered_count']),'info')} {badge('case '+str(imp.get('case_id_original') or ''),'info') if imp.get('case_id_original') else ''}</p><p><a class='button good' href='/reviewer/imports/{import_id}/pages'>Open captured page viewer</a> <a class='button secondary' href='/reviewer/imports/{import_id}/viewer?kind=pages'>Filter page objects</a></p><table><tr><th>Package</th><td>{h(imp['package_name'])}</td></tr><tr><th>Case</th><td>{h(imp.get('case_name') or '')}</td></tr><tr><th>Package SHA-256</th><td class='hashcell'><code>{h(imp['package_sha256'])}</code></td></tr><tr><th>Escrow public-key fingerprint</th><td class='hashcell'><code>{h(imp.get('escrow_public_key_fingerprint') or '')}</code></td></tr></table></div><div class='card noprint'><h2>Browse recovered evidence</h2><p>{''.join(filter_links)}</p><form><input type='hidden' name='kind' value='{h(kind)}'><input type='hidden' name='render' value='{h(render)}'><input type='hidden' name='remote_capture' value='{1 if remote_capture_enabled else 0}'><div class='row'><div><label>Search filename, URL/source, hash, MIME, kind, or tag</label><input name='q' value='{h(q)}'></div><div><label>Hashtag</label><input name='hashtag' value='{h(tag_filter)}' placeholder='#priority'></div><div><label>Extensions / MIME tokens</label><input name='exts' value='{h(ext_filter_text)}' placeholder='mp4, jpg, webp'></div><div><label><input type='checkbox' name='starred' value='1' {'checked' if star_filter else ''}> Starred only</label><button>Search</button></div></div></form></div><div class='grid' style='grid-template-columns:minmax(500px,50%) minmax(480px,1fr)'><div class='card'><h2>Recovered objects</h2><div class='table-scroll'><table><tr><th>Thumb</th><th>Open</th><th>Star / tags</th><th>Kind</th><th>Filename</th><th>Type</th><th>Size</th><th>Hash</th><th>Source</th><th>SHA-256</th></tr>{''.join(obj_rows) or '<tr><td colspan="10" class="muted">No recovered objects match this filter.</td></tr>'}</table></div></div><div>{selected_info or '<div class="card"><p class="muted">Select an object to view it.</p></div>'}</div></div><div class='card'><h2>Sealed package manifest</h2><pre>{manifest_pre}</pre></div>"""
+    protection_panel = reviewer_import_protection_panel(request, import_id, imp)
+    body = f"""{flash(msg)}<div class='card safe'><h2>LE Case Viewer — import #{import_id}</h2><p>{badge(imp['status'],'good' if imp['status']=='imported' else 'warn')} {badge('objects '+str(imp['recovered_count']),'info')} {badge('case '+str(imp.get('case_id_original') or ''),'info') if imp.get('case_id_original') else ''} {reviewer_import_protection_badges(request, imp)}</p><p><a class='button good' href='/reviewer/imports/{import_id}/pages'>Open captured page viewer</a> <a class='button secondary' href='/reviewer/imports/{import_id}/viewer?kind=pages'>Filter page objects</a></p><table><tr><th>Package</th><td>{h(imp['package_name'])}</td></tr><tr><th>Case</th><td>{h(imp.get('case_name') or '')}</td></tr><tr><th>Package SHA-256</th><td class='hashcell'><code>{h(imp['package_sha256'])}</code></td></tr><tr><th>Escrow public-key fingerprint</th><td class='hashcell'><code>{h(imp.get('escrow_public_key_fingerprint') or '')}</code></td></tr></table></div>{protection_panel}<div class='card noprint'><h2>Browse recovered evidence</h2><p>{''.join(filter_links)}</p><form><input type='hidden' name='kind' value='{h(kind)}'><input type='hidden' name='render' value='{h(render)}'><input type='hidden' name='remote_capture' value='{1 if remote_capture_enabled else 0}'><div class='row'><div><label>Search filename, URL/source, hash, MIME, kind, or tag</label><input name='q' value='{h(q)}'></div><div><label>Hashtag</label><input name='hashtag' value='{h(tag_filter)}' placeholder='#priority'></div><div><label>Extensions / MIME tokens</label><input name='exts' value='{h(ext_filter_text)}' placeholder='mp4, jpg, webp'></div><div><label><input type='checkbox' name='starred' value='1' {'checked' if star_filter else ''}> Starred only</label><button>Search</button></div></div></form></div><div class='grid' style='grid-template-columns:minmax(500px,50%) minmax(480px,1fr)'><div class='card'><h2>Recovered objects</h2><div class='table-scroll'><table><tr><th>Thumb</th><th>Open</th><th>Star / tags</th><th>Kind</th><th>Filename</th><th>Type</th><th>Size</th><th>Hash</th><th>Source</th><th>SHA-256</th></tr>{''.join(obj_rows) or '<tr><td colspan="10" class="muted">No recovered objects match this filter.</td></tr>'}</table></div></div><div>{selected_info or '<div class="card"><p class="muted">Select an object to view it.</p></div>'}</div></div><div class='card'><h2>Sealed package manifest</h2><pre>{manifest_pre}</pre></div>"""
     return layout(request, f"LE Viewer Import #{import_id}", body)
 
 
@@ -10202,6 +11957,7 @@ def case_report_zip(request: Request, case_id: int) -> StreamingResponse:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("report.json", pretty(data))
+        z.writestr("integrity/application_genesis.json", pretty(data.get("application_genesis") or {}))
         z.writestr("case_report.html", build_case_report_html(data))
         z.writestr("saved_pages/index.html", build_case_saved_pages_index(case_id, data))
         z.writestr("media/index.html", build_case_media_index(data))
@@ -10224,7 +11980,7 @@ def case_report_zip(request: Request, case_id: int) -> StreamingResponse:
                     z.writestr(f"saved_pages/metadata/evidence_{ev['id']}.json", pretty({"page_capture": c, "model_metadata": model.get("metadata"), "evidence": ev}))
             except Exception as exc:
                 z.writestr(f"saved_pages/errors/evidence_{c.get('evidence_id','unknown')}.txt", str(exc))
-        z.writestr("README.txt", "Report-only bundle. No original evidence/media bytes are included. Open case_report.html first. Saved page viewers are in saved_pages/. They are safe reconstructed viewers and do not fetch remote resources.\n")
+        z.writestr("README.txt", "Report-only bundle. No original evidence/media bytes are included. Open case_report.html first. Saved page viewers are in saved_pages/. They are safe reconstructed viewers and do not fetch remote resources. See integrity/application_genesis.json for the Application Genesis Hash / Executable Genesis Seal.\n")
     log_event(current_user(request)["username"], "CASE_REPORT_ZIP_EXPORTED", case_id=case_id, details={"report_only": True})
     buf.seek(0)
     return StreamingResponse(buf, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename=case_{case_id}_report_only.zip"})
@@ -10353,7 +12109,7 @@ def settings_page(request: Request, msg: str | None = None) -> HTMLResponse:
     def opt(name: str, value: str, label: str | None = None) -> str:
         return f"<option value='{h(value)}' {'selected' if s.get(name)==value else ''}>{h(label or value)}</option>"
     sealed_mime_allowlist = h(s.get("sealed_media_preserve_mime_allowlist", "image/\nvideo/\naudio/\napplication/dash+xml\napplication/vnd.apple.mpegurl\napplication/x-mpegurl\napplication/mp4\napplication/octet-stream"))
-    body = f"""{flash(msg)}<div class='card'><h2>Global safety profile</h2><form method='post' action='/settings'>
+    body = f"""{flash(msg)}<div class='card'><h2>Global safety profile</h2><form method='post' action='/settings' data-webauthn-action='admin_settings'>
       <div class='row'><div><label>Edition</label><select name='edition'>{opt('edition','lockdown','Lockdown / compliance-safe')}{opt('edition','supervised','Supervised approval')}{opt('edition','lab','Lab/full-forensic')}</select></div><div><label>Default capture mode</label><select name='default_capture_mode'>{''.join(f'<option value="{m}" {"selected" if s.get("default_capture_mode")==m else ""}>{m}</option>' for m in CAPTURE_MODES)}</select></div><div><label>Default media policy</label><select name='default_media_policy'>{''.join(f'<option value="{m}" {"selected" if s.get("default_media_policy")==m else ""}>{m}</option>' for m in MEDIA_POLICIES)}</select></div></div><div class='row'><div><label>Default user agent profile</label><select name='default_user_agent_profile'>{ua_select_html('default_user_agent_profile', s.get('default_user_agent_profile','chrome_windows'))}</select></div><div><label>Custom user agent default</label><input name='custom_user_agent' value='{h(s.get('custom_user_agent',''))}' placeholder='Only used when profile is Custom'></div></div>
       <label><input type='checkbox' name='hard_default_safe_mode' value='1' {'checked' if truthy(s.get('hard_default_safe_mode')) else ''}> Hard default safe mode</label>
       <label><input type='checkbox' name='disable_full_reveal_in_lockdown' value='1' {'checked' if truthy(s.get('disable_full_reveal_in_lockdown')) else ''}> Lockdown: disable full reveal</label>
@@ -10367,11 +12123,14 @@ def settings_page(request: Request, msg: str | None = None) -> HTMLResponse:
       <label><input type='checkbox' name='live_javascript_enabled' value='1' {'checked' if truthy(s.get('live_javascript_enabled')) else ''}> Live browser: JavaScript enabled</label>
       <label><input type='checkbox' name='live_download_allowed_media_default' value='1' {'checked' if truthy(s.get('live_download_allowed_media_default')) else ''}> Live browser: check “save allowed media for exact renderer” by default</label>
       <label><input type='checkbox' name='live_auto_capture_default' value='1' {'checked' if truthy(s.get('live_auto_capture_default','0')) else ''}> Live browser: check “auto-capture each new settled page” by default</label>
+      <label><input type='checkbox' name='live_allow_captcha_challenge_media_default' value='1' {'checked' if truthy(s.get('live_allow_captcha_challenge_media_default','0')) else ''}> Live browser: check “allow only CAPTCHA/challenge images, including inline/base64 data images, while media remains blocked” by default</label>
       <label><input type='checkbox' name='capture_settle_before_save' value='1' {'checked' if truthy(s.get('capture_settle_before_save','1')) else ''}> Capture: wait/settle before saving manual and auto captures</label>
       <label><input type='checkbox' name='capture_auto_scroll_enabled' value='1' {'checked' if truthy(s.get('capture_auto_scroll_enabled','0')) else ''}> Capture: auto-scroll before saving to trigger lazy-loaded content</label>
       <div class='row'><div><label>Capture wait after load (ms)</label><input name='capture_wait_after_load_ms' value='{h(s.get('capture_wait_after_load_ms','5000'))}'></div><div><label>Capture network-idle timeout (ms)</label><input name='capture_network_idle_timeout_ms' value='{h(s.get('capture_network_idle_timeout_ms','20000'))}'></div><div><label>Capture total settle timeout (ms)</label><input name='capture_settle_timeout_ms' value='{h(s.get('capture_settle_timeout_ms','30000'))}'></div></div>
       <div class='row'><div><label>Auto-scroll max steps</label><input name='capture_auto_scroll_max_steps' value='{h(s.get('capture_auto_scroll_max_steps','30'))}'></div><div><label>Auto-scroll pause (ms)</label><input name='capture_auto_scroll_pause_ms' value='{h(s.get('capture_auto_scroll_pause_ms','550'))}'></div><div><label>Stable rounds before save</label><input name='capture_stable_rounds' value='{h(s.get('capture_stable_rounds','3'))}'></div></div>
       <div class='row'><div><label>Initial navigation timeout (ms)</label><input name='live_initial_navigation_timeout_ms' value='{h(s.get('live_initial_navigation_timeout_ms','60000'))}'></div><div><label>Auto-capture delay after navigation (ms)</label><input name='live_auto_capture_delay_ms' value='{h(s.get('live_auto_capture_delay_ms','2500'))}'></div><div><label>Reviewer default render mode</label><select name='reviewer_default_render_mode'><option value='auto' {'selected' if s.get('reviewer_default_render_mode','auto')=='auto' else ''}>auto / best available</option><option value='safe' {'selected' if s.get('reviewer_default_render_mode','auto')=='safe' else ''}>safe local only</option><option value='remote' {'selected' if s.get('reviewer_default_render_mode','auto')=='remote' else ''}>allow remote callbacks</option><option value='scripts' {'selected' if s.get('reviewer_default_render_mode','auto')=='scripts' else ''}>allow remote + scripts</option></select></div></div>
+      <div class='row'><div><label>LE reviewer import unlock timeout (seconds)</label><input name='reviewer_import_unlock_timeout_seconds' value='{h(s.get('reviewer_import_unlock_timeout_seconds','900'))}'><p class='small muted'>Default 900 seconds. Use 0 to disable inactivity locking for imported reviewer cases.</p></div></div>
+      <div class='card warn'><h3>LE PDF report generator</h3><p class='small muted'>Timeout/layout settings for reviewer page screenshot PDF reports. Raising timeouts helps slow dynamic pages. Standard PDF page sizing prevents screenshots from producing oversized/cut-off PDF pages.</p><div class='row'><div><label>Navigation timeout (ms)</label><input name='pdf_report_navigation_timeout_ms' value='{h(s.get('pdf_report_navigation_timeout_ms','60000'))}'></div><div><label>DOM loaded timeout (ms)</label><input name='pdf_report_domcontentloaded_timeout_ms' value='{h(s.get('pdf_report_domcontentloaded_timeout_ms','20000'))}'></div><div><label>Dynamic/scripts wait (ms)</label><input name='pdf_report_scripts_wait_ms' value='{h(s.get('pdf_report_scripts_wait_ms','12000'))}'></div></div><div class='row'><div><label>Safe render wait (ms)</label><input name='pdf_report_safe_wait_ms' value='{h(s.get('pdf_report_safe_wait_ms','3000'))}'></div><div><label>Screenshot timeout (ms)</label><input name='pdf_report_screenshot_timeout_ms' value='{h(s.get('pdf_report_screenshot_timeout_ms','30000'))}'></div><div><label>Fallback timeout (ms)</label><input name='pdf_report_fallback_timeout_ms' value='{h(s.get('pdf_report_fallback_timeout_ms','30000'))}'></div></div><div class='row'><div><label><input type='checkbox' name='pdf_report_full_width_capture' value='1' {'checked' if truthy(s.get('pdf_report_full_width_capture','1')) else ''}> Capture full document width to prevent right-side clipping</label></div><div><label>Max capture width px</label><input name='pdf_report_max_capture_width' value='{h(s.get('pdf_report_max_capture_width','2400'))}'></div><div><label>Max capture height px</label><input name='pdf_report_max_capture_height' value='{h(s.get('pdf_report_max_capture_height','24000'))}'></div></div><div class='row'><div><label>PDF page width px</label><input name='pdf_report_pdf_page_width_px' value='{h(s.get('pdf_report_pdf_page_width_px','1224'))}'><p class='small muted'>1224 px = 8.5 inches at 144 DPI.</p></div><div><label>PDF page height px</label><input name='pdf_report_pdf_page_height_px' value='{h(s.get('pdf_report_pdf_page_height_px','1584'))}'><p class='small muted'>1584 px = 11 inches at 144 DPI.</p></div><div><label>PDF margin px</label><input name='pdf_report_pdf_margin_px' value='{h(s.get('pdf_report_pdf_margin_px','36'))}'></div><div><label>Page split overlap px</label><input name='pdf_report_split_overlap_px' value='{h(s.get('pdf_report_split_overlap_px','24'))}'></div></div></div>
       <label><input type='checkbox' name='reviewer_enabled' value='1' {'checked' if truthy(s.get('reviewer_enabled','1')) else ''}> Enable law-enforcement / cleared reviewer import and viewer area</label>
       <label><input type='checkbox' name='sealed_export_enabled' value='1' {'checked' if truthy(s.get('sealed_export_enabled','1')) else ''}> Enable sealed encrypted law-enforcement evidence export</label>
       <label><input type='checkbox' name='sealed_export_include_derived' value='1' {'checked' if truthy(s.get('sealed_export_include_derived','1')) else ''}> Sealed export includes encrypted derived artifacts/snapshots when available</label>
@@ -10396,17 +12155,20 @@ function torAction(url){{
 setInterval(()=>fetch('/tor/prewarm-status').then(r=>r.json()).then(j=>torRender(j)).catch(()=>{{}}), 2000);
 </script></div><div class='row'><div><label>Tor host</label><input name='tor_host' value='{h(s.get('tor_host','127.0.0.1'))}'></div><div><label>SOCKS port</label><input name='tor_socks_port' value='{h(s.get('tor_socks_port','9050'))}'><p class='small muted'>Auto-detect also checks 9150 and 9050.</p></div><div><label>Control port</label><input name='tor_control_port' value='{h(s.get('tor_control_port','9051'))}'></div></div><label>Tor control password (optional)</label><input name='tor_control_password' type='password' value='{h(s.get('tor_control_password',''))}'>
       <button class='good'>Save settings</button></form></div>
-      <div class='card'><h2>Master reveal key</h2><form method='post' action='/settings/master-key'><label>New master reveal key</label><input name='master_key' type='password' minlength='12'><button class='danger'>Rotate master key</button></form></div>
-      <div class='card'><h2>Create user</h2><form method='post' action='/settings/users'><div class='row'><div><label>Username</label><input name='username'></div><div><label>Password</label><input name='password' type='password'></div><div><label>Role</label><select name='role'><option value='investigator'>investigator</option><option value='supervisor'>supervisor</option><option value='reviewer'>reviewer</option><option value='admin'>admin</option></select></div><div><label>Image policy</label><select name='image_policy'><option value='none'>none</option><option value='blur'>blur</option><option value='full'>full</option></select></div></div><button>Create user</button></form><table><tr><th>User</th><th>Role</th><th>Image policy</th><th>Master</th><th>Approval</th><th>WebAuthn</th></tr>{user_rows}</table></div>
-      <div class='card'><h2>Diagnostics</h2><p><a class='button' href='/self-test'>Self-test</a> <a class='button' href='/tor/status'>Tor status</a> <a class='button warn' href='/webauthn'>YubiKey/WebAuthn hooks</a></p></div>"""
+      <div class='card'><h2>Master reveal key</h2><form method='post' action='/settings/master-key' data-webauthn-action='admin_settings'><label>New master reveal key</label><input name='master_key' type='password' minlength='12'><button class='danger'>Rotate master key</button></form></div>
+      <div class='card'><h2>Create user</h2><form method='post' action='/settings/users' data-webauthn-action='admin_settings'><div class='row'><div><label>Username</label><input name='username'></div><div><label>Password</label><input name='password' type='password'></div><div><label>Role</label><select name='role'><option value='investigator'>investigator</option><option value='supervisor'>supervisor</option><option value='reviewer'>reviewer</option><option value='admin'>admin</option></select></div><div><label>Image policy</label><select name='image_policy'><option value='none'>none</option><option value='blur'>blur</option><option value='full'>full</option></select></div></div><button>Create user</button></form><table><tr><th>User</th><th>Role</th><th>Image policy</th><th>Master</th><th>Approval</th><th>WebAuthn</th></tr>{user_rows}</table></div>
+      <div class='card'><h2>Diagnostics</h2><p><a class='button' href='/self-test'>Self-test</a> <a class='button' href='/debug-bundle.zip'>Debug bundle</a> <a class='button' href='/tor/status'>Tor status</a> <a class='button warn' href='/webauthn'>YubiKey/WebAuthn hooks</a></p></div>"""
     return layout(request, "Settings", body)
 
 
 @app.post("/settings")
 def settings_save(request: Request,
     edition: str = Form("lockdown"), default_capture_mode: str = Form("metadata_only"), default_media_policy: str = Form("block_images_video"), default_user_agent_profile: str = Form("chrome_windows"), custom_user_agent: str = Form(""), live_browser_default: str = Form("chromium"),
-    hard_default_safe_mode: str | None = Form(None), disable_full_reveal_in_lockdown: str | None = Form(None), disable_plaintext_export_in_lockdown: str | None = Form(None), disable_materialization_in_lockdown: str | None = Form(None), allow_blur_in_lockdown: str | None = Form(None), require_master_key_full_reveal: str | None = Form(None), require_approval_full_reveal: str | None = Form(None), require_approval_plaintext_export: str | None = Form(None), require_approval_materialization: str | None = Form(None), live_javascript_enabled: str | None = Form(None), live_download_allowed_media_default: str | None = Form(None), live_auto_capture_default: str | None = Form(None), capture_settle_before_save: str | None = Form(None), capture_auto_scroll_enabled: str | None = Form(None), reviewer_enabled: str | None = Form(None), sealed_export_enabled: str | None = Form(None), sealed_export_include_derived: str | None = Form(None), sealed_media_preservation_enabled: str | None = Form(None), sealed_media_preserve_images: str | None = Form(None), sealed_media_preserve_video: str | None = Form(None), sealed_media_preserve_audio: str | None = Form(None), sealed_media_preserve_max_bytes: str = Form("52428800"), sealed_media_preserve_max_total_bytes: str = Form("209715200"), sealed_media_preserve_max_items_per_session: str = Form("2500"), sealed_media_preserve_max_pending_tasks: str = Form("75"), sealed_media_preserve_mime_allowlist: str = Form("image/\nvideo/\naudio/\napplication/dash+xml\napplication/vnd.apple.mpegurl\napplication/x-mpegurl\napplication/mp4\napplication/octet-stream"), sealed_media_preserve_mode: str = Form("balanced"), sealed_media_preserve_fetch_timeout_ms: str = Form("3500"), sealed_media_preserve_background_timeout_ms: str = Form("18000"), sealed_media_preserve_skip_decorative_fast: str | None = Form(None), organization_hard_seal_media_enabled: str | None = Form(None), organization_hard_seal_public_key_pem: str = Form(""), head_probe_blocked_media: str | None = Form(None), reject_inline_media_in_safe_mode: str | None = Form(None), max_root_read_bytes: str = Form("524288"), max_text_summary_chars: str = Form("20000"), max_blocked_records: str = Form("1000"), snapshot_max_media_bytes: str = Form("52428800"), snapshot_max_media_items: str = Form("250"), snapshot_max_total_asset_bytes: str = Form("209715200"), capture_wait_after_load_ms: str = Form("5000"), capture_network_idle_timeout_ms: str = Form("20000"), capture_settle_timeout_ms: str = Form("30000"), capture_auto_scroll_max_steps: str = Form("30"), capture_auto_scroll_pause_ms: str = Form("550"), capture_stable_rounds: str = Form("3"), live_initial_navigation_timeout_ms: str = Form("60000"), live_auto_capture_delay_ms: str = Form("2500"), reviewer_default_render_mode: str = Form("auto"), safe_allowlist_domains: str = Form(""), capture_denylist_domains: str = Form(""), tor_browser_path: str = Form(""), tor_executable_path: str = Form(""), tor_auto_start_from_browser_bundle: str | None = Form(None), tor_browser_force_socks: str | None = Form(None), tor_background_prewarm_enabled: str | None = Form(None), tor_host: str = Form("127.0.0.1"), tor_socks_port: str = Form("9050"), tor_control_port: str = Form("9051"), tor_control_password: str = Form("")) -> RedirectResponse:
+    hard_default_safe_mode: str | None = Form(None), disable_full_reveal_in_lockdown: str | None = Form(None), disable_plaintext_export_in_lockdown: str | None = Form(None), disable_materialization_in_lockdown: str | None = Form(None), allow_blur_in_lockdown: str | None = Form(None), require_master_key_full_reveal: str | None = Form(None), require_approval_full_reveal: str | None = Form(None), require_approval_plaintext_export: str | None = Form(None), require_approval_materialization: str | None = Form(None), live_javascript_enabled: str | None = Form(None), live_download_allowed_media_default: str | None = Form(None), live_auto_capture_default: str | None = Form(None), live_allow_captcha_challenge_media_default: str | None = Form(None), capture_settle_before_save: str | None = Form(None), capture_auto_scroll_enabled: str | None = Form(None), reviewer_enabled: str | None = Form(None), sealed_export_enabled: str | None = Form(None), sealed_export_include_derived: str | None = Form(None), sealed_media_preservation_enabled: str | None = Form(None), sealed_media_preserve_images: str | None = Form(None), sealed_media_preserve_video: str | None = Form(None), sealed_media_preserve_audio: str | None = Form(None), sealed_media_preserve_max_bytes: str = Form("52428800"), sealed_media_preserve_max_total_bytes: str = Form("209715200"), sealed_media_preserve_max_items_per_session: str = Form("2500"), sealed_media_preserve_max_pending_tasks: str = Form("75"), sealed_media_preserve_mime_allowlist: str = Form("image/\nvideo/\naudio/\napplication/dash+xml\napplication/vnd.apple.mpegurl\napplication/x-mpegurl\napplication/mp4\napplication/octet-stream"), sealed_media_preserve_mode: str = Form("balanced"), sealed_media_preserve_fetch_timeout_ms: str = Form("3500"), sealed_media_preserve_background_timeout_ms: str = Form("18000"), sealed_media_preserve_skip_decorative_fast: str | None = Form(None), organization_hard_seal_media_enabled: str | None = Form(None), organization_hard_seal_public_key_pem: str = Form(""), head_probe_blocked_media: str | None = Form(None), reject_inline_media_in_safe_mode: str | None = Form(None), max_root_read_bytes: str = Form("524288"), max_text_summary_chars: str = Form("20000"), max_blocked_records: str = Form("1000"), snapshot_max_media_bytes: str = Form("52428800"), snapshot_max_media_items: str = Form("250"), snapshot_max_total_asset_bytes: str = Form("209715200"), capture_wait_after_load_ms: str = Form("5000"), capture_network_idle_timeout_ms: str = Form("20000"), capture_settle_timeout_ms: str = Form("30000"), capture_auto_scroll_max_steps: str = Form("30"), capture_auto_scroll_pause_ms: str = Form("550"), capture_stable_rounds: str = Form("3"), live_initial_navigation_timeout_ms: str = Form("60000"), live_auto_capture_delay_ms: str = Form("2500"), reviewer_default_render_mode: str = Form("auto"), reviewer_import_unlock_timeout_seconds: str = Form("900"), pdf_report_navigation_timeout_ms: str = Form("60000"), pdf_report_domcontentloaded_timeout_ms: str = Form("20000"), pdf_report_scripts_wait_ms: str = Form("12000"), pdf_report_safe_wait_ms: str = Form("3000"), pdf_report_screenshot_timeout_ms: str = Form("30000"), pdf_report_fallback_timeout_ms: str = Form("30000"), pdf_report_full_width_capture: str | None = Form(None), pdf_report_max_capture_width: str = Form("2400"), pdf_report_max_capture_height: str = Form("24000"), pdf_report_pdf_page_width_px: str = Form("1224"), pdf_report_pdf_page_height_px: str = Form("1584"), pdf_report_pdf_margin_px: str = Form("36"), pdf_report_split_overlap_px: str = Form("24"), safe_allowlist_domains: str = Form(""), capture_denylist_domains: str = Form(""), tor_browser_path: str = Form(""), tor_executable_path: str = Form(""), tor_auto_start_from_browser_bundle: str | None = Form(None), tor_browser_force_socks: str | None = Form(None), tor_background_prewarm_enabled: str | None = Form(None), tor_host: str = Form("127.0.0.1"), tor_socks_port: str = Form("9050"), tor_control_port: str = Form("9051"), tor_control_password: str = Form("")) -> RedirectResponse:
     user = require_admin(request)
+    redir = webauthn_recent_or_redirect(request, user, "admin_settings", "/settings")
+    if redir:
+        return redir
     if civilian_unknown_master_mode():
         edition = "lockdown"
         hard_default_safe_mode = "1"
@@ -10425,8 +12187,21 @@ def settings_save(request: Request,
     if default_user_agent_profile not in USER_AGENT_PROFILES: default_user_agent_profile = "chrome_windows"
     if live_browser_default not in BROWSERS: live_browser_default = "chromium"
     if reviewer_default_render_mode not in {"auto", "safe", "remote", "scripts"}: reviewer_default_render_mode = "auto"
+    reviewer_import_unlock_timeout_seconds = str(safe_int(reviewer_import_unlock_timeout_seconds, 900, min_value=0, max_value=86400))
+    pdf_report_navigation_timeout_ms = str(safe_int(pdf_report_navigation_timeout_ms, 60000, min_value=5000, max_value=300000))
+    pdf_report_domcontentloaded_timeout_ms = str(safe_int(pdf_report_domcontentloaded_timeout_ms, 20000, min_value=1000, max_value=180000))
+    pdf_report_scripts_wait_ms = str(safe_int(pdf_report_scripts_wait_ms, 12000, min_value=0, max_value=120000))
+    pdf_report_safe_wait_ms = str(safe_int(pdf_report_safe_wait_ms, 3000, min_value=0, max_value=60000))
+    pdf_report_screenshot_timeout_ms = str(safe_int(pdf_report_screenshot_timeout_ms, 30000, min_value=3000, max_value=180000))
+    pdf_report_fallback_timeout_ms = str(safe_int(pdf_report_fallback_timeout_ms, 30000, min_value=3000, max_value=180000))
+    pdf_report_max_capture_width = str(safe_int(pdf_report_max_capture_width, 2400, min_value=640, max_value=8000))
+    pdf_report_max_capture_height = str(safe_int(pdf_report_max_capture_height, 24000, min_value=1200, max_value=60000))
+    pdf_report_pdf_page_width_px = str(safe_int(pdf_report_pdf_page_width_px, 1224, min_value=480, max_value=5000))
+    pdf_report_pdf_page_height_px = str(safe_int(pdf_report_pdf_page_height_px, 1584, min_value=640, max_value=7000))
+    pdf_report_pdf_margin_px = str(safe_int(pdf_report_pdf_margin_px, 36, min_value=0, max_value=400))
+    pdf_report_split_overlap_px = str(safe_int(pdf_report_split_overlap_px, 24, min_value=0, max_value=300))
     vals = locals().copy(); vals.pop("request"); vals.pop("user")
-    for key in ["hard_default_safe_mode", "disable_full_reveal_in_lockdown", "disable_plaintext_export_in_lockdown", "disable_materialization_in_lockdown", "allow_blur_in_lockdown", "require_master_key_full_reveal", "require_approval_full_reveal", "require_approval_plaintext_export", "require_approval_materialization", "live_javascript_enabled", "live_download_allowed_media_default", "live_auto_capture_default", "capture_settle_before_save", "capture_auto_scroll_enabled", "reviewer_enabled", "sealed_export_enabled", "sealed_export_include_derived", "sealed_media_preservation_enabled", "sealed_media_preserve_images", "sealed_media_preserve_video", "sealed_media_preserve_audio", "sealed_media_preserve_skip_decorative_fast", "organization_hard_seal_media_enabled", "tor_auto_start_from_browser_bundle", "tor_browser_force_socks", "tor_background_prewarm_enabled", "head_probe_blocked_media", "reject_inline_media_in_safe_mode"]:
+    for key in ["hard_default_safe_mode", "disable_full_reveal_in_lockdown", "disable_plaintext_export_in_lockdown", "disable_materialization_in_lockdown", "allow_blur_in_lockdown", "require_master_key_full_reveal", "require_approval_full_reveal", "require_approval_plaintext_export", "require_approval_materialization", "live_javascript_enabled", "live_download_allowed_media_default", "live_auto_capture_default", "live_allow_captcha_challenge_media_default", "capture_settle_before_save", "capture_auto_scroll_enabled", "reviewer_enabled", "sealed_export_enabled", "sealed_export_include_derived", "sealed_media_preservation_enabled", "sealed_media_preserve_images", "sealed_media_preserve_video", "sealed_media_preserve_audio", "sealed_media_preserve_skip_decorative_fast", "organization_hard_seal_media_enabled", "tor_auto_start_from_browser_bundle", "tor_browser_force_socks", "tor_background_prewarm_enabled", "head_probe_blocked_media", "reject_inline_media_in_safe_mode", "pdf_report_full_width_capture"]:
         vals[key] = "1" if vals.get(key) else "0"
     vals["sealed_media_preserve_max_bytes"] = str(safe_int(vals.get("sealed_media_preserve_max_bytes"), 52428800, min_value=1048576))
     vals["sealed_media_preserve_max_total_bytes"] = str(safe_int(vals.get("sealed_media_preserve_max_total_bytes"), 209715200, min_value=1048576))
@@ -10466,6 +12241,9 @@ def settings_save(request: Request,
 @app.post("/settings/master-key")
 def settings_master(request: Request, master_key: str = Form(...)) -> RedirectResponse:
     user = require_admin(request)
+    redir = webauthn_recent_or_redirect(request, user, "admin_settings", "/settings")
+    if redir:
+        return redir
     if civilian_unknown_master_mode():
         raise HTTPException(403, "Civilian Unknown Master Key mode blocks local master-key rotation")
     set_master_key(master_key)
@@ -10476,6 +12254,9 @@ def settings_master(request: Request, master_key: str = Form(...)) -> RedirectRe
 @app.post("/settings/users")
 def settings_create_user(request: Request, username: str = Form(...), password: str = Form(...), role: str = Form("investigator"), image_policy: str = Form("blur")) -> RedirectResponse:
     user = require_admin(request)
+    redir = webauthn_recent_or_redirect(request, user, "admin_settings", "/settings")
+    if redir:
+        return redir
     if role not in {"investigator", "supervisor", "reviewer", "admin"}: role = "investigator"
     if image_policy not in {"none", "blur", "full"}: image_policy = "blur"
     if len(password) < 8: raise HTTPException(400, "Password too short")
@@ -10484,17 +12265,58 @@ def settings_create_user(request: Request, username: str = Form(...), password: 
     return RedirectResponse("/settings?msg=User%20created", 303)
 
 
+def tor_status_bootstrap_fast(timeout: float = 0.75) -> dict[str, Any]:
+    res = tor_control_command("GETINFO status/bootstrap-phase", timeout=timeout)
+    if not res.get("ok"):
+        return {"ok": False, "percent": None, "message": res.get("error") or res.get("response") or "control unavailable", "raw": res}
+    raw = res.get("response") or ""
+    m = re.search(r"PROGRESS=(\d+)", raw)
+    pct = int(m.group(1)) if m else None
+    return {"ok": True, "percent": pct, "message": raw, "raw": res}
+
+
 def tor_status_data() -> dict[str, Any]:
     host = get_setting("tor_host", "127.0.0.1")
-    socks = int(get_setting("tor_socks_port", "9050") or "9050")
-    ctrl = int(get_setting("tor_control_port", "9051") or "9051")
-    out = {"host": host, "socks_port": socks, "control_port": ctrl, "socks_open": False, "control_open": False}
+    socks = safe_int(get_setting("tor_socks_port", "9050"), 9050)
+    ctrl = safe_int(get_setting("tor_control_port", "9051"), 9051)
+    out: dict[str, Any] = {"host": host, "socks_port": socks, "control_port": ctrl, "socks_open": False, "control_open": False, "running": False, "ok": False, "percent": None, "state": "closed", "label": "Tor: closed", "message": "Tor SOCKS is closed"}
     for key, port in [("socks_open", socks), ("control_open", ctrl)]:
         try:
-            with socket.create_connection((host, port), timeout=2):
+            with socket.create_connection((host, port), timeout=0.6):
                 out[key] = True
         except Exception as exc:
             out[key + "_error"] = str(exc)
+    try:
+        with TOR_PREWARM_LOCK:
+            prewarm = dict(TOR_PREWARM_STATUS)
+    except Exception:
+        prewarm = {}
+    out["prewarm"] = {k: v for k, v in prewarm.items() if k not in {"diagnostics", "log_tail"}}
+    out["running"] = bool(prewarm.get("running"))
+    boot = prewarm.get("bootstrap") if isinstance(prewarm.get("bootstrap"), dict) else {}
+    if out["control_open"]:
+        boot = tor_status_bootstrap_fast(timeout=0.75)
+    out["bootstrap"] = boot
+    pct = boot.get("percent") if isinstance(boot, dict) else None
+    if pct is None and isinstance(prewarm.get("bootstrap"), dict):
+        pct = prewarm["bootstrap"].get("percent")
+    try:
+        pct = int(pct) if pct is not None else None
+    except Exception:
+        pct = None
+    out["percent"] = pct
+    if pct is not None and pct >= 100:
+        out.update({"ok": True, "state": "ready", "label": "Tor: ready 100%", "message": f"Tor ready on {host}:{socks}; bootstrap 100%"})
+    elif pct is not None:
+        out.update({"ok": False, "state": "bootstrapping", "label": f"Tor: bootstrapping {pct}%", "message": f"Tor bootstrapping {pct}% on {host}:{socks}"})
+    elif out["socks_open"] and not out["control_open"]:
+        out.update({"ok": True, "state": "socks_open", "label": "Tor: SOCKS open", "message": f"Tor SOCKS open on {host}:{socks}; control unavailable"})
+    elif out["socks_open"]:
+        out.update({"ok": True, "state": "socks_open", "label": "Tor: SOCKS open", "message": f"Tor SOCKS open on {host}:{socks}"})
+    elif out["running"]:
+        out.update({"ok": False, "state": "starting", "label": "Tor: starting", "message": str(prewarm.get("message") or "Tor is starting")})
+    else:
+        out.update({"ok": False, "state": "closed", "label": "Tor: closed", "message": str(prewarm.get("message") or "Tor SOCKS is closed")})
     return out
 
 
@@ -10519,10 +12341,436 @@ def tor_exit_ip_route(request: Request) -> JSONResponse:
     return JSONResponse(tor_exit_ip())
 
 
-@app.get("/webauthn", response_class=HTMLResponse)
-def webauthn_page(request: Request) -> HTMLResponse:
+def webauthn_browser_script(*, purpose: str, action: str = "", return_to: str = "/") -> str:
+    """Shared browser-side WebAuthn helpers.
+
+    The browser itself shows the YubiKey/security-key prompt. The app only
+    starts the ceremony and verifies the signed result server-side.
+    """
+    return f"""
+<script>
+function bsB64ToBuf(s) {{
+  s = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}}
+function bsBufToB64(buf) {{
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/[+]/g, '-').replace(/[/]/g, '_').replace(/=+$/g, '');
+}}
+function bsStatus(msg, good=false) {{
+  const el = document.getElementById('webauthn-status');
+  if (el) el.innerHTML = `<span class="badge ${{good ? 'good' : 'warn'}}">${{msg}}</span>`;
+}}
+function bsWebAuthnErrorMessage(e) {{
+  const raw = (e && (e.message || e.name)) ? String(e.name || '') + ': ' + String(e.message || '') : String(e || 'unknown error');
+  if (/insecure|SecurityError|secure context/i.test(raw)) {{
+    return raw + ' — WebAuthn is strict about local origins. Open BlindSite at http://localhost:' + location.port + '/webauthn instead of 127.0.0.1/IP, then retry. If using a remote/deployed host, use HTTPS with a trusted certificate.';
+  }}
+  if (/rp id|relying party|not a registrable|rpId/i.test(raw)) {{
+    return raw + ' — The YubiKey RP ID must match the current browser host. Use the same localhost/host URL for enrollment and sign-in.';
+  }}
+  return raw;
+}}
+function bsEnsureWebAuthnSafeOrigin() {{
+  const host = (location.hostname || '').toLowerCase();
+  if (location.protocol === 'http:' && (host === '127.0.0.1' || host === '::1' || host === '0.0.0.0')) {{
+    const target = 'http://localhost:' + location.port + location.pathname + location.search + location.hash;
+    window.location.replace(target);
+    throw new Error('Switching to localhost for YubiKey/WebAuthn. Try again after the page reloads.');
+  }}
+  if (!window.isSecureContext) {{
+    throw new Error('WebAuthn requires a secure browser context. Use http://localhost for local BlindSite, or HTTPS for deployed instances.');
+  }}
+}}
+async function bsRegisterKey() {{
+  try {{
+    bsEnsureWebAuthnSafeOrigin();
+    if (!navigator.credentials || !window.PublicKeyCredential) throw new Error('This browser does not expose WebAuthn. Try Chrome/Edge/Firefox on localhost or HTTPS.');
+    bsStatus('Asking browser for your YubiKey/security key…');
+    const nickname = (document.getElementById('webauthn-nickname') || {{value:''}}).value || 'YubiKey / security key';
+    const enablePolicy = !!(document.getElementById('webauthn-enable-policy') || {{checked:false}}).checked;
+    const r = await fetch('/webauthn/register/options', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify({{nickname:nickname}})}});
+    const opts = await r.json();
+    if (!opts.ok) throw new Error(opts.error || 'Could not start enrollment');
+    const pub = opts.publicKey;
+    pub.challenge = bsB64ToBuf(pub.challenge);
+    pub.user.id = bsB64ToBuf(pub.user.id);
+    if (pub.excludeCredentials) pub.excludeCredentials = pub.excludeCredentials.map(c => ({{...c, id: bsB64ToBuf(c.id)}}));
+    const cred = await navigator.credentials.create({{publicKey: pub}});
+    const payload = {{
+      rawId: bsBufToB64(cred.rawId),
+      id: cred.id,
+      type: cred.type,
+      nickname: nickname,
+      enable_policy: enablePolicy,
+      response: {{
+        clientDataJSON: bsBufToB64(cred.response.clientDataJSON),
+        attestationObject: bsBufToB64(cred.response.attestationObject),
+        transports: cred.response.getTransports ? cred.response.getTransports() : []
+      }}
+    }};
+    const vr = await fetch('/webauthn/register/verify', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload)}});
+    const v = await vr.json();
+    if (!v.ok) throw new Error(v.error || 'Enrollment failed');
+    bsStatus('YubiKey/security key enrolled.', true);
+    setTimeout(() => window.location = '/webauthn?msg=YubiKey%20enrolled', 700);
+  }} catch(e) {{ bsStatus('YubiKey enrollment failed: ' + bsWebAuthnErrorMessage(e)); }}
+}}
+async function bsAuthenticateKey(mode, action, returnTo) {{
+  try {{
+    bsEnsureWebAuthnSafeOrigin();
+    if (!navigator.credentials || !window.PublicKeyCredential) throw new Error('This browser does not expose WebAuthn. Try Chrome/Edge/Firefox on localhost or HTTPS.');
+    bsStatus('Touch your YubiKey/security key when the browser asks…');
+    const url = mode === 'login' ? '/webauthn/login/options' : ('/webauthn/auth/options?action=' + encodeURIComponent(action || 'step_up'));
+    const r = await fetch(url, {{cache:'no-store'}});
+    const opts = await r.json();
+    if (!opts.ok) throw new Error(opts.error || 'Could not start WebAuthn');
+    const pub = opts.publicKey;
+    pub.challenge = bsB64ToBuf(pub.challenge);
+    if (pub.allowCredentials) pub.allowCredentials = pub.allowCredentials.map(c => ({{...c, id: bsB64ToBuf(c.id)}}));
+    const assertion = await navigator.credentials.get({{publicKey: pub}});
+    const payload = {{
+      mode: mode,
+      action: action || '',
+      return_to: returnTo || '',
+      rawId: bsBufToB64(assertion.rawId),
+      id: assertion.id,
+      type: assertion.type,
+      response: {{
+        clientDataJSON: bsBufToB64(assertion.response.clientDataJSON),
+        authenticatorData: bsBufToB64(assertion.response.authenticatorData),
+        signature: bsBufToB64(assertion.response.signature),
+        userHandle: assertion.response.userHandle ? bsBufToB64(assertion.response.userHandle) : ''
+      }}
+    }};
+    const endpoint = mode === 'login' ? '/webauthn/login/verify' : '/webauthn/auth/verify';
+    const vr = await fetch(endpoint, {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload)}});
+    const v = await vr.json();
+    if (!v.ok) throw new Error(v.error || 'WebAuthn verification failed');
+    bsStatus('YubiKey/security key verified.', true);
+    setTimeout(() => {{ const dest = (mode === 'login') ? (v.redirect || returnTo || '/') : (returnTo || v.redirect || '/'); window.location = dest; }}, 500);
+  }} catch(e) {{ bsStatus('YubiKey verification failed: ' + bsWebAuthnErrorMessage(e)); }}
+}}
+{ "bsAuthenticateKey('login', '', '/')" if purpose == "login_auto" else "" }
+{ "bsAuthenticateKey('stepup', " + json.dumps(action) + ", " + json.dumps(return_to) + ")" if purpose == "stepup_auto" else "" }
+</script>
+"""
+
+
+@app.get("/webauthn/diagnostics")
+def webauthn_diagnostics(request: Request) -> JSONResponse:
     require_user(request)
-    return layout(request, "YubiKey / WebAuthn", "<div class='card'><h2>Hardware-key support hooks</h2><p>This build keeps per-user WebAuthn/YubiKey policy flags and blocks full reveal for accounts requiring hardware-key step-up unless integrated enrollment is completed. Use the <code>fido2</code> package and a trusted HTTPS deployment for production WebAuthn ceremonies.</p><p class='muted'>Localhost is acceptable for browser testing, but agency deployment should use counsel/IT-approved identity management.</p></div>")
+    return JSONResponse(webauthn_secure_context_hint(request))
+
+
+@app.get("/webauthn", response_class=HTMLResponse)
+def webauthn_page(request: Request, msg: str | None = None) -> HTMLResponse:
+    redir = webauthn_canonical_redirect_if_needed(request)
+    if redir:
+        return redir  # type: ignore[return-value]
+    user = require_user(request)
+    creds = [dict(r) for r in webauthn_credential_rows(user["username"])]
+    rows = "".join(
+        f"<tr><td>{h(c.get('nickname') or 'YubiKey / security key')}</td><td><code>{h((c.get('credential_id') or '')[:28])}…</code></td><td>{h(c.get('created_at'))}</td><td>{h(c.get('last_used_at') or '')}</td><td><form method='post' action='/webauthn/credentials/{int(c['id'])}/delete' onsubmit='return confirm(\"Remove this YubiKey credential?\")'><button class='danger'>Remove</button></form></td></tr>"
+        for c in creds
+    )
+    enabled = truthy(user.get("require_webauthn"))
+    status = badge("required for this account", "good") if enabled else badge("not required for login", "warn")
+    verified = badge("verified this session", "good") if webauthn_step_up_valid(request, user) else badge("not recently verified", "warn")
+    hint = webauthn_secure_context_hint(request)
+    hint_rows = "".join(f"<li>{h(w)}</li>" for w in (hint.get("warnings") or []))
+    hint_block = f"<div class='card danger'><h3>YubiKey/WebAuthn origin warning</h3><ul>{hint_rows}</ul><p><a class='button warn' href='{h(hint.get('canonical_local_url') or '/webauthn')}'>Open localhost YubiKey page</a></p></div>" if hint_rows else ""
+    body = f"""{flash(msg)}{hint_block}<div class='card warn'><h2>YubiKey / WebAuthn</h2>
+      <p>{status} {verified}</p>
+      <p>Enroll a YubiKey or any FIDO2/WebAuthn security key. This is optional and additive: it does not replace the master reveal key, approvals, custody locks, or existing policy checks. BlindSite uses the browser's native security-key prompt; no extra desktop app is required.</p>
+      <p class='small muted'>Localhost is supported by modern browsers for WebAuthn testing. Production agency deployments should use HTTPS and counsel/IT-approved identity policy.</p>
+      <div id='webauthn-status'>{badge('ready','info')}</div>
+      <label>Key nickname</label><input id='webauthn-nickname' value='YubiKey / security key'>
+      <label><input id='webauthn-enable-policy' type='checkbox'> Also require this key at next sign-in and high-risk actions for my account (optional)</label><p class='small muted'>YubiKey/WebAuthn is optional and additive. It does not replace the master reveal key, approvals, custody locks, or existing policy checks.</p>
+      <button class='good' type='button' onclick='bsRegisterKey()'>Enroll YubiKey / security key</button>
+      <button class='secondary' type='button' onclick="bsAuthenticateKey('stepup','manual','/webauthn')">Test / verify key now</button>
+      <form method='post' action='/webauthn/policy' style='display:inline'><input type='hidden' name='enabled' value='{0 if enabled else 1}'><button class='{'secondary' if enabled else 'warn'}'>{'Disable account YubiKey requirement' if enabled else 'Require YubiKey for my account'}</button></form>
+    </div>
+    <div class='card'><h2>Enrolled keys</h2><table><tr><th>Nickname</th><th>Credential ID</th><th>Created</th><th>Last used</th><th>Remove</th></tr>{rows or '<tr><td colspan="5" class="muted">No YubiKey/security key enrolled yet.</td></tr>'}</table></div>
+    <div class='card safe'><h2>Where BlindSite asks for the key</h2><p>After you opt in, BlindSite asks through the browser's native security-key prompt before sign-in, full reveal, plaintext export, blocked-media materialization, sealed export, and exact local page rendering. YubiKey is optional and never replaces the master reveal key or approval workflow.</p></div>
+    {webauthn_browser_script(purpose='manage')}
+    """
+    return layout(request, "YubiKey / WebAuthn", body)
+
+
+@app.post("/webauthn/policy")
+def webauthn_policy(request: Request, enabled: int = Form(1)) -> RedirectResponse:
+    user = require_user(request)
+    want_enabled = bool(int(enabled or 0))
+    if want_enabled and not webauthn_user_has_credentials(user["username"]):
+        return RedirectResponse("/webauthn?msg=Enroll%20a%20YubiKey%20or%20security%20key%20before%20requiring%20it", 303)
+    execute("UPDATE users SET require_webauthn=? WHERE username=?", (1 if want_enabled else 0, user["username"]))
+    if not want_enabled:
+        request.session.pop("webauthn_verified_at", None)
+        request.session.pop("webauthn_verified_user", None)
+        request.session.pop("webauthn_verified_action", None)
+    log_event(user["username"], "YUBIKEY_POLICY_UPDATED", details={"require_webauthn": want_enabled})
+    return RedirectResponse("/webauthn?msg=YubiKey%20policy%20updated", 303)
+
+
+@app.post("/webauthn/credentials/{credential_db_id}/delete")
+def webauthn_delete_credential(request: Request, credential_db_id: int) -> RedirectResponse:
+    user = require_user(request)
+    row = rowdict(fetchone("SELECT * FROM webauthn_credentials WHERE id=?", (credential_db_id,)))
+    if not row or row.get("username") != user["username"]:
+        raise HTTPException(404, "YubiKey credential not found")
+    execute("DELETE FROM webauthn_credentials WHERE id=?", (credential_db_id,))
+    remaining = webauthn_credential_count(user["username"])
+    if remaining == 0:
+        execute("UPDATE users SET require_webauthn=0 WHERE username=?", (user["username"],))
+    log_event(user["username"], "YUBIKEY_CREDENTIAL_REMOVED", details={"credential_db_id": credential_db_id, "remaining_credentials": remaining})
+    return RedirectResponse("/webauthn?msg=YubiKey%20credential%20removed", 303)
+
+
+@app.post("/webauthn/register/options")
+async def webauthn_register_options(request: Request) -> JSONResponse:
+    user = require_user(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    challenge = b64url(secrets.token_bytes(32))
+    request.session["webauthn_register_challenge"] = challenge
+    username = str(user["username"])
+    existing = [{"type": "public-key", "id": r["credential_id"]} for r in webauthn_credential_rows(username)]
+    rp: dict[str, Any] = {"name": APP_NAME}
+    explicit_rp_id = webauthn_public_key_rp_id(request)
+    if explicit_rp_id:
+        rp["id"] = explicit_rp_id
+    options = {
+        "challenge": challenge,
+        "rp": rp,
+        "user": {"id": b64url(username.encode("utf-8")), "name": username, "displayName": username},
+        "pubKeyCredParams": [{"type": "public-key", "alg": -7}, {"type": "public-key", "alg": -257}],
+        "timeout": 60000,
+        "attestation": "none",
+        "excludeCredentials": existing,
+        "authenticatorSelection": {"residentKey": "discouraged", "userVerification": "preferred"},
+    }
+    hint = webauthn_secure_context_hint(request)
+    log_event(username, "YUBIKEY_REGISTRATION_STARTED", details={"rp_id": explicit_rp_id or "browser-default-local-origin", "rp_id_candidates": webauthn_rp_id_candidates(request), "secure_context_hint": hint, "nickname": str(payload.get("nickname") or "")[:80]})
+    return JSONResponse({"ok": True, "publicKey": options, "secureContextHint": hint})
+
+
+@app.post("/webauthn/register/verify")
+async def webauthn_register_verify(request: Request) -> JSONResponse:
+    user = require_user(request)
+    username = str(user["username"])
+    try:
+        payload = await request.json()
+        client_obj, client_raw = webauthn_check_client_data(request, payload.get("response", {}).get("clientDataJSON", ""), "webauthn.create", "webauthn_register_challenge")
+        att_obj = cbor_decode(b64url_decode(payload.get("response", {}).get("attestationObject", "")))
+        auth_data = att_obj.get("authData") if isinstance(att_obj, dict) else None
+        if not isinstance(auth_data, bytes):
+            raise ValueError("attestation object did not contain authData")
+        parsed = webauthn_parse_authenticator_data(auth_data)
+        if not webauthn_rp_hash_valid(request, parsed["rp_id_hash"]):
+            raise ValueError("RP ID hash mismatch for this origin. Use the same localhost/host URL you used when enrolling the key.")
+        if not (int(parsed["flags"]) & 0x01):
+            raise ValueError("Authenticator did not assert user presence")
+        cred_id = b64url(parsed["credential_id"])
+        public_key_pem, alg = webauthn_public_key_from_cose(parsed["cose_public_key"])
+        transports = payload.get("response", {}).get("transports") or []
+        execute("""INSERT INTO webauthn_credentials(username,credential_id,public_key_pem,cose_alg,sign_count,aaguid,nickname,transports_json,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(credential_id) DO UPDATE SET nickname=excluded.nickname, transports_json=excluded.transports_json""", (username, cred_id, public_key_pem, alg, int(parsed.get("sign_count") or 0), parsed.get("aaguid", b"").hex(), clean_filename(str(payload.get("nickname") or "YubiKey / security key")), json.dumps(transports), utcnow()))
+        if payload.get("enable_policy", True):
+            execute("UPDATE users SET require_webauthn=1 WHERE username=?", (username,))
+        request.session.pop("webauthn_register_challenge", None)
+        log_event(username, "YUBIKEY_CREDENTIAL_ENROLLED", details={"credential_id_sha256": sha256_text(cred_id), "cose_alg": alg, "transports": transports, "require_webauthn": bool(payload.get("enable_policy", True))})
+        return JSONResponse({"ok": True})
+    except Exception as exc:
+        log_event(username, "YUBIKEY_CREDENTIAL_ENROLLMENT_FAILED", details={"error": str(exc)[:500]})
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+def webauthn_options_for_username(request: Request, username: str, *, challenge_key: str, action: str = "") -> dict[str, Any]:
+    creds = list(webauthn_credential_rows(username))
+    if not creds:
+        raise HTTPException(400, "No YubiKey/WebAuthn credential is enrolled for this account")
+    challenge = b64url(secrets.token_bytes(32))
+    request.session[challenge_key] = challenge
+    if action:
+        request.session["webauthn_auth_action"] = action
+    options: dict[str, Any] = {
+        "challenge": challenge,
+        "timeout": 60000,
+        "allowCredentials": [{"type": "public-key", "id": r["credential_id"]} for r in creds],
+        "userVerification": "preferred",
+    }
+    explicit_rp_id = webauthn_public_key_rp_id(request)
+    if explicit_rp_id:
+        options["rpId"] = explicit_rp_id
+    return options
+
+
+@app.get("/webauthn/required")
+def webauthn_required_status(request: Request, action: str = "step_up") -> JSONResponse:
+    user = require_user(request)
+    required = webauthn_action_requires_stepup(user, action)
+    has_creds = webauthn_user_has_credentials(user["username"])
+    verified = webauthn_step_up_valid(request, user)
+    return JSONResponse({
+        "ok": True,
+        "action": action,
+        "label": WEBAUTHN_STEPUP_ACTION_LABELS.get(action, action.replace("_", " ")),
+        "required": bool(required),
+        "has_credentials": bool(has_creds),
+        "verified": bool(verified),
+        "optional": True,
+    })
+
+
+@app.get("/webauthn/auth/options")
+def webauthn_auth_options(request: Request, action: str = "step_up") -> JSONResponse:
+    user = require_user(request)
+    if not webauthn_action_requires_stepup(user, action) and action not in {"manual", "step_up", "reviewer_import_unlock"}:
+        return JSONResponse({"ok": False, "error": "YubiKey/WebAuthn is not required for this action on this account"}, status_code=400)
+    return JSONResponse({"ok": True, "publicKey": webauthn_options_for_username(request, user["username"], challenge_key="webauthn_auth_challenge", action=action)})
+
+
+def webauthn_verify_assertion_for_username(request: Request, username: str, payload: dict[str, Any], *, challenge_key: str) -> dict[str, Any]:
+    response = payload.get("response") or {}
+    _client_obj, client_raw = webauthn_check_client_data(request, response.get("clientDataJSON", ""), "webauthn.get", challenge_key)
+    credential_id = payload.get("rawId") or payload.get("id") or ""
+    cred = rowdict(fetchone("SELECT * FROM webauthn_credentials WHERE username=? AND credential_id=?", (username, credential_id)))
+    if not cred:
+        raise HTTPException(403, "This YubiKey/security key is not enrolled for the current account")
+    auth_data = b64url_decode(response.get("authenticatorData", ""))
+    parsed = webauthn_parse_authenticator_data(auth_data)
+    if not webauthn_rp_hash_valid(request, parsed["rp_id_hash"]):
+        raise HTTPException(403, "RP ID hash mismatch for this origin. Use the same localhost/host URL you used when enrolling the key.")
+    if not (int(parsed["flags"]) & 0x01):
+        raise HTTPException(403, "Authenticator did not assert user presence")
+    signed_data = auth_data + hashlib.sha256(client_raw).digest()
+    webauthn_verify_signature(str(cred["public_key_pem"]), b64url_decode(response.get("signature", "")), signed_data)
+    old_count = int(cred.get("sign_count") or 0)
+    new_count = int(parsed.get("sign_count") or 0)
+    warning = ""
+    if old_count and new_count and new_count <= old_count:
+        warning = "Authenticator sign counter did not increase; continuing but recording warning."
+    if new_count > old_count:
+        execute("UPDATE webauthn_credentials SET sign_count=?, last_used_at=? WHERE id=?", (new_count, utcnow(), cred["id"]))
+    else:
+        execute("UPDATE webauthn_credentials SET last_used_at=? WHERE id=?", (utcnow(), cred["id"]))
+    return {"credential_db_id": cred["id"], "credential_id_sha256": sha256_text(credential_id), "warning": warning, "flags": parsed.get("flags"), "sign_count": new_count}
+
+
+@app.post("/webauthn/auth/verify")
+async def webauthn_auth_verify(request: Request) -> JSONResponse:
+    user = require_user(request)
+    username = str(user["username"])
+    try:
+        payload = await request.json()
+        result = webauthn_verify_assertion_for_username(request, username, payload, challenge_key="webauthn_auth_challenge")
+        action = str(payload.get("action") or request.session.get("webauthn_auth_action") or "step_up")
+        request.session["webauthn_verified_at"] = time.time()
+        request.session["webauthn_verified_user"] = username
+        request.session["webauthn_verified_action"] = action
+        request.session.pop("webauthn_auth_challenge", None)
+        log_event(username, "YUBIKEY_STEP_UP_VERIFIED", details={"action": action, **result})
+        redirect_to = request.session.pop("webauthn_return_to", "") if request.session.get("webauthn_return_to") else ""
+        redirect_to = redirect_to or str(payload.get("return_to") or "") or "/"
+        return JSONResponse({"ok": True, "redirect": redirect_to})
+    except HTTPException as exc:
+        return JSONResponse({"ok": False, "error": str(exc.detail)}, status_code=exc.status_code)
+    except Exception as exc:
+        log_event(username, "YUBIKEY_STEP_UP_FAILED", details={"error": str(exc)[:500]})
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@app.get("/webauthn/step-up", response_class=HTMLResponse)
+def webauthn_stepup_page(request: Request, action: str = "step_up", return_to: str = "/") -> HTMLResponse:
+    redir = webauthn_canonical_redirect_if_needed(request)
+    if redir:
+        return redir  # type: ignore[return-value]
+    user = require_user(request)
+    if not webauthn_user_has_credentials(user["username"]):
+        return RedirectResponse("/webauthn?msg=Enroll%20a%20YubiKey%20before%20using%20step-up", 303)  # type: ignore[return-value]
+    request.session["webauthn_return_to"] = return_to or "/"
+    label = WEBAUTHN_STEPUP_ACTION_LABELS.get(action, action.replace("_", " "))
+    body = f"""<div class='card warn' style='text-align:center;max-width:900px;margin:20px auto'>
+      <h2>YubiKey step-up required</h2>
+      <p>BlindSite needs your YubiKey/security key before: <b>{h(label)}</b>.</p>
+      <div id='webauthn-status'>{badge('waiting for browser prompt','warn')}</div>
+      <p><button class='good' type='button' onclick="bsAuthenticateKey('stepup',{h(json.dumps(action))},{h(json.dumps(return_to or '/'))});return false;">Use YubiKey now</button> <a class='button secondary' href='{h(return_to or '/')}' >Cancel</a></p>
+      <p class='small muted'>The browser will show the security-key prompt. Touch your YubiKey when asked.</p>
+    </div>{webauthn_browser_script(purpose='stepup_auto', action=action, return_to=return_to or '/')}
+    """
+    return layout(request, "YubiKey step-up", body)
+
+
+@app.get("/webauthn/login", response_class=HTMLResponse)
+def webauthn_login_page(request: Request) -> HTMLResponse:
+    redir = webauthn_canonical_redirect_if_needed(request)
+    if redir:
+        return redir  # type: ignore[return-value]
+    username = str(request.session.get("pending_webauthn_login_username") or "")
+    if not username:
+        return RedirectResponse("/login", 303)  # type: ignore[return-value]
+    body = f"""<div class='card warn' style='text-align:center;max-width:900px;margin:20px auto'>
+      <h2>YubiKey sign-in required</h2>
+      <p>Password accepted for <b>{h(username)}</b>. Touch your YubiKey/security key to finish signing in.</p>
+      <div id='webauthn-status'>{badge('waiting for browser prompt','warn')}</div>
+      <p><button class='good' type='button' onclick="bsAuthenticateKey('login','','/')">Use YubiKey now</button> <a class='button secondary' href='/login'>Cancel</a></p>
+    </div>{webauthn_browser_script(purpose='login_auto')}
+    """
+    return layout(request, "YubiKey sign-in", body)
+
+
+@app.get("/webauthn/login/options")
+def webauthn_login_options(request: Request) -> JSONResponse:
+    username = str(request.session.get("pending_webauthn_login_username") or "")
+    if not username:
+        return JSONResponse({"ok": False, "error": "No pending YubiKey login"}, status_code=400)
+    return JSONResponse({"ok": True, "publicKey": webauthn_options_for_username(request, username, challenge_key="webauthn_login_challenge", action="login")})
+
+
+@app.post("/webauthn/login/verify")
+async def webauthn_login_verify(request: Request) -> JSONResponse:
+    username = str(request.session.get("pending_webauthn_login_username") or "")
+    if not username:
+        return JSONResponse({"ok": False, "error": "No pending YubiKey login"}, status_code=400)
+    try:
+        payload = await request.json()
+        result = webauthn_verify_assertion_for_username(request, username, payload, challenge_key="webauthn_login_challenge")
+        init_tor_session = truthy(request.session.get("pending_login_init_tor"))
+        force_tor_all_cases = truthy(request.session.get("pending_login_force_tor_all_cases"))
+        sealed_sender_enabled = truthy(request.session.get("pending_login_sealed_sender_enabled", "1"))
+        request.session.clear()
+        request.session["username"] = username
+        request.session["sealed_sender_file_downloads_enabled"] = "1" if sealed_sender_enabled else "0"
+        if force_tor_all_cases:
+            request.session["force_tor_all_cases"] = "1"
+        request.session["webauthn_verified_at"] = time.time()
+        request.session["webauthn_verified_user"] = username
+        request.session["webauthn_verified_action"] = "login"
+        set_setting("sealed_media_preservation_enabled", "1" if sealed_sender_enabled else "0")
+        log_event(username, "LOGIN", details={"init_tor_session": init_tor_session, "force_tor_all_cases": force_tor_all_cases, "sealed_sender_file_downloads_enabled": sealed_sender_enabled, "yubikey_login": True})
+        log_event(username, "YUBIKEY_LOGIN_VERIFIED", details=result)
+        try:
+            if init_tor_session or setting_bool("tor_background_prewarm_enabled", "0"):
+                tor_prewarm_background("login-session" if init_tor_session else "login")
+        except Exception:
+            pass
+        row = fetchone("SELECT role FROM users WHERE username=?", (username,))
+        redirect = "/setup" if get_setting("setup_required", "0") == "1" and row and row["role"] == "admin" else "/"
+        return JSONResponse({"ok": True, "redirect": redirect})
+    except HTTPException as exc:
+        return JSONResponse({"ok": False, "error": str(exc.detail)}, status_code=exc.status_code)
+    except Exception as exc:
+        log_event(username, "YUBIKEY_LOGIN_FAILED", details={"error": str(exc)[:500]})
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 
 @app.get("/audit/verify", response_class=HTMLResponse)
@@ -10561,15 +12809,72 @@ def stop_report_submit(request: Request, reason: str = Form(...), notes: str = F
     return RedirectResponse("/?msg=Stop/report%20event%20recorded", 303)
 
 
+def build_debug_bundle(actor: str = "system") -> bytes:
+    """Create a no-plaintext diagnostic bundle with Application Genesis Hash info."""
+    ensure_application_genesis_event("global", actor="system")
+    buf = io.BytesIO()
+    safe_settings = all_settings()
+    for secret_key in ["tor_control_password", "master_key_hash", "wrapped_master_key", "wrapped_storage_key", "escrow_public_key_pem", "organization_hard_seal_public_key_pem"]:
+        if secret_key in safe_settings:
+            safe_settings[secret_key] = "[redacted]"
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("application_genesis.json", pretty(application_genesis_report(investigation_id="global")))
+        z.writestr("application_build_identity.json", pretty(application_build_identity()))
+        z.writestr("self_test.json", pretty(run_self_tests()))
+        z.writestr("audit_verification.json", pretty(verify_audit_chain()))
+        z.writestr("tor_diagnostics.json", pretty(tor_diagnostics()))
+        z.writestr("settings_summary.json", pretty(safe_settings))
+        z.writestr("README.txt", "BlindSite debug bundle. This bundle intentionally omits plaintext evidence and redacts local secrets. It includes Application Genesis Hash / Executable Genesis Seal information for build verification.\n")
+    return buf.getvalue()
+
+
+@app.get("/debug-bundle.zip")
+def debug_bundle_zip(request: Request) -> StreamingResponse:
+    user = require_user(request)
+    payload = build_debug_bundle(user["username"])
+    log_event(user["username"], "DEBUG_BUNDLE_EXPORTED", details={"application_genesis": application_genesis_report(investigation_id="global"), "size": len(payload)})
+    return StreamingResponse(io.BytesIO(payload), media_type="application/zip", headers={"Content-Disposition": "attachment; filename=blindsite_debug_bundle.zip"})
+
+
 def run_self_tests() -> dict[str, Any]:
     init_db()
+    ensure_application_genesis_event("global", actor="system")
     tests: dict[str, Any] = {"app": APP_NAME, "version": APP_VERSION, "time": utcnow()}
     tests["database"] = DB_PATH.exists()
     tests["fernet_key"] = KEY_FILE.exists()
     sample = b"selftest-" + secrets.token_bytes(8)
     tests["encryption_roundtrip"] = decrypt_bytes(encrypt_bytes(sample)) == sample
+    tests["application_genesis_hash"] = application_build_identity()
+    tests["application_genesis"] = application_genesis_report(investigation_id="global")
+    tests["executable_genesis_seal"] = tests["application_genesis"]
     tests["audit"] = verify_audit_chain()
     tests["tor"] = tor_status_data()
+    tests["captcha_challenge_display_exception"] = {
+        "optional": True,
+        "default_enabled": setting_bool("live_allow_captcha_challenge_media_default", "0"),
+        "scope": "image-only CAPTCHA/challenge URLs plus inline data:image CAPTCHA elements with CAPTCHA/challenge context; ordinary images/video/audio remain blocked and sealed-preserved according to policy",
+        "known_network_candidate_example": captcha_challenge_media_candidate("https://www.google.com/recaptcha/api2/payload?p=test", "image"),
+        "known_inline_data_candidate_example": captcha_challenge_inline_data_candidate("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAE=", "class captchabtn alt captcha answer are you not a robot"),
+        "ordinary_inline_data_image_blocked_without_context": not captcha_challenge_inline_data_candidate("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAE=", "site logo avatar banner"),
+    }
+    tests["yubikey_webauthn"] = {
+        "enabled": True,
+        "optional": True,
+        "credential_count": fetchone("SELECT count(*) c FROM webauthn_credentials")["c"],
+        "users_requiring_webauthn": fetchone("SELECT count(*) c FROM users WHERE require_webauthn=1")["c"],
+        "stepup_max_age_seconds": webauthn_stepup_max_age(),
+        "localhost_origin_fix": True,
+        "rp_id_behavior": "BlindSite omits explicit rp.id/rpId for localhost/loopback ceremonies so browsers can use the current local origin and avoid SecurityError / operation-is-insecure failures.",
+        "reviewer_import_unlock_action_supported": True,
+        "note": "Browser-native WebAuthn/YubiKey ceremonies are tested interactively in the browser; self-test verifies database/config presence only.",
+    }
+    tests["reviewer_import_security"] = {
+        "password_protection_supported": True,
+        "yubikey_webauthn_protection_supported": True,
+        "unlock_inactivity_timeout_seconds": reviewer_import_unlock_timeout_seconds(),
+        "protected_import_count": fetchone("SELECT count(*) c FROM reviewer_imports WHERE notes_json LIKE '%review_case_password_hash%' OR notes_json LIKE '%review_case_webauthn_protected%'")["c"],
+        "note": "LE reviewer imports can be protected by review-case password and/or optional YubiKey/WebAuthn. Unlock sessions expire after inactivity timeout unless set to 0.",
+    }
     try:
         import playwright  # type: ignore
         tests["playwright_python"] = True
@@ -10723,8 +13028,10 @@ def handle_escrow_cli(argv: list[str]) -> bool:
 
 def launch(host: str, port: int, open_browser: bool = True) -> None:
     init_db()
-    url = f"http://{host}:{port}"
-    print(f"\n{APP_NAME} {APP_VERSION}\nOpen: {url}\nDefault login on first run: admin / change-me-now\n")
+    url = webauthn_public_url_for(host, port) if webauthn_loopback_host(host) else f"http://{host}:{port}"
+    bind_note = f"Binding: http://{host}:{port}"
+    yubi_note = "YubiKey/WebAuthn local enrollment uses localhost. If you opened 127.0.0.1 manually, BlindSite will redirect WebAuthn pages to localhost."
+    print(f"\n{APP_NAME} {APP_VERSION}\nOpen: {url}\n{bind_note}\n{yubi_note}\nDefault login on first run: admin / change-me-now\n")
     if open_browser and setting_bool("auto_open_browser", "1"):
         def opener() -> None:
             time.sleep(1.0)

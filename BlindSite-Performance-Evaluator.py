@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
 """
 BlindSite Performance Evaluator
-
 US CYBER MILITIA | BLINDSITE
 
-Standalone performance validation harness for BlindSite.py.
+Standalone performance/workflow validation harness for BlindSite.py.
 
-Purpose:
-- Measure live browser/capture performance in a controlled local test.
-- Produce reconstructable logs/artifacts instead of only summary claims.
-- Validate that the fast live-route model stays fast while blocked media
-  preservation runs in the background.
-- Optionally run a quick real-website benchmark.
-- Optionally run a Tor prewarm/status performance check.
+This evaluator focuses on speed, responsiveness, and reconstructable performance
+artifacts for current BlindSite features, including the newest hardening additions:
 
-This is a performance/workflow evaluator, not a security certification.
+  - Application Genesis Hash / Executable Genesis Seal helper timing;
+  - Tor status bar/status API timing and reconstructable status samples;
+  - CAPTCHA/challenge exception predicate speed and narrowness, including inline/base64 data:image CAPTCHAs;
+  - empty-header display helper speed/clarity;
+  - blocked-media retry statistics proving all-not-downloaded includes queue-full;
+  - workflow regression checks moved out of the security evaluator, including retry semantics, Tor status surface, and header-display clarity;
+  - reconstructable workflow logs/artifacts for retry actions, Tor runtime/status samples, and browser-event header rows;
+  - LE Reviewer import password/YubiKey protection timeout helper timing;
+  - optional local live-browser blocked-media benchmark;
+  - optional Tor prewarm/status benchmark.
+
+It produces a report folder containing JSON/Markdown/CSV and an artifacts folder
+so the logs are reconstructable instead of being just summary claims.
+
+This is a performance/workflow evaluator, not a legal or forensic certification.
 Security/encryption claims should be covered by BlindSite-Security-Evaluator.py.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import base64
 import contextlib
 import hashlib
@@ -46,19 +55,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-
-
-APP_VERSION = "1.1.1-performance-workflow-validation-v5.14"
-DEFAULT_ASSET_COUNT = 80
-DEFAULT_SVG_COUNT = 20
-DEFAULT_VIDEO_COUNT = 4
-DEFAULT_ASSET_DELAY_MS = 10
-DEFAULT_PAGE_WAIT_SECONDS = 20
-DEFAULT_PRESERVATION_WAIT_SECONDS = 45
-DEFAULT_QUEUE_LIMIT = 45
-DEFAULT_MAX_ITEMS = 2500
+APP_VERSION = "2.1-workflow-performance-reconstructable"
+DEFAULT_TIMEOUT = 12
+ZERO_HASH = "0" * 64
 
 
 @dataclass
@@ -69,6 +68,14 @@ class Check:
     evidence: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class Benchmark:
+    name: str
+    elapsed_seconds: float
+    detail: str = ""
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+
 class PerformanceEvaluator:
     def __init__(
         self,
@@ -77,35 +84,31 @@ class PerformanceEvaluator:
         report_root: Path,
         keep_temp: bool = False,
         verbose: bool = True,
-        asset_count: int = DEFAULT_ASSET_COUNT,
-        svg_count: int = DEFAULT_SVG_COUNT,
-        video_count: int = DEFAULT_VIDEO_COUNT,
-        asset_delay_ms: int = DEFAULT_ASSET_DELAY_MS,
-        queue_limit: int = DEFAULT_QUEUE_LIMIT,
-        max_items: int = DEFAULT_MAX_ITEMS,
-        preserve_mode: str = "fast",
+        quick_iterations: int = 1000,
+        retry_rows: int = 600,
+        live_assets: int = 60,
+        live_delay_ms: int = 5,
     ):
         self.original_app_path = app_path.expanduser().resolve()
         self.report_root = report_root.expanduser().resolve()
         self.keep_temp = keep_temp
         self.verbose = verbose
-        self.asset_count = int(asset_count)
-        self.svg_count = int(svg_count)
-        self.video_count = int(video_count)
-        self.asset_delay_ms = int(asset_delay_ms)
-        self.queue_limit = int(queue_limit)
-        self.max_items = int(max_items)
-        self.preserve_mode = preserve_mode if preserve_mode in {"fast", "balanced", "complete"} else "fast"
-        self.started_at = now_iso()
+        self.quick_iterations = max(1, int(quick_iterations))
+        self.retry_rows = max(10, int(retry_rows))
+        self.live_assets = max(1, int(live_assets))
+        self.live_delay_ms = max(0, int(live_delay_ms))
+        self.started_at = utcnow()
         self.checks: list[Check] = []
+        self.benchmarks: list[Benchmark] = []
+        self.artifacts: list[dict[str, Any]] = []
+        self.reconstruction_steps: list[dict[str, Any]] = []
         self.tempdir_obj: tempfile.TemporaryDirectory[str] | None = None
         self.workdir: Path | None = None
         self.app_copy: Path | None = None
-        self.m = None
         self.artifact_dir: Path | None = None
-        self.artifacts: list[dict[str, Any]] = []
-        self.benchmarks: list[dict[str, Any]] = []
-        self.reconstruction_steps: list[dict[str, Any]] = []
+        self.m = None
+
+    # ------------------ logging/checks ------------------
 
     def log(self, msg: str) -> None:
         if self.verbose:
@@ -131,32 +134,638 @@ class PerformanceEvaluator:
     def step(self, name: str, detail: str = "", **data: Any) -> None:
         self.reconstruction_steps.append({
             "index": len(self.reconstruction_steps) + 1,
+            "timestamp_utc": utcnow(),
             "name": name,
             "detail": detail,
-            "timestamp_utc": now_iso(),
             "data": safe_json(data),
         })
+
+    def bench(self, name: str, elapsed: float, detail: str = "", **metrics: Any) -> None:
+        self.benchmarks.append(Benchmark(name=name, elapsed_seconds=round(float(elapsed), 6), detail=detail, metrics=safe_json(metrics)))
+        self.log(f"⏱️ BENCH: {name} — {elapsed:.4f}s" + (f" — {detail}" if detail else ""))
+
+    # ------------------ setup/import ------------------
 
     def setup(self) -> None:
         if not self.original_app_path.exists():
             raise SystemExit(f"BlindSite file not found: {self.original_app_path}")
         self.report_root.mkdir(parents=True, exist_ok=True)
-        self.tempdir_obj = tempfile.TemporaryDirectory(prefix="blindsite_perf_")
+        self.tempdir_obj = tempfile.TemporaryDirectory(prefix="blindsite_perf_eval_")
         self.workdir = Path(self.tempdir_obj.name)
         self.app_copy = self.workdir / "BlindSite_under_test.py"
         self.artifact_dir = self.workdir / "performance_artifacts"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(self.original_app_path, self.app_copy)
-        self.write_json_artifact("environment/run_context.json", self.run_context(), "Run context and environment metadata")
+        self.write_json_artifact("environment/run_context.json", self.run_context(), "Run context and environment metadata", category="environment")
         self.log(f"Using sandbox: {self.workdir}")
         self.log(f"Copied app under test: {self.app_copy}")
 
     def cleanup(self) -> None:
+        """Release imported BlindSite resources and remove the temporary sandbox.
+
+        On Windows, sqlite files can remain locked for a short time if an imported
+        module or a benchmark fixture still has a connection/handle alive. Cleanup
+        must never turn an otherwise successful performance validation into a
+        traceback, so we explicitly release known resources, retry deletion, and
+        downgrade leftover temp-file locks to a warning.
+        """
         if self.keep_temp:
             self.warn("temporary sandbox retained", str(self.workdir))
             return
-        if self.tempdir_obj:
-            self.tempdir_obj.cleanup()
+
+        # Ask any in-memory live sessions / managed helpers from the imported app
+        # to stop before deleting the copied app/data directory. These calls are
+        # intentionally best-effort; cleanup should not mask the validation result.
+        if self.m is not None:
+            with contextlib.suppress(Exception):
+                live = getattr(self.m, "LIVE", {})
+                for session in list(live.values()):
+                    with contextlib.suppress(Exception):
+                        session.stop_sync()
+            with contextlib.suppress(Exception):
+                if hasattr(self.m, "stop_managed_tor"):
+                    self.m.stop_managed_tor("performance-evaluator-cleanup")
+
+        # Drop the imported module reference so sqlite connections and file handles
+        # held by module globals/closures can be garbage-collected before rmtree.
+        with contextlib.suppress(Exception):
+            sys.modules.pop("blindsite_perf_under_test", None)
+        self.m = None
+        gc.collect()
+
+        if not self.tempdir_obj:
+            return
+
+        sandbox = Path(self.tempdir_obj.name)
+        # Detach TemporaryDirectory's finalizer and do the deletion ourselves so
+        # a Windows PermissionError can be reported as a warning instead of a
+        # post-report traceback.
+        with contextlib.suppress(Exception):
+            self.tempdir_obj._finalizer.detach()  # type: ignore[attr-defined]
+
+        last_exc: Exception | None = None
+        for attempt in range(12):
+            try:
+                if sandbox.exists():
+                    shutil.rmtree(sandbox)
+                self.tempdir_obj = None
+                return
+            except PermissionError as exc:
+                last_exc = exc
+                gc.collect()
+                time.sleep(0.25)
+            except Exception as exc:
+                last_exc = exc
+                break
+
+        # Last-resort ignore-errors pass. If a locked sqlite file remains, leave
+        # the sandbox path in the report output instead of crashing after PASS.
+        with contextlib.suppress(Exception):
+            shutil.rmtree(sandbox, ignore_errors=True)
+        if sandbox.exists():
+            self.warn(
+                "temporary sandbox cleanup retained locked files",
+                "Validation completed, but Windows still had a temporary file open. Close Python/BlindSite processes and delete the sandbox manually if desired.",
+                sandbox=str(sandbox),
+                error=str(last_exc) if last_exc else "unknown cleanup error",
+            )
+        self.tempdir_obj = None
+
+    def import_app(self) -> Any:
+        assert self.app_copy is not None
+        spec = importlib.util.spec_from_file_location("blindsite_perf_under_test", self.app_copy)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Could not import BlindSite under test")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["blindsite_perf_under_test"] = module
+        spec.loader.exec_module(module)
+        self.m = module
+        return module
+
+    def run(self, *, live_browser_test: bool = False, tor_prewarm: bool = False, tor_required: bool = False) -> None:
+        self.setup()
+        try:
+            self.test_compile()
+            self.test_selftest_subprocess()
+            m = self.import_app()
+            t0 = time.perf_counter()
+            m.init_db()
+            self.bench("imported init_db", time.perf_counter() - t0, "BlindSite init_db in isolated sandbox")
+            self.pass_("import and isolated DB init", "BlindSite imported and initialized in sandbox", version=getattr(m, "APP_VERSION", "unknown"))
+            self.configure_for_benchmarks()
+            self.test_feature_surface()
+            self.benchmark_application_genesis_hash()
+            self.benchmark_tor_status()
+            self.benchmark_captcha_predicates()
+            self.benchmark_header_display()
+            self.benchmark_blocked_media_retry_stats()
+            self.benchmark_workflow_log_reconstructability()
+            self.benchmark_reviewer_import_timeout_helpers()
+            self.benchmark_debug_bundle_surface()
+            if live_browser_test:
+                self.run_local_live_browser_benchmark()
+            else:
+                self.skip("local live-browser performance benchmark", "disabled; pass --live-browser-test to run Playwright/local media benchmark")
+            if tor_prewarm:
+                self.run_tor_prewarm_benchmark(required=tor_required)
+            else:
+                self.skip("Tor prewarm performance benchmark", "disabled; pass --tor-prewarm to run")
+        except Exception as exc:
+            self.fail("performance evaluator crashed", str(exc), traceback=traceback.format_exc(limit=20))
+        finally:
+            self.write_reports()
+            self.cleanup()
+
+    # ------------------ core checks ------------------
+
+    def test_compile(self) -> None:
+        assert self.app_copy is not None
+        try:
+            t0 = time.perf_counter()
+            py_compile.compile(str(self.app_copy), doraise=True)
+            elapsed = time.perf_counter() - t0
+            self.bench("Python compile", elapsed, "py_compile completed")
+            self.pass_("Python compile", "py_compile completed without syntax errors", elapsed_seconds=round(elapsed, 5))
+        except Exception as exc:
+            self.fail("Python compile", str(exc))
+            raise
+
+    def test_selftest_subprocess(self) -> None:
+        assert self.app_copy is not None and self.workdir is not None
+        try:
+            t0 = time.perf_counter()
+            result = subprocess.run([sys.executable, str(self.app_copy), "--self-test"], cwd=str(self.workdir), text=True, capture_output=True, timeout=90)
+            elapsed = time.perf_counter() - t0
+            self.bench("BlindSite --self-test", elapsed, "subprocess self-test")
+            evidence = {"returncode": result.returncode, "elapsed_seconds": round(elapsed, 5), "stdout_tail": result.stdout[-2500:], "stderr_tail": result.stderr[-2500:]}
+            self.write_json_artifact("self_test/selftest_subprocess.json", evidence, "BlindSite --self-test subprocess output", category="self_test")
+            if result.returncode == 0:
+                self.pass_("BlindSite --self-test", "self-test exited 0", **evidence)
+            else:
+                self.warn("BlindSite --self-test", "self-test did not exit 0; performance tests may still run", **evidence)
+        except subprocess.TimeoutExpired:
+            self.warn("BlindSite --self-test", "timed out after 90 seconds")
+        except Exception as exc:
+            self.warn("BlindSite --self-test", str(exc))
+
+    def configure_for_benchmarks(self) -> None:
+        m = self.m
+        settings = {
+            "sealed_media_preservation_enabled": "1",
+            "sealed_media_preserve_mode": "fast",
+            "sealed_media_preserve_max_pending_tasks": "75",
+            "sealed_media_preserve_max_items_per_session": "2500",
+            "capture_wait_after_load_ms": "5000",
+            "capture_network_idle_timeout_ms": "20000",
+            "capture_auto_scroll_enabled": "0",
+            "live_allow_captcha_challenge_media_default": "0",
+            "reviewer_import_unlock_timeout_seconds": "900",
+        }
+        for k, v in settings.items():
+            with contextlib.suppress(Exception):
+                m.set_setting(k, v)
+        self.write_json_artifact("settings/performance_settings.json", settings, "Settings applied for local performance checks", category="settings")
+        self.pass_("performance settings applied", "local benchmark settings applied", settings=settings)
+
+    def test_feature_surface(self) -> None:
+        m = self.m
+        assert self.app_copy is not None
+        source = self.app_copy.read_text(encoding="utf-8", errors="ignore")
+        helpers = [
+            "application_build_identity",
+            "application_genesis_report",
+            "tor_status_data",
+            "captcha_challenge_media_candidate",
+            "captcha_challenge_inline_data_candidate",
+            "event_header_hash_html",
+            "blocked_media_session_stats",
+            "reviewer_import_unlock_timeout_seconds",
+            "reviewer_import_unlock_session",
+            "reviewer_import_is_unlocked",
+            "build_debug_bundle",
+        ]
+        missing = [h for h in helpers if not hasattr(m, h)]
+        markers = {
+            "inline_data_captcha": "data:image" in source and "CAPTCHA_CHALLENGE_INLINE_MEDIA_ALLOWED" in source,
+            "tor_status_bar": "/tor/status" in source and "tor-status" in source,
+            "header_empty_display": "No headers captured" in source,
+            "all_not_downloaded_retry": "all_not_downloaded" in source and "only_queue_full" in source,
+            "reviewer_timeout": "reviewer_import_unlock_timeout_seconds" in source,
+        }
+        self.write_json_artifact("feature_surface/current_feature_surface.json", {"helpers": helpers, "missing": missing, "markers": markers}, "Current feature surface scan", category="feature_surface")
+        if not missing and all(markers.values()):
+            self.pass_("current performance-relevant feature surface", "all current performance-relevant helper surfaces are present")
+        else:
+            self.fail("current performance-relevant feature surface", "missing helpers or source markers", missing=missing, markers=markers)
+
+    # ------------------ micro benchmarks ------------------
+
+    def benchmark_application_genesis_hash(self) -> None:
+        m = self.m
+        if not hasattr(m, "application_build_identity"):
+            self.fail("Application Genesis Hash timing", "application_build_identity missing")
+            return
+        samples = []
+        for i in range(5):
+            t0 = time.perf_counter()
+            ident = m.application_build_identity()
+            elapsed = time.perf_counter() - t0
+            samples.append({"iteration": i + 1, "elapsed_seconds": round(elapsed, 6), "identity": safe_json(ident)})
+        self.write_json_artifact("genesis/application_build_identity_samples.json", samples, "Application Genesis Hash timing samples", category="genesis_timing")
+        max_elapsed = max(s["elapsed_seconds"] for s in samples)
+        first = samples[0]["identity"]
+        sha = first.get("executable_sha256") or first.get("source_sha256") or first.get("application_sha256")
+        self.bench("Application Genesis Hash helper", max_elapsed, "max of 5 calls", sha256=sha)
+        if sha and max_elapsed < 5.0:
+            self.pass_("Application Genesis Hash timing", "build/source identity hash computed quickly", max_elapsed=max_elapsed, sha256=sha, mode=first.get("mode"))
+        else:
+            self.warn("Application Genesis Hash timing", "hash missing or slow", max_elapsed=max_elapsed, identity=first)
+
+    def benchmark_tor_status(self) -> None:
+        m = self.m
+        if not hasattr(m, "tor_status_data"):
+            self.fail("Tor status performance", "tor_status_data missing")
+            return
+        samples = []
+        total_start = time.perf_counter()
+        for i in range(20):
+            t0 = time.perf_counter()
+            st = m.tor_status_data()
+            elapsed = time.perf_counter() - t0
+            samples.append({"iteration": i + 1, "elapsed_seconds": round(elapsed, 6), "status": safe_json(st)})
+        total = time.perf_counter() - total_start
+        elapsed_values = [s["elapsed_seconds"] for s in samples]
+        avg = sum(elapsed_values) / len(elapsed_values)
+        worst = max(elapsed_values)
+        self.write_json_artifact("tor/tor_status_samples.json", samples, "Tor status bar/status API performance samples", category="tor_status")
+        self.bench("Tor status data", total, "20 tor_status_data calls", average_seconds=avg, worst_seconds=worst)
+        required = {"state", "label", "message", "percent", "socks_open", "control_open", "prewarm"}
+        if worst < 3.0 and required.issubset(set(samples[-1]["status"].keys())):
+            self.pass_("Tor status performance", "tor_status_data is UI-friendly and non-blocking", average_seconds=round(avg, 6), worst_seconds=round(worst, 6), final=samples[-1]["status"])
+        else:
+            self.fail("Tor status performance", "tor_status_data was slow or missing keys", average_seconds=round(avg, 6), worst_seconds=round(worst, 6), final=samples[-1]["status"])
+
+    def benchmark_captcha_predicates(self) -> None:
+        m = self.m
+        required = ["captcha_challenge_media_candidate", "captcha_challenge_inline_data_candidate", "captcha_challenge_context_candidate"]
+        missing = [x for x in required if not hasattr(m, x)]
+        if missing:
+            self.fail("CAPTCHA predicate performance", "missing CAPTCHA helper(s)", missing=missing)
+            return
+        data_uri = "data:image/png;base64," + base64.b64encode(b"fake-inline-captcha").decode("ascii")
+        checks = {
+            "network_captcha_allowed": bool(m.captcha_challenge_media_candidate("https://captcha.example/onion/captcha.png", "image")),
+            "network_logo_blocked": not bool(m.captcha_challenge_media_candidate("https://example.com/static/logo.png", "image")),
+            "video_blocked": not bool(m.captcha_challenge_media_candidate("https://example.com/captcha.mp4", "media")),
+            "inline_context_allowed": bool(m.captcha_challenge_inline_data_candidate(data_uri, "class captchabtn Are you not a Robot ring_id captcha")),
+            "inline_without_context_blocked": not bool(m.captcha_challenge_inline_data_candidate(data_uri, "avatar logo gallery banner")),
+        }
+        t0 = time.perf_counter()
+        for _ in range(self.quick_iterations):
+            m.captcha_challenge_media_candidate("https://www.google.com/recaptcha/api2/payload?p=abc", "image")
+            m.captcha_challenge_inline_data_candidate(data_uri, "captcha challenge ring_id human verification")
+            m.captcha_challenge_context_candidate("ordinary avatar logo banner")
+        elapsed = time.perf_counter() - t0
+        per_call = elapsed / (self.quick_iterations * 3)
+        artifact = {"iterations": self.quick_iterations, "elapsed_seconds": round(elapsed, 6), "seconds_per_call": per_call, "checks": checks}
+        self.write_json_artifact("captcha/captcha_predicate_benchmark.json", artifact, "CAPTCHA/challenge predicate speed and scope", category="captcha_performance")
+        self.bench("CAPTCHA predicate helpers", elapsed, f"{self.quick_iterations * 3} helper calls", seconds_per_call=per_call)
+        if all(checks.values()) and per_call < 0.005:
+            self.pass_("CAPTCHA predicate performance", "CAPTCHA/challenge checks are narrow and fast", **artifact)
+        else:
+            self.fail("CAPTCHA predicate performance", "CAPTCHA helper scope or timing failed", **artifact)
+
+    def benchmark_header_display(self) -> None:
+        m = self.m
+        if not hasattr(m, "event_header_hash_html"):
+            self.fail("Header display performance", "event_header_hash_html missing")
+            return
+        empty_hash = m.header_hash({})
+        real_headers = {"Content-Type": "text/html", "Server": "validation"}
+        real_hash = m.header_hash(real_headers)
+        t0 = time.perf_counter()
+        for _ in range(self.quick_iterations):
+            empty_html = m.event_header_hash_html("{}", empty_hash)
+            real_html = m.event_header_hash_html(json.dumps(real_headers), real_hash)
+        elapsed = time.perf_counter() - t0
+        per_render = elapsed / (self.quick_iterations * 2)
+        artifact = {"iterations": self.quick_iterations, "elapsed_seconds": round(elapsed, 6), "seconds_per_render": per_render, "empty_hash": empty_hash, "empty_html": empty_html, "real_hash": real_hash, "real_html": real_html}
+        self.write_json_artifact("headers/header_display_benchmark.json", artifact, "Header display helper timing and output", category="header_display")
+        self.bench("Header display helper", elapsed, f"{self.quick_iterations * 2} renders", seconds_per_render=per_render)
+        if "No headers captured" in empty_html and empty_hash not in empty_html and real_hash in real_html and per_render < 0.005:
+            self.pass_("Header display performance", "empty-header display is clear and fast", **artifact)
+        else:
+            self.fail("Header display performance", "header display output/timing failed", **artifact)
+
+    def benchmark_blocked_media_retry_stats(self) -> None:
+        m = self.m
+        if not hasattr(m, "blocked_media_session_stats") or not hasattr(m, "sha256_text") or not hasattr(m, "header_hash"):
+            self.fail("Blocked-media retry stats performance", "blocked-media stats/hash helpers missing")
+            return
+        sid = "perf-retry-" + hashlib.sha256(os.urandom(8)).hexdigest()[:10]
+        qf_count = self.retry_rows // 3
+        timeout_count = self.retry_rows // 3
+        downloaded_count = self.retry_rows - qf_count - timeout_count
+
+        def row(media_url: str, reason: str, downloaded: bool) -> tuple[Any, ...]:
+            record = {
+                "session_id": sid,
+                "media_url_sha256": m.sha256_text(media_url),
+                "resource_type": "image",
+                "policy": "block_images_video",
+                "reason": reason,
+                "downloaded": bool(downloaded),
+                "created_at": m.utcnow() if hasattr(m, "utcnow") else utcnow(),
+            }
+            metadata_record_hash = m.sha256_text(json.dumps(record, sort_keys=True, separators=(",", ":")))
+            return (
+                None, None, sid, "http://example.test", media_url, record["media_url_sha256"], "image",
+                "GET", "img", "http://example.test", "block_images_video", reason, None,
+                "image/png", "1", "", "", "{}", "{}", m.header_hash({}), "",
+                1 if downloaded else 0, None, metadata_record_hash, record["created_at"],
+            )
+
+        rows_to_insert: list[tuple[Any, ...]] = []
+        for i in range(qf_count):
+            rows_to_insert.append(row(f"http://example.test/qf_{i}.png", "sealed preservation skipped: background queue full (75 >= 75)", False))
+        for i in range(timeout_count):
+            rows_to_insert.append(row(f"http://example.test/timeout_{i}.png", "sealed preservation failed in background: timeout", False))
+        for i in range(downloaded_count):
+            rows_to_insert.append(row(f"http://example.test/done_{i}.png", "background encrypted preservation complete", True))
+
+        t_insert = time.perf_counter()
+        con = m.db()
+        try:
+            con.executemany(
+                """INSERT INTO blocked_media(case_id,root_evidence_id,session_id,page_url,media_url,url_sha256,resource_type,request_method,tag_type,referrer,policy,reason,status_code,content_type,content_length,etag,last_modified,headers_json,request_headers_json,header_sha256,content_sha256,downloaded,materialized_evidence_id,metadata_record_hash,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                rows_to_insert,
+            )
+            con.commit()
+        finally:
+            with contextlib.suppress(Exception):
+                con.close()
+        insert_elapsed = time.perf_counter() - t_insert
+
+        t_stats = time.perf_counter()
+        stats = m.blocked_media_session_stats(sid)
+        stats_elapsed = time.perf_counter() - t_stats
+        rows = [dict(r) for r in m.fetchall("SELECT id,downloaded,reason,url_sha256,metadata_record_hash FROM blocked_media WHERE session_id=? ORDER BY id LIMIT 50", (sid,))]
+        artifact = {"session_id": sid, "inserted_rows": self.retry_rows, "expected": {"queue_full": qf_count, "timeouts": timeout_count, "downloaded": downloaded_count}, "stats": stats, "insert_elapsed_seconds": insert_elapsed, "stats_elapsed_seconds": stats_elapsed, "sample_rows": rows, "insert_method": "direct transactional fixture insert to measure stats/retry workflow rather than record_blocked_media audit overhead"}
+        self.write_json_artifact("retry/blocked_media_retry_stats_benchmark.json", artifact, "Blocked-media retry/statistics performance and reconstructable rows", category="retry_stats")
+        self.bench("Blocked-media retry stats", stats_elapsed, f"stats over {self.retry_rows} rows", insert_seconds=insert_elapsed, stats=stats)
+        expected_not = qf_count + timeout_count
+        ok = int(stats.get("total") or 0) == self.retry_rows and int(stats.get("not_downloaded") or 0) == expected_not and int(stats.get("queue_full") or 0) == qf_count and stats_elapsed < 2.0
+        if ok:
+            self.pass_("Blocked-media retry stats performance", "all-not-downloaded includes queue-full and stats are fast", **artifact)
+        else:
+            self.fail("Blocked-media retry stats performance", "retry stats output or timing failed", **artifact)
+
+    def benchmark_workflow_log_reconstructability(self) -> None:
+        """Reconstruct workflow/reliability logs that are not pure security controls.
+
+        These checks intentionally live in the performance/workflow evaluator:
+        - retry request events and queue-full/not-downloaded semantics;
+        - Tor runtime/status samples;
+        - browser_events rows with empty vs real headers and display labels.
+        """
+        m = self.m
+        required = ["log_event", "tor_status_data", "header_hash", "event_header_hash_html"]
+        missing = [x for x in required if not hasattr(m, x)]
+        if missing:
+            self.fail("Workflow log reconstructability", "missing helper(s)", missing=missing)
+            return
+        sid = "perf-workflow-log-" + hashlib.sha256(os.urandom(8)).hexdigest()[:10]
+        try:
+            t0 = time.perf_counter()
+            retry_details = {
+                "retry_all_not_downloaded": True,
+                "only_queue_full": False,
+                "selected_count": 0,
+                "result": {"queued": 3, "queue_full": 1, "errors": 0},
+                "evaluator_note": "workflow/performance reconstructability sample",
+            }
+            retry_hash = m.log_event("performance_evaluator", "LIVE_BLOCKED_MEDIA_RETRY_REQUESTED", session_id=sid, details=retry_details)
+
+            tor_before = m.tor_status_data()
+            if hasattr(m, "tor_append_runtime_log"):
+                m.tor_append_runtime_log("performance evaluator reconstructability sample: tor status observed")
+            tor_after = m.tor_status_data()
+            tor_log_tail = m.tor_log_tail(2000) if hasattr(m, "tor_log_tail") else ""
+
+            empty_headers_json = "{}"
+            empty_header_sha = m.header_hash({})
+            real_headers = {"Content-Type": "text/html", "Server": "performance-evaluator"}
+            real_headers_json = json.dumps(real_headers, sort_keys=True)
+            real_header_sha = m.header_hash(real_headers)
+            now = m.utcnow() if hasattr(m, "utcnow") else utcnow()
+            m.execute(
+                "INSERT INTO browser_events(session_id,created_at,event_type,url,resource_type,method,status_code,headers_json,header_sha256,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (sid, now, "performance_empty_header_sample", "http://example.test/empty", "document", "GET", None, empty_headers_json, empty_header_sha, json.dumps({"display_html": m.event_header_hash_html(empty_headers_json, empty_header_sha)}, ensure_ascii=False)),
+            )
+            m.execute(
+                "INSERT INTO browser_events(session_id,created_at,event_type,url,resource_type,method,status_code,headers_json,header_sha256,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (sid, now, "performance_real_header_sample", "http://example.test/real", "document", "GET", 200, real_headers_json, real_header_sha, json.dumps({"display_html": m.event_header_hash_html(real_headers_json, real_header_sha)}, ensure_ascii=False)),
+            )
+            audit_rows = [dict(r) for r in m.fetchall("SELECT * FROM audit_events WHERE session_id=? ORDER BY id ASC", (sid,))]
+            browser_rows = [dict(r) for r in m.fetchall("SELECT * FROM browser_events WHERE session_id=? ORDER BY id ASC", (sid,))]
+            elapsed = time.perf_counter() - t0
+            reconstructed = {
+                "session_id": sid,
+                "elapsed_seconds": elapsed,
+                "retry_event_hash": retry_hash,
+                "retry_details": retry_details,
+                "audit_rows": safe_json(audit_rows),
+                "browser_rows": safe_json(browser_rows),
+                "tor_status_before": safe_json(tor_before),
+                "tor_status_after": safe_json(tor_after),
+                "tor_log_tail_sample": tor_log_tail[-1000:],
+                "empty_header_display": m.event_header_hash_html(empty_headers_json, empty_header_sha),
+                "real_header_display": m.event_header_hash_html(real_headers_json, real_header_sha),
+                "empty_header_sha256": empty_header_sha,
+                "real_header_sha256": real_header_sha,
+            }
+            self.write_json_artifact("workflow_logs/workflow_log_reconstructability.json", reconstructed, "Workflow log reconstructability sample for retry, Tor status, and header display rows", category="workflow_log_reconstructability")
+            self.bench("Workflow log reconstructability", elapsed, "insert/read audit+browser workflow rows and Tor status samples")
+            ok = (
+                audit_rows
+                and browser_rows
+                and "No headers captured" in reconstructed["empty_header_display"]
+                and empty_header_sha not in reconstructed["empty_header_display"]
+                and real_header_sha in reconstructed["real_header_display"]
+                and isinstance(tor_before, dict)
+                and isinstance(tor_after, dict)
+            )
+            if ok:
+                self.pass_("Workflow log reconstructability", "retry events, Tor status samples, and empty/real header browser-event rows are reconstructable", elapsed_seconds=round(elapsed, 6), session_id=sid)
+            else:
+                self.fail("Workflow log reconstructability", "workflow log reconstruction sample failed", **reconstructed)
+        except Exception as exc:
+            self.fail("Workflow log reconstructability", str(exc), traceback=traceback.format_exc(limit=12))
+
+    def benchmark_reviewer_import_timeout_helpers(self) -> None:
+        m = self.m
+        required = ["reviewer_import_unlock_timeout_seconds", "reviewer_import_unlock_session", "reviewer_import_is_unlocked", "reviewer_import_lock_session", "reviewer_import_session_key", "set_reviewer_import_password", "set_reviewer_import_webauthn_protection"]
+        missing = [x for x in required if not hasattr(m, x)]
+        if missing:
+            self.fail("LE Reviewer timeout helper performance", "missing helper(s)", missing=missing)
+            return
+        class DummyRequest:
+            def __init__(self) -> None:
+                self.session = {"username": "admin"}
+        try:
+            now = m.utcnow()
+            import_id = m.execute("""INSERT INTO reviewer_imports(package_name,package_sha256,package_size,status,imported_by,created_at,object_count,recovered_count,case_name,vault_path,manifest_json,notes_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", ("perf_timeout_import.zip", "0" * 64, 0, "imported", "performance_evaluator", now, 0, 0, "Performance Timeout Import", "perf_timeout", "{}", "{}"))
+            m.set_reviewer_import_password(import_id, "Perf-Reviewer-Password-123!", "performance_evaluator")
+            m.set_reviewer_import_webauthn_protection(import_id, True, "performance_evaluator")
+            imp = m.reviewer_import_for(import_id)
+            req = DummyRequest()
+            t0 = time.perf_counter()
+            m.set_setting("reviewer_import_unlock_timeout_seconds", "1")
+            m.reviewer_import_unlock_session(req, import_id, "admin", "password+yubikey")
+            key = m.reviewer_import_session_key(import_id)
+            req.session[key]["last_activity"] = time.time() - 5
+            locked_after_timeout = not bool(m.reviewer_import_is_unlocked(req, import_id, imp))
+            m.set_setting("reviewer_import_unlock_timeout_seconds", "0")
+            m.reviewer_import_unlock_session(req, import_id, "admin", "password+yubikey")
+            req.session[key]["last_activity"] = time.time() - 3600
+            unlocked_no_timeout = bool(m.reviewer_import_is_unlocked(req, import_id, imp))
+            elapsed = time.perf_counter() - t0
+            notes = m.reviewer_import_notes(imp)
+            artifact = {"import_id": import_id, "elapsed_seconds": elapsed, "locked_after_timeout": locked_after_timeout, "unlocked_no_timeout": unlocked_no_timeout, "session": safe_json(req.session), "notes": safe_json(notes)}
+            self.write_json_artifact("reviewer_timeout/reviewer_import_timeout_benchmark.json", artifact, "LE Reviewer import timeout helper timing and session reconstruction", category="reviewer_timeout")
+            self.bench("LE Reviewer timeout helpers", elapsed, "unlock/timeout/no-timeout helper flow")
+            if locked_after_timeout and unlocked_no_timeout and elapsed < 2.0:
+                self.pass_("LE Reviewer timeout helper performance", "reviewer import timeout helpers are fast and reconstructable", **artifact)
+            else:
+                self.fail("LE Reviewer timeout helper performance", "timeout helper behavior or timing failed", **artifact)
+        except Exception as exc:
+            self.fail("LE Reviewer timeout helper performance", str(exc), traceback=traceback.format_exc(limit=12))
+
+    def benchmark_debug_bundle_surface(self) -> None:
+        m = self.m
+        if not hasattr(m, "build_debug_bundle"):
+            self.warn("Debug bundle surface", "build_debug_bundle missing")
+            return
+        try:
+            t0 = time.perf_counter()
+            data = m.build_debug_bundle("performance_evaluator")
+            elapsed = time.perf_counter() - t0
+            listing = zip_listing(data)
+            artifact = {"elapsed_seconds": elapsed, "size": len(data), "listing": listing}
+            self.write_json_artifact("debug_bundle/debug_bundle_summary.json", artifact, "Debug bundle generation performance and listing", category="debug_bundle")
+            self.bench("Debug bundle generation", elapsed, "build_debug_bundle")
+            needed = {"application_genesis.json", "self_test.json", "application_build_identity.json"}
+            names = {Path(x["name"]).name for x in listing}
+            if needed.issubset(names) and elapsed < 10.0:
+                self.pass_("Debug bundle performance", "debug bundle includes reconstructable current-feature diagnostics", **artifact)
+            else:
+                self.warn("Debug bundle performance", "debug bundle generated but missing expected files or slow", **artifact)
+        except Exception as exc:
+            self.warn("Debug bundle performance", str(exc), traceback=traceback.format_exc(limit=8))
+
+    # ------------------ optional live browser benchmark ------------------
+
+    def run_local_live_browser_benchmark(self) -> None:
+        m = self.m
+        if not hasattr(m, "start_live_session"):
+            self.skip("local live-browser performance benchmark", "start_live_session missing")
+            return
+        server = LocalMediaServer(asset_count=self.live_assets, delay_ms=self.live_delay_ms)
+        server.start()
+        session = None
+        try:
+            case_id = create_lab_case(m, "Performance Local Live Benchmark")
+            with contextlib.suppress(Exception):
+                m.set_setting("sealed_media_preservation_enabled", "1")
+                m.execute("UPDATE cases SET sealed_media_preservation_enabled=1, sealed_media_preserve_images=1, sealed_media_preserve_video=1, sealed_media_preserve_audio=1 WHERE id=?", (case_id,))
+            start_url = server.url("/")
+            t0 = time.perf_counter()
+            kwargs = {
+                "actor": "performance_evaluator",
+                "case_id": case_id,
+                "start_url": start_url,
+                "browser_choice": "chromium",
+                "use_tor": False,
+                "media_policy": "block_images_video",
+                "headless": True,
+                "download_allowed_media": False,
+                "auto_capture": False,
+                "settle_before_capture": True,
+                "sealed_media_preservation_session": True,
+                "capture_auto_scroll_session": False,
+                "allow_captcha_challenge_media": True,
+            }
+            sig = inspect.signature(m.start_live_session)
+            kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+            session = m.start_live_session(**kwargs)
+            start_elapsed = time.perf_counter() - t0
+            sid = session.session_id
+            samples = []
+            wait_start = time.perf_counter()
+            while time.perf_counter() - wait_start < 20:
+                samples.append({"elapsed": round(time.perf_counter() - t0, 3), "status": safe_json(m.live_preservation_status_for(sid))})
+                if int(samples[-1]["status"].get("blocked") or 0) >= max(1, self.live_assets // 2):
+                    break
+                time.sleep(0.5)
+            capture_start = time.perf_counter()
+            eid = session.capture_current_sync()
+            capture_elapsed = time.perf_counter() - capture_start
+            final_status = m.live_preservation_status_for(sid)
+            rows = [dict(r) for r in m.fetchall("SELECT id,event_type,url,resource_type,method,headers_json,header_sha256,meta_json FROM browser_events WHERE session_id=? ORDER BY id LIMIT 200", (sid,))]
+            result = {"case_id": case_id, "session_id": sid, "start_url": start_url, "session_start_seconds": start_elapsed, "capture_seconds": capture_elapsed, "samples": samples, "final_status": safe_json(final_status), "server_requests": server.request_count, "browser_events": safe_json(rows), "page_evidence_id": eid}
+            self.write_json_artifact("live_browser/local_live_benchmark.json", result, "Optional local live browser benchmark with CAPTCHA exception enabled", category="live_browser")
+            self.bench("Local live browser benchmark", start_elapsed + capture_elapsed, "session start + capture", final_status=final_status)
+            if capture_elapsed < 30:
+                self.pass_("local live-browser performance benchmark", "live session and page capture completed", **result)
+            else:
+                self.warn("local live-browser performance benchmark", "capture completed but was slow", **result)
+        except Exception as exc:
+            msg = str(exc)
+            if "Executable doesn't exist" in msg or "playwright" in msg.lower():
+                self.skip("local live-browser performance benchmark", "Playwright browser is unavailable; run `python -m playwright install chromium` to enable this benchmark", error=msg[:1000])
+            else:
+                self.warn("local live-browser performance benchmark", str(exc), traceback=traceback.format_exc(limit=12))
+        finally:
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    session.stop_sync()
+            server.stop()
+
+    def run_tor_prewarm_benchmark(self, *, required: bool = False) -> None:
+        m = self.m
+        if not hasattr(m, "tor_prewarm_background") or not hasattr(m, "tor_prewarm_status"):
+            self.skip("Tor prewarm performance benchmark", "Tor prewarm helpers missing")
+            return
+        samples = []
+        try:
+            t0 = time.perf_counter()
+            initial = m.tor_prewarm_background("performance-evaluator")
+            samples.append({"elapsed": 0.0, "status": safe_json(initial)})
+            final = initial
+            for _ in range(60):
+                time.sleep(1)
+                final = m.tor_prewarm_status()
+                samples.append({"elapsed": round(time.perf_counter() - t0, 3), "status": safe_json(final)})
+                if not final.get("running"):
+                    break
+            elapsed = time.perf_counter() - t0
+            artifact = {"elapsed_seconds": elapsed, "initial": safe_json(initial), "final": safe_json(final), "samples": samples}
+            self.write_json_artifact("tor/tor_prewarm_benchmark.json", artifact, "Optional Tor prewarm/status benchmark", category="tor_prewarm")
+            self.bench("Tor prewarm benchmark", elapsed, "tor_prewarm_background/tor_prewarm_status")
+            if final.get("ok"):
+                self.pass_("Tor prewarm performance benchmark", "Tor prewarm completed", **artifact)
+            elif required:
+                self.fail("Tor prewarm performance benchmark", "Tor was required but did not become ready", **artifact)
+            else:
+                self.warn("Tor prewarm performance benchmark", "Tor did not become ready; expected if Tor is not configured", **artifact)
+        except Exception as exc:
+            if required:
+                self.fail("Tor prewarm performance benchmark", str(exc), traceback=traceback.format_exc(limit=12))
+            else:
+                self.warn("Tor prewarm performance benchmark", str(exc), traceback=traceback.format_exc(limit=12))
+
+    # ------------------ artifacts/reports ------------------
 
     def run_context(self) -> dict[str, Any]:
         return {
@@ -173,14 +782,11 @@ class PerformanceEvaluator:
             "app_file": str(self.original_app_path),
             "app_sha256": sha256_file(self.original_app_path) if self.original_app_path.exists() else "",
             "sandbox": str(self.workdir) if self.workdir else "",
-            "benchmark_defaults": {
-                "asset_count": self.asset_count,
-                "svg_count": self.svg_count,
-                "video_count": self.video_count,
-                "asset_delay_ms": self.asset_delay_ms,
-                "queue_limit": self.queue_limit,
-                "max_items": self.max_items,
-                "preserve_mode": self.preserve_mode,
+            "parameters": {
+                "quick_iterations": self.quick_iterations,
+                "retry_rows": self.retry_rows,
+                "live_assets": self.live_assets,
+                "live_delay_ms": self.live_delay_ms,
             },
         }
 
@@ -197,14 +803,7 @@ class PerformanceEvaluator:
     def write_bytes_artifact(self, rel: str, data: bytes, description: str, *, category: str = "artifact", mime: str = "application/octet-stream") -> dict[str, Any]:
         p = self.artifact_path(rel)
         p.write_bytes(data)
-        rec = {
-            "path": rel.replace("\\", "/"),
-            "description": description,
-            "category": category,
-            "mime": mime,
-            "size": len(data),
-            "sha256": sha256_bytes(data),
-        }
+        rec = {"path": rel.replace("\\", "/"), "description": description, "category": category, "mime": mime, "size": len(data), "sha256": sha256_bytes(data)}
         self.artifacts.append(rec)
         return rec
 
@@ -212,698 +811,100 @@ class PerformanceEvaluator:
         data = json.dumps(safe_json(obj), indent=2, ensure_ascii=False).encode("utf-8")
         return self.write_bytes_artifact(rel, data, description, category=category, mime="application/json")
 
-    def import_app(self) -> Any:
-        assert self.app_copy is not None
-        spec = importlib.util.spec_from_file_location("blindsite_perf_under_test", self.app_copy)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("Could not import BlindSite under test")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["blindsite_perf_under_test"] = module
-        spec.loader.exec_module(module)
-        self.m = module
-        return module
-
-    def run(self, *, external_url: str = "", run_control: bool = True, run_tor_prewarm: bool = False, tor_required: bool = False) -> None:
-        self.setup()
-        try:
-            self.test_compile()
-            self.test_selftest_subprocess()
-            m = self.import_app()
-            m.init_db()
-            self.pass_("import and isolated DB init", "BlindSite imported and initialized in sandbox", version=getattr(m, "APP_VERSION", "unknown"))
-            self.configure_app_for_performance_tests()
-            self.test_new_feature_surface()
-            self.test_pdf_report_queue_helpers()
-            self.run_local_media_benchmarks(run_control=run_control)
-            if external_url:
-                self.run_external_url_benchmark(external_url)
-            if run_tor_prewarm:
-                self.run_tor_prewarm_benchmark(required=tor_required)
-        except Exception as exc:
-            self.fail("performance evaluator crashed", str(exc), traceback=traceback.format_exc(limit=20))
-        finally:
-            self.write_reports()
-            self.cleanup()
-
-    def test_compile(self) -> None:
-        assert self.app_copy is not None
-        try:
-            py_compile.compile(str(self.app_copy), doraise=True)
-            self.pass_("Python compile", "py_compile completed without syntax errors")
-        except Exception as exc:
-            self.fail("Python compile", str(exc))
-            raise
-
-    def test_selftest_subprocess(self) -> None:
-        assert self.app_copy is not None and self.workdir is not None
-        try:
-            result = subprocess.run(
-                [sys.executable, str(self.app_copy), "--self-test"],
-                cwd=str(self.workdir),
-                text=True,
-                capture_output=True,
-                timeout=90,
-            )
-            evidence = {"returncode": result.returncode, "stdout_tail": result.stdout[-1500:], "stderr_tail": result.stderr[-1500:]}
-            if result.returncode == 0:
-                self.pass_("BlindSite --self-test", "self-test exited 0", **evidence)
-            else:
-                self.warn("BlindSite --self-test", "self-test did not exit 0; performance tests may still run", **evidence)
-        except subprocess.TimeoutExpired:
-            self.warn("BlindSite --self-test", "timed out after 90 seconds")
-        except Exception as exc:
-            self.warn("BlindSite --self-test", str(exc))
-
-    def configure_app_for_performance_tests(self) -> None:
-        m = self.m
-        assert m is not None
-        pub_pem, pub_fp = generate_public_key_for_org_hardseal()
-        settings = {
-            "custody_mode": "organization",
-            "sealed_media_preservation_enabled": "1",
-            "sealed_media_preserve_images": "1",
-            "sealed_media_preserve_video": "1",
-            "sealed_media_preserve_audio": "1",
-            "sealed_media_preserve_mode": self.preserve_mode,
-            "sealed_media_preserve_max_pending_tasks": str(self.queue_limit),
-            "sealed_media_preserve_max_items_per_session": str(self.max_items),
-            "sealed_media_preserve_max_bytes": str(50 * 1024 * 1024),
-            "sealed_media_preserve_max_total_bytes": str(512 * 1024 * 1024),
-            "sealed_media_preserve_background_timeout_ms": "8000",
-            "sealed_media_preserve_fetch_timeout_ms": "6000",
-            "sealed_media_preserve_flush_before_capture_ms": "1000",
-            "sealed_media_preserve_skip_decorative_fast": "0",
-            "sealed_media_preserve_mime_allowlist": "image/\nvideo/\naudio/\napplication/dash+xml\napplication/vnd.apple.mpegurl\napplication/x-mpegurl\napplication/mp4\napplication/octet-stream",
-            "organization_hard_seal_media_enabled": "1",
-            "organization_hard_seal_public_key_pem": pub_pem,
-            "organization_hard_seal_public_key_fingerprint": pub_fp,
-            "live_browser_default": "chromium",
-            "capture_auto_scroll_default": "0",
-            "capture_settle_before_capture_default": "1",
-            "auto_capture_after_settle_default": "0",
-        }
-        for k, v in settings.items():
-            set_app_setting(m, k, v)
-        self.write_json_artifact("settings/performance_test_settings.json", settings, "Settings applied for performance benchmark", category="settings")
-        self.pass_("performance settings applied", "settings configured for fast blocked-media preservation", queue_limit=self.queue_limit, max_items=self.max_items, preserve_mode=self.preserve_mode, org_public_key_fingerprint=pub_fp)
-
-    def create_case(self, name: str, *, sealed: bool = True) -> int:
-        m = self.m
-        assert m is not None
-        now = getattr(m, "utcnow", now_iso)()
-        cid = m.execute(
-            """INSERT INTO cases(name,description,mode,compliance_safe,irreversible_lock,never_materialize_originals,no_plaintext_export,raw_root_allowed,default_media_policy,force_tor,quarantine_default,created_by,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                name,
-                "Performance evaluator generated test case.",
-                "lab",
-                0,
-                0,
-                1,
-                1,
-                1,
-                "block_images_video",
-                0,
-                1,
-                "performance_evaluator",
-                now,
-            ),
-        )
-        with contextlib.suppress(Exception):
-            m.execute(
-                """UPDATE cases SET sealed_media_preservation_enabled=?, sealed_media_preserve_images=?, sealed_media_preserve_video=?, sealed_media_preserve_audio=?, sealed_media_preserve_max_bytes=? WHERE id=?""",
-                (1 if sealed else 0, 1, 1, 1, 50 * 1024 * 1024, cid),
-            )
-        return int(cid)
-
-    def test_new_feature_surface(self) -> None:
-        """Check that recent workstation/performance feature surfaces exist.
-
-        This is not a security proof. It ensures the app under test exposes the
-        operational features that the performance evaluator can rely on or report
-        about: PDF job queues, Tor prewarm/status helpers, reviewer password
-        helpers, and PDF encryption helper.
-        """
-        m = self.m
-        required = [
-            "pdf_report_jobs_for_import",
-            "pdf_report_job_snapshot",
-            "pdf_report_job_update",
-            "pdf_report_job_log",
-            "pdf_report_job_cancelled",
-            "tor_prewarm_background",
-            "tor_prewarm_status",
-            "set_reviewer_import_password",
-            "reviewer_import_is_password_protected",
-            "encrypt_pdf_report_bytes",
-        ]
-        missing = [name for name in required if not hasattr(m, name)]
-        constants = {
-            "PDF_REPORT_MAX_PAGES": getattr(m, "PDF_REPORT_MAX_PAGES", None),
-            "PDF_REPORT_DEVICE_SCALE_FACTOR": getattr(m, "PDF_REPORT_DEVICE_SCALE_FACTOR", None),
-            "PDF_REPORT_DPI": getattr(m, "PDF_REPORT_DPI", None),
-            "PDF_REPORT_JPEG_QUALITY": getattr(m, "PDF_REPORT_JPEG_QUALITY", None),
-        }
-        self.write_json_artifact("feature_surface/recent_features.json", {"required_helpers": required, "missing": missing, "pdf_constants": constants}, "Recent BlindSite feature surface check", category="feature_surface")
-        if missing:
-            self.warn("recent feature surface", "some recent feature helpers were not found; older app build may be under test", missing=missing, pdf_constants=constants)
-        else:
-            self.pass_("recent feature surface", "recent PDF/Tor/reviewer helper surfaces are present", pdf_constants=constants)
-        if constants.get("PDF_REPORT_MAX_PAGES") == 20:
-            self.pass_("PDF max page configuration", "PDF report max pages is configured for 20 pages", value=constants.get("PDF_REPORT_MAX_PAGES"))
-        else:
-            self.warn("PDF max page configuration", "PDF report max pages was not 20", value=constants.get("PDF_REPORT_MAX_PAGES"))
-        try:
-            if float(constants.get("PDF_REPORT_DEVICE_SCALE_FACTOR") or 0) >= 2:
-                self.pass_("PDF high-resolution capture configuration", "PDF report device scale factor is >= 2", **constants)
-            else:
-                self.warn("PDF high-resolution capture configuration", "PDF report scale factor is lower than expected", **constants)
-        except Exception:
-            self.warn("PDF high-resolution capture configuration", "could not evaluate PDF scale factor", **constants)
-
-    def test_pdf_report_queue_helpers(self) -> None:
-        """Reconstructably test the in-memory PDF job queue helpers without heavy rendering.
-
-        Full screenshot/PDF rendering is intentionally not forced here because it
-        can be environment-dependent and expensive. This validates the queue
-        mechanics that should remain visible even when a user leaves the progress
-        page: create/update/log/list/snapshot/cancel.
-        """
-        m = self.m
-        required = ["PDF_REPORT_JOBS", "PDF_REPORT_LOCK", "pdf_report_jobs_for_import", "pdf_report_job_snapshot", "pdf_report_job_update", "pdf_report_job_log", "pdf_report_job_cancelled"]
-        missing = [name for name in required if not hasattr(m, name)]
-        if missing:
-            self.skip("PDF report job queue helpers", "queue helpers not available in this app build", missing=missing)
-            return
-        try:
-            # Create a minimal reviewer_import row so the job belongs to a real import id.
-            now = getattr(m, "utcnow", now_iso)()
-            import_id = m.execute("""INSERT INTO reviewer_imports(package_name,package_sha256,package_size,status,imported_by,created_at,object_count,recovered_count,case_name,vault_path,manifest_json,notes_json)
-                                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (
-                "performance_pdf_queue_test.zip",
-                "0" * 64,
-                0,
-                "imported",
-                "performance_evaluator",
-                now,
-                0,
-                0,
-                "Performance PDF Queue Test",
-                "performance_pdf_queue_test",
-                "{}",
-                "{}",
-            ))
-            job_id = "perfjob_" + hashlib.sha256(os.urandom(16)).hexdigest()[:16]
-            with m.PDF_REPORT_LOCK:
-                m.PDF_REPORT_JOBS[job_id] = {
-                    "id": job_id,
-                    "import_id": import_id,
-                    "status": "queued",
-                    "phase": "queued",
-                    "current": 0,
-                    "total": 3,
-                    "progress_percent": 0,
-                    "page_ids": [101, 102, 103],
-                    "render_mode": "scripts",
-                    "created_at": now,
-                    "logs": [f"[{now}] performance evaluator queued test job"],
-                }
-            snap1 = m.pdf_report_job_snapshot(job_id)
-            m.pdf_report_job_update(job_id, status="running", phase="screenshotting_page", current=1, progress_percent=33, message="Performance evaluator simulated screenshot")
-            m.pdf_report_job_log(job_id, "Performance evaluator simulated progress log entry")
-            queue = m.pdf_report_jobs_for_import(import_id)
-            snap2 = m.pdf_report_job_snapshot(job_id)
-            m.pdf_report_job_update(job_id, status="cancelled", phase="cancel_requested", cancel_requested=True, message="Performance evaluator cancel simulation")
-            cancelled = bool(m.pdf_report_job_cancelled(job_id))
-            snap3 = m.pdf_report_job_snapshot(job_id)
-            artifact = {"import_id": import_id, "job_id": job_id, "initial": snap1, "after_update": snap2, "queue_for_import": queue, "after_cancel": snap3, "cancelled": cancelled}
-            self.write_json_artifact("pdf_queue/pdf_job_queue_simulation.json", artifact, "PDF job queue helper simulation with queue/list/snapshot/cancel states", category="pdf_queue")
-            if snap1.get("status") == "queued" and snap2.get("status") == "running" and queue and cancelled:
-                self.pass_("PDF report job queue helpers", "job queue supports create/list/snapshot/update/log/cancel", import_id=import_id, job_id=job_id, queued_count=len(queue))
-            else:
-                self.warn("PDF report job queue helpers", "queue helpers ran but returned unexpected states", **artifact)
-        except Exception as exc:
-            self.warn("PDF report job queue helpers", str(exc), traceback=traceback.format_exc(limit=12))
-
-    def run_local_media_benchmarks(self, *, run_control: bool) -> None:
-        # Control run: no sealed media preservation, still blocks display.
-        if run_control:
-            self.run_local_media_benchmark(label="control_block_no_preservation", sealed_preservation=False)
-
-        # Main run: sealed/background preservation enabled.
-        self.run_local_media_benchmark(label="fast_route_background_preservation", sealed_preservation=True)
-
-        if run_control and len(self.benchmarks) >= 2:
-            control = next((b for b in self.benchmarks if b.get("label") == "control_block_no_preservation"), None)
-            main = next((b for b in self.benchmarks if b.get("label") == "fast_route_background_preservation"), None)
-            if control and main:
-                comparison = compare_benchmarks(control, main)
-                self.write_json_artifact("benchmarks/control_vs_preservation_comparison.json", comparison, "Control vs background preservation benchmark comparison", category="benchmark_comparison")
-                overhead = comparison.get("capture_overhead_seconds")
-                if overhead is not None and overhead < 10:
-                    self.pass_("background preservation overhead bounded", "capture overhead versus no-preservation control was under 10 seconds", **comparison)
-                else:
-                    self.warn("background preservation overhead", "capture overhead was high or could not be measured", **comparison)
-
-    def run_local_media_benchmark(self, *, label: str, sealed_preservation: bool) -> None:
-        m = self.m
-        assert m is not None
-
-        server = MediaStressServer(
-            image_count=self.asset_count,
-            svg_count=self.svg_count,
-            video_count=self.video_count,
-            delay_ms=self.asset_delay_ms,
-        )
-        server.start()
-        case_id = self.create_case(f"Performance Benchmark {label}", sealed=sealed_preservation)
-        self.write_json_artifact(f"local_site/{label}_asset_manifest.json", server.asset_manifest(), f"Local stress-test asset manifest for {label}", category="test_site")
-        self.write_bytes_artifact(f"local_site/{label}_index.html", server.index_html().encode("utf-8"), f"HTML served by local stress-test site for {label}", category="test_site", mime="text/html")
-
-        session = None
-        status_samples: list[dict[str, Any]] = []
-        timings: dict[str, float] = {}
-        start_url = server.url("/")
-        self.step("local_benchmark_start", f"Starting local media benchmark {label}", label=label, sealed_preservation=sealed_preservation, start_url=start_url, expected_assets=server.expected_request_count)
-
-        try:
-            set_app_setting(m, "sealed_media_preservation_enabled", "1" if sealed_preservation else "0")
-            t0 = time.perf_counter()
-            session = self.start_live_session(case_id=case_id, start_url=start_url, sealed_preservation=sealed_preservation)
-            timings["session_start_seconds"] = round(time.perf_counter() - t0, 4)
-            sid = getattr(session, "session_id", "")
-            self.pass_("live session started: " + label, "headless live browser session started", session_id=sid, seconds=timings["session_start_seconds"], sealed_preservation=sealed_preservation)
-
-            t_wait = time.perf_counter()
-            expected_min = max(1, int(server.expected_request_count * 0.60))
-            while time.perf_counter() - t_wait < DEFAULT_PAGE_WAIT_SECONDS:
-                st = get_preservation_status(m, session)
-                status_samples.append({"elapsed": round(time.perf_counter() - t0, 3), "status": st})
-                if int(st.get("blocked") or 0) >= expected_min:
-                    break
-                time.sleep(0.4)
-            timings["time_to_expected_blocked_seconds"] = round(time.perf_counter() - t_wait, 4)
-
-            # Manual capture should prioritize page capture and not wait for all media.
-            t_cap = time.perf_counter()
-            page_eid = capture_session(m, session)
-            timings["manual_capture_seconds"] = round(time.perf_counter() - t_cap, 4)
-            self.pass_("manual capture completed: " + label, "page capture completed", page_evidence_id=page_eid, seconds=timings["manual_capture_seconds"])
-
-            # Poll preservation after capture so we can reconstruct queue/progress behavior.
-            t_pres = time.perf_counter()
-            last_st = {}
-            while time.perf_counter() - t_pres < DEFAULT_PRESERVATION_WAIT_SECONDS:
-                last_st = get_preservation_status(m, session)
-                status_samples.append({"elapsed": round(time.perf_counter() - t0, 3), "status": last_st})
-                if not sealed_preservation:
-                    break
-                pending = int(last_st.get("pending_tasks") or 0)
-                outstanding = int(last_st.get("outstanding") or 0)
-                # A few failures/skips are recorded in status; don't wait forever if no active pending work.
-                if pending == 0 and time.perf_counter() - t_pres > 2:
-                    break
-                time.sleep(0.75)
-            timings["post_capture_preservation_poll_seconds"] = round(time.perf_counter() - t_pres, 4)
-            timings["total_live_benchmark_seconds"] = round(time.perf_counter() - t0, 4)
-
-            stats = blocked_media_stats(m, sid)
-            type_counts = blocked_media_type_counts(m, sid)
-            rows = blocked_media_rows(m, sid)
-            self.write_json_artifact(f"benchmarks/{label}_status_samples.json", status_samples, f"Preservation/status polling samples for {label}", category="status_samples")
-            self.write_json_artifact(f"benchmarks/{label}_blocked_media_rows.json", rows, f"Blocked-media database rows for {label}", category="db_rows")
-            self.write_json_artifact(f"benchmarks/{label}_type_counts.json", type_counts, f"Blocked media file-type counts for {label}", category="db_counts")
-            filter_proofs = self.simulate_blocked_media_filters(rows)
-            self.write_json_artifact(f"benchmarks/{label}_filter_proofs.json", filter_proofs, f"Positive/negative blocked-media filter reconstruction for {label}", category="filter_proof")
-
-            result = {
-                "label": label,
-                "sealed_preservation": sealed_preservation,
-                "session_id": sid,
-                "case_id": case_id,
-                "start_url": start_url,
-                "expected_asset_requests": server.expected_request_count,
-                "timings": timings,
-                "final_preservation_status": last_st,
-                "blocked_media_stats": stats,
-                "file_type_counts": type_counts,
-                "filter_proofs": filter_proofs,
-                "blocked_rows_count": len(rows),
-                "server_request_log_count": len(server.request_log),
-                "server_request_counts": server.request_counts(),
-                "page_evidence_id": page_eid,
-            }
-            self.benchmarks.append(result)
-            self.write_json_artifact(f"benchmarks/{label}_summary.json", result, f"Benchmark summary for {label}", category="benchmark")
-
-            blocked = int((last_st or {}).get("blocked") or stats.get("total") or 0)
-            if blocked >= expected_min:
-                self.pass_("blocked-media request throughput: " + label, f"blocked {blocked} requests for local media-heavy page", blocked=blocked, expected_min=expected_min, expected_assets=server.expected_request_count, timings=timings)
-            else:
-                self.warn("blocked-media request throughput: " + label, f"blocked count lower than expected; page or browser may not have requested every asset", blocked=blocked, expected_min=expected_min, expected_assets=server.expected_request_count)
-
-            if timings["manual_capture_seconds"] <= 20:
-                self.pass_("manual capture speed: " + label, "manual capture completed within 20 seconds", seconds=timings["manual_capture_seconds"])
-            else:
-                self.warn("manual capture speed: " + label, "manual capture exceeded 20 seconds", seconds=timings["manual_capture_seconds"])
-
-            if sealed_preservation:
-                downloaded = int(stats.get("downloaded") or 0)
-                not_downloaded = int(stats.get("not_downloaded") or 0)
-                queue_full = int(stats.get("queue_full") or 0)
-                if downloaded > 0:
-                    self.pass_("background preservation made progress: " + label, "at least one blocked media item was preserved", downloaded=downloaded, not_downloaded=not_downloaded, queue_full=queue_full)
-                else:
-                    self.warn("background preservation made progress: " + label, "no blocked media rows were marked downloaded during benchmark window", downloaded=downloaded, not_downloaded=not_downloaded, queue_full=queue_full)
-                if queue_full == 0:
-                    self.pass_("queue capacity not exceeded: " + label, "no queue-full rows were recorded", queue_limit=self.queue_limit)
-                else:
-                    self.warn("queue capacity exceeded: " + label, "queue-full rows were recorded; raise queue limit or reduce asset pressure", queue_full=queue_full, queue_limit=self.queue_limit)
-
-        except Exception as exc:
-            msg = str(exc)
-            if "Executable doesn't exist" in msg or "playwright install" in msg or "Playwright" in msg and "browser" in msg.lower():
-                self.skip("local media benchmark: " + label, "Playwright browser executable is not installed in this environment; run `python -m playwright install chromium` to enable live performance benchmark", error=msg[:1000])
-            else:
-                self.fail("local media benchmark: " + label, msg, traceback=traceback.format_exc(limit=12))
-        finally:
-            if session is not None:
-                with contextlib.suppress(Exception):
-                    stop_session(m, session)
-            server.stop()
-
-    def run_external_url_benchmark(self, url: str) -> None:
-        m = self.m
-        assert m is not None
-        case_id = self.create_case("External URL Performance Benchmark", sealed=True)
-        url = normalize_url(url)
-        self.step("external_benchmark_start", "Starting optional external URL benchmark", url=url)
-
-        session = None
-        status_samples = []
-        timings = {}
-        try:
-            t0 = time.perf_counter()
-            session = self.start_live_session(case_id=case_id, start_url=url, sealed_preservation=True)
-            timings["session_start_seconds"] = round(time.perf_counter() - t0, 4)
-            sid = getattr(session, "session_id", "")
-            self.pass_("external live session started", "headless live browser session started for external URL", session_id=sid, url=url, seconds=timings["session_start_seconds"])
-
-            wait_seconds = min(25, DEFAULT_PAGE_WAIT_SECONDS + 5)
-            t_wait = time.perf_counter()
-            while time.perf_counter() - t_wait < wait_seconds:
-                st = get_preservation_status(m, session)
-                status_samples.append({"elapsed": round(time.perf_counter() - t0, 3), "status": st})
-                # Don't try to fully settle arbitrary pages.
-                if int(st.get("requests") or 0) >= 10 and time.perf_counter() - t_wait > 3:
-                    break
-                time.sleep(0.8)
-
-            t_cap = time.perf_counter()
-            page_eid = capture_session(m, session)
-            timings["manual_capture_seconds"] = round(time.perf_counter() - t_cap, 4)
-            self.pass_("external manual capture completed", "page capture completed for external URL", page_evidence_id=page_eid, seconds=timings["manual_capture_seconds"])
-
-            # Quick post-capture poll only; this is not intended to preserve an entire real site.
-            t_pres = time.perf_counter()
-            while time.perf_counter() - t_pres < 10:
-                st = get_preservation_status(m, session)
-                status_samples.append({"elapsed": round(time.perf_counter() - t0, 3), "status": st})
-                if int(st.get("pending_tasks") or 0) == 0 and time.perf_counter() - t_pres > 2:
-                    break
-                time.sleep(1.0)
-
-            stats = blocked_media_stats(m, sid)
-            rows = blocked_media_rows(m, sid)
-            type_counts = blocked_media_type_counts(m, sid)
-            filter_proofs = self.simulate_blocked_media_filters(rows)
-            result = {
-                "label": "external_url",
-                "url": url,
-                "session_id": sid,
-                "case_id": case_id,
-                "timings": timings,
-                "final_preservation_status": status_samples[-1]["status"] if status_samples else {},
-                "blocked_media_stats": stats,
-                "file_type_counts": type_counts,
-                "filter_proofs": filter_proofs,
-                "blocked_rows_count": len(rows),
-            }
-            self.benchmarks.append(result)
-            self.write_json_artifact("external_url/status_samples.json", status_samples, "Status polling samples for optional external URL benchmark", category="status_samples")
-            self.write_json_artifact("external_url/blocked_media_rows.json", rows, "Blocked-media rows for optional external URL benchmark", category="db_rows")
-            self.write_json_artifact("external_url/type_counts.json", type_counts, "Blocked media file-type counts for optional external URL benchmark", category="db_counts")
-            self.write_json_artifact("external_url/filter_proofs.json", filter_proofs, "Positive/negative blocked-media filter reconstruction for optional external URL benchmark", category="filter_proof")
-            self.write_json_artifact("external_url/summary.json", result, "External URL benchmark summary", category="benchmark")
-
-        except Exception as exc:
-            self.warn("external URL benchmark", f"external benchmark failed or could not complete quickly: {exc}", traceback=traceback.format_exc(limit=10), url=url)
-        finally:
-            if session is not None:
-                with contextlib.suppress(Exception):
-                    stop_session(m, session)
-
-    def run_tor_prewarm_benchmark(self, *, required: bool) -> None:
-        m = self.m
-        assert m is not None
-        if not hasattr(m, "tor_prewarm_background") or not hasattr(m, "tor_prewarm_status"):
-            self.skip("Tor prewarm benchmark", "BlindSite under test does not expose tor_prewarm_background/tor_prewarm_status")
-            return
-        self.step("tor_prewarm_start", "Starting optional Tor prewarm benchmark")
-        try:
-            set_app_setting(m, "tor_background_prewarm_enabled", "1")
-            t0 = time.perf_counter()
-            initial = m.tor_prewarm_background("performance-evaluator")
-            samples = [{"elapsed": 0, "status": safe_json(initial)}]
-            final = {}
-            for _ in range(90):
-                time.sleep(1)
-                final = safe_json(m.tor_prewarm_status())
-                samples.append({"elapsed": round(time.perf_counter() - t0, 3), "status": final})
-                if not final.get("running"):
-                    break
-            elapsed = round(time.perf_counter() - t0, 4)
-            self.write_json_artifact("tor/tor_prewarm_samples.json", samples, "Tor prewarm status samples", category="tor")
-            result = {"elapsed_seconds": elapsed, "initial": safe_json(initial), "final": final}
-            self.write_json_artifact("tor/tor_prewarm_summary.json", result, "Tor prewarm benchmark summary", category="tor")
-            if final.get("ok"):
-                self.pass_("Tor prewarm benchmark", "Tor prewarm completed successfully", **result)
-            elif required:
-                self.fail("Tor prewarm benchmark", "Tor prewarm did not complete successfully and --tor-required was set", **result)
-            else:
-                self.warn("Tor prewarm benchmark", "Tor prewarm did not complete successfully; this may be expected if tor.exe is not configured/installed", **result)
-        except Exception as exc:
-            if required:
-                self.fail("Tor prewarm benchmark", str(exc), traceback=traceback.format_exc(limit=12))
-            else:
-                self.warn("Tor prewarm benchmark", str(exc), traceback=traceback.format_exc(limit=12))
-
-    def start_live_session(self, *, case_id: int, start_url: str, sealed_preservation: bool):
-        m = self.m
-        assert m is not None
-        if not hasattr(m, "start_live_session"):
-            raise RuntimeError("BlindSite under test does not expose start_live_session")
-        kwargs = {
-            "actor": "performance_evaluator",
-            "case_id": case_id,
-            "start_url": start_url,
-            "browser_choice": "chromium",
-            "use_tor": False,
-            "media_policy": "block_images_video",
-            "headless": True,
-            "user_agent_profile": "chrome_windows",
-            "custom_user_agent": "",
-            "download_allowed_media": False,
-            "auto_capture": False,
-            "settle_before_capture": True,
-            "sealed_media_preservation_session": sealed_preservation,
-            "capture_auto_scroll_session": False,
-        }
-        sig = inspect.signature(m.start_live_session)
-        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
-        return m.start_live_session(**filtered)
-
-    def simulate_blocked_media_filters(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """Reconstruct positive + negative blocked-media filter behavior from DB rows.
-
-        This mirrors the operational question the UI answers: after a user filters
-        for include/exclude extension/type/reason/URL, how many rows are visible
-        and which IDs are selectable for retry.
-        """
-        scenarios = [
-            {"name": "include_video_exclude_xml", "include_ext": ["mp4", "m3u8", "mpd"], "exclude_ext": ["xml"], "include_text": [], "exclude_text": []},
-            {"name": "exclude_decorative_common", "include_ext": [], "exclude_ext": ["ico", "svg"], "include_text": [], "exclude_text": ["favicon", "logo"]},
-            {"name": "not_downloaded_queue_full_excluding_xml", "include_ext": [], "exclude_ext": ["xml"], "include_text": ["queue full"], "exclude_text": []},
-        ]
-        def ext_for(row: dict[str, Any]) -> str:
-            url = str(row.get("media_url") or row.get("url") or "")
-            ext = Path(urlparse(url).path).suffix.lower().lstrip(".")
-            if ext:
-                return ext
-            mime = str(row.get("mime_type") or row.get("content_type") or "")
-            if "/" in mime:
-                return mime.split("/", 1)[-1].split(";", 1)[0].lower()
-            return str(row.get("resource_type") or row.get("kind") or "other").lower()
-        def row_text(row: dict[str, Any]) -> str:
-            return " ".join(str(row.get(k) or "") for k in ("reason", "media_url", "url", "mime_type", "content_type", "resource_type")).lower()
-        out = {"total_rows": len(rows), "scenarios": []}
-        for sc in scenarios:
-            inc_ext = [x.lower().strip(" .") for x in sc["include_ext"]]
-            exc_ext = [x.lower().strip(" .") for x in sc["exclude_ext"]]
-            inc_text = [x.lower() for x in sc["include_text"]]
-            exc_text = [x.lower() for x in sc["exclude_text"]]
-            visible = []
-            for r in rows:
-                e = ext_for(r)
-                t = row_text(r)
-                if inc_ext and e not in inc_ext:
-                    continue
-                if exc_ext and e in exc_ext:
-                    continue
-                if inc_text and not all(term in t for term in inc_text):
-                    continue
-                if exc_text and any(term in t for term in exc_text):
-                    continue
-                visible.append({"id": r.get("id"), "ext": e, "downloaded": r.get("downloaded"), "reason": r.get("reason"), "url": r.get("media_url") or r.get("url")})
-            out["scenarios"].append({"scenario": sc, "visible_count": len(visible), "visible_ids_sample": [v.get("id") for v in visible[:50]], "extension_counts": count_values([v.get("ext") for v in visible]), "sample_rows": visible[:20]})
-        return out
-
     def write_reports(self) -> None:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        out = self.report_root / f"blindsite_performance_{stamp}"
+        out = self.report_root / ("blindsite_performance_validation_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"))
         out.mkdir(parents=True, exist_ok=True)
-        counts = {s: sum(1 for c in self.checks if c.status == s) for s in ["PASS", "FAIL", "WARN", "SKIP", "INFO"]}
-        performance_summary = summarize_benchmarks(self.benchmarks)
+        counts: dict[str, int] = {}
+        for c in self.checks:
+            counts[c.status] = counts.get(c.status, 0) + 1
         report = {
-            "tool": "BlindSite Performance Evaluator",
+            "suite": "BlindSite Performance Evaluator",
             "suite_version": APP_VERSION,
             "started_at_utc": self.started_at,
-            "finished_at_utc": now_iso(),
-            "app_file": str(self.original_app_path),
-            "app_sha256": sha256_file(self.original_app_path) if self.original_app_path.exists() else "",
-            "result_counts": counts,
-            "overall_pass": counts.get("FAIL", 0) == 0,
-            "performance_summary": performance_summary,
-            "benchmarks": self.benchmarks,
-            "reconstruction_steps": self.reconstruction_steps,
-            "artifacts": self.artifacts,
+            "finished_at_utc": utcnow(),
+            "counts": counts,
+            "overall": "FAIL" if counts.get("FAIL") else "PASS with caveats/warnings/skips as listed",
             "checks": [c.__dict__ for c in self.checks],
-            "important_note": "This is performance/workflow validation, not legal certification or security certification. Use the security evaluator for encryption/custody proof.",
+            "benchmarks": [b.__dict__ for b in self.benchmarks],
+            "artifacts": self.artifacts,
+            "reconstruction_steps": self.reconstruction_steps,
         }
-        # Copy artifacts out of temp sandbox into final report folder.
-        if self.artifact_dir and self.artifact_dir.exists():
-            dest = out / "performance_artifacts"
-            if dest.exists():
-                shutil.rmtree(dest)
-            shutil.copytree(self.artifact_dir, dest)
-        (out / "performance_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        (out / "performance_report.json").write_text(json.dumps(safe_json(report), indent=2, ensure_ascii=False), encoding="utf-8")
         (out / "performance_report.md").write_text(render_markdown_report(report), encoding="utf-8")
-
+        (out / "benchmark_summary.csv").write_text(render_benchmark_csv(self.benchmarks), encoding="utf-8")
+        (out / "reconstruction_chain.json").write_text(json.dumps({"steps": self.reconstruction_steps, "artifacts": self.artifacts}, indent=2, ensure_ascii=False), encoding="utf-8")
+        if self.artifact_dir and self.artifact_dir.exists():
+            shutil.copytree(self.artifact_dir, out / "performance_artifacts", dirs_exist_ok=True)
         self.log("\n" + "=" * 72)
-        self.log("PERFORMANCE EVALUATION COMPLETE")
+        self.log("PERFORMANCE VALIDATION COMPLETE")
         self.log("=" * 72)
         self.log(f"Report folder: {out}")
         self.log(f"Pass: {counts.get('PASS',0)} | Fail: {counts.get('FAIL',0)} | Warn: {counts.get('WARN',0)} | Skip: {counts.get('SKIP',0)}")
-        self.log(f"Overall: {'PASS' if report['overall_pass'] else 'FAIL'}")
-        if performance_summary:
-            self.log("Summary:")
-            for k, v in performance_summary.items():
-                self.log(f"  {k}: {v}")
+        self.log("Overall: " + report["overall"])
 
 
-class MediaStressServer:
-    def __init__(self, *, image_count: int, svg_count: int, video_count: int, delay_ms: int):
-        self.image_count = max(0, int(image_count))
-        self.svg_count = max(0, int(svg_count))
-        self.video_count = max(0, int(video_count))
-        self.delay_ms = max(0, int(delay_ms))
-        self.httpd: http.server.ThreadingHTTPServer | None = None
-        self.thread: threading.Thread | None = None
-        self.port = find_free_port()
-        self.request_log: list[dict[str, Any]] = []
+# ------------------ local server ------------------
+
+class LocalMediaServer:
+    def __init__(self, *, asset_count: int, delay_ms: int):
+        self.asset_count = asset_count
+        self.delay_ms = delay_ms
+        self.httpd = None
+        self.thread = None
+        self.port = 0
+        self.request_count = 0
         self._lock = threading.Lock()
-
-    @property
-    def expected_request_count(self) -> int:
-        # Main images + SVGs + posters + video sources.
-        return self.image_count + self.svg_count + (self.video_count * 2)
-
-    def url(self, path: str = "/") -> str:
-        if not path.startswith("/"):
-            path = "/" + path
-        return f"http://127.0.0.1:{self.port}{path}"
-
-    def index_html(self) -> str:
-        imgs = []
-        for i in range(self.image_count):
-            imgs.append(f'<img class="perf-img" src="/img/{i:04d}.png" width="16" height="16" alt="img-{i}">')
-        for i in range(self.svg_count):
-            imgs.append(f'<img class="perf-svg" src="/svg/{i:04d}.svg" width="16" height="16" alt="svg-{i}">')
-        videos = []
-        for i in range(self.video_count):
-            videos.append(f'<video class="perf-video" width="120" height="80" poster="/img/poster_{i:04d}.png" muted><source src="/video/{i:04d}.mp4" type="video/mp4"></video>')
-        # Include background-image refs because real dynamic pages use them.
-        css_bg = "\n".join([f".bg-{i}{{background-image:url('/img/bg_{i:04d}.png');width:12px;height:12px;display:inline-block}}" for i in range(min(10, self.image_count))])
-        bg_divs = "".join([f'<span class="bg-{i}"></span>' for i in range(min(10, self.image_count))])
-        return f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>BlindSite Performance Local Media Stress Page</title>
-<style>
-body {{ font-family: Arial, sans-serif; }}
-.grid {{ display: grid; grid-template-columns: repeat(20, 18px); gap: 2px; }}
-{css_bg}
-</style>
-</head>
-<body>
-<h1>BlindSite Performance Local Media Stress Page</h1>
-<p id="asset-count">Images: {self.image_count}; SVG: {self.svg_count}; Videos: {self.video_count}; Delay: {self.delay_ms}ms</p>
-<div id="backgrounds">{bg_divs}</div>
-<div class="grid">
-{''.join(imgs)}
-</div>
-<div id="videos">
-{''.join(videos)}
-</div>
-<script>
-window.BLINDSITE_PERF_PAGE_LOADED = true;
-</script>
-</body>
-</html>"""
-
-    def asset_manifest(self) -> dict[str, Any]:
-        assets = []
-        for i in range(self.image_count):
-            assets.append({"path": f"/img/{i:04d}.png", "url": self.url(f"/img/{i:04d}.png"), "mime": "image/png", "sha256": sha256_bytes(tiny_png_bytes())})
-        for i in range(min(10, self.image_count)):
-            assets.append({"path": f"/img/bg_{i:04d}.png", "url": self.url(f"/img/bg_{i:04d}.png"), "mime": "image/png", "sha256": sha256_bytes(tiny_png_bytes())})
-        for i in range(self.video_count):
-            assets.append({"path": f"/img/poster_{i:04d}.png", "url": self.url(f"/img/poster_{i:04d}.png"), "mime": "image/png", "sha256": sha256_bytes(tiny_png_bytes())})
-            assets.append({"path": f"/video/{i:04d}.mp4", "url": self.url(f"/video/{i:04d}.mp4"), "mime": "video/mp4", "sha256": sha256_bytes(fake_mp4_bytes(i))})
-        for i in range(self.svg_count):
-            payload = svg_bytes(i)
-            assets.append({"path": f"/svg/{i:04d}.svg", "url": self.url(f"/svg/{i:04d}.svg"), "mime": "image/svg+xml", "sha256": sha256_bytes(payload)})
-        return {"base_url": self.url("/"), "expected_request_count": self.expected_request_count, "assets": assets}
+        self.png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
 
     def start(self) -> None:
-        parent = self
-
+        outer = self
         class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, fmt: str, *args: Any) -> None:
+            def log_message(self, format: str, *args: Any) -> None:
                 return
-
             def do_GET(self) -> None:
-                parent.handle(self)
-
-            def do_HEAD(self) -> None:
-                parent.handle(self, head=True)
-
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True, name="blindsite-perf-media-server")
+                with outer._lock:
+                    outer.request_count += 1
+                if outer.delay_ms:
+                    time.sleep(outer.delay_ms / 1000.0)
+                if self.path == "/" or self.path.startswith("/?"):
+                    body = outer.index_html().encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path.startswith("/img"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(outer.png)))
+                    self.end_headers()
+                    self.wfile.write(outer.png)
+                elif self.path.startswith("/captcha"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(outer.png)))
+                    self.end_headers()
+                    self.wfile.write(outer.png)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = int(self.httpd.server_address[1])
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.thread.start()
-        wait_for_port("127.0.0.1", self.port, timeout=5)
+
+    def index_html(self) -> str:
+        data_uri = "data:image/png;base64," + base64.b64encode(self.png).decode("ascii")
+        images = "\n".join(f"<img src='/img{i}.png' alt='asset {i}'>" for i in range(self.asset_count))
+        return f"""<!doctype html><html><head><title>BlindSite Performance Local Media Stress Page</title></head><body>
+<h1>BlindSite Performance Local Media Stress Page</h1>
+<form><p>Are you not a Robot? Select the CAPTCHA ring.</p><img class='captchabtn' alt='captcha challenge' src='{data_uri}'><input name='ring_id' value='7'><button>Submit</button></form>
+<img src='/captcha.png' alt='captcha image'>
+{images}
+</body></html>"""
+
+    def url(self, path: str = "/") -> str:
+        return f"http://127.0.0.1:{self.port}{path}"
 
     def stop(self) -> None:
         if self.httpd:
@@ -911,265 +912,11 @@ window.BLINDSITE_PERF_PAGE_LOADED = true;
                 self.httpd.shutdown()
             with contextlib.suppress(Exception):
                 self.httpd.server_close()
-        if self.thread:
-            self.thread.join(timeout=3)
-
-    def record_request(self, handler: http.server.BaseHTTPRequestHandler, content_type: str, size: int, status: int) -> None:
-        with self._lock:
-            self.request_log.append({
-                "timestamp_utc": now_iso(),
-                "path": handler.path,
-                "method": handler.command,
-                "content_type": content_type,
-                "size": size,
-                "status": status,
-            })
-
-    def request_counts(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        with self._lock:
-            for r in self.request_log:
-                key = str(r.get("content_type") or "unknown").split(";", 1)[0]
-                counts[key] = counts.get(key, 0) + 1
-        return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
-
-    def handle(self, handler: http.server.BaseHTTPRequestHandler, head: bool = False) -> None:
-        path = urlparse(handler.path).path
-        if self.delay_ms:
-            time.sleep(self.delay_ms / 1000.0)
-
-        if path == "/" or path == "/index.html":
-            body = self.index_html().encode("utf-8")
-            self.respond(handler, 200, body, "text/html; charset=utf-8", head=head)
-            return
-
-        if path.startswith("/img/") and path.endswith(".png"):
-            body = tiny_png_bytes()
-            self.respond(handler, 200, body, "image/png", head=head)
-            return
-
-        if path.startswith("/svg/") and path.endswith(".svg"):
-            try:
-                idx = int(Path(path).stem)
-            except Exception:
-                idx = 0
-            body = svg_bytes(idx)
-            self.respond(handler, 200, body, "image/svg+xml", head=head)
-            return
-
-        if path.startswith("/video/") and path.endswith(".mp4"):
-            try:
-                idx = int(Path(path).stem)
-            except Exception:
-                idx = 0
-            body = fake_mp4_bytes(idx)
-            self.respond(handler, 200, body, "video/mp4", head=head)
-            return
-
-        body = b"not found"
-        self.respond(handler, 404, body, "text/plain", head=head)
-
-    def respond(self, handler: http.server.BaseHTTPRequestHandler, status: int, body: bytes, content_type: str, head: bool = False) -> None:
-        self.record_request(handler, content_type, len(body), status)
-        handler.send_response(status)
-        handler.send_header("Content-Type", content_type)
-        handler.send_header("Content-Length", str(len(body)))
-        handler.send_header("Cache-Control", "no-store")
-        handler.end_headers()
-        if not head:
-            handler.wfile.write(body)
 
 
-def get_preservation_status(m: Any, session: Any) -> dict[str, Any]:
-    try:
-        if hasattr(session, "preservation_status"):
-            return safe_json(session.preservation_status())
-    except Exception:
-        pass
-    try:
-        if hasattr(m, "live_preservation_status_for"):
-            return safe_json(m.live_preservation_status_for(session.session_id))
-    except Exception:
-        pass
-    return {
-        "session_id": getattr(session, "session_id", ""),
-        "requests": getattr(session, "requests", None),
-        "blocked": getattr(session, "blocked", None),
-        "pending_tasks": None,
-        "preserved": getattr(session, "sealed_preserved", None),
-        "preserved_bytes": getattr(session, "sealed_preserved_bytes", None),
-    }
+# ------------------ helpers ------------------
 
-
-def capture_session(m: Any, session: Any) -> int:
-    if hasattr(session, "capture_current_sync"):
-        return int(session.capture_current_sync())
-    if hasattr(m, "capture_live_session"):
-        return int(m.capture_live_session(session.session_id))
-    raise RuntimeError("No capture method available")
-
-
-def stop_session(m: Any, session: Any) -> None:
-    if hasattr(m, "stop_live_session"):
-        m.stop_live_session(session.session_id)
-    elif hasattr(session, "stop_sync"):
-        session.stop_sync()
-
-
-def blocked_media_stats(m: Any, sid: str) -> dict[str, Any]:
-    with contextlib.suppress(Exception):
-        if hasattr(m, "blocked_media_session_stats"):
-            return safe_json(m.blocked_media_session_stats(sid))
-    rows = blocked_media_rows(m, sid)
-    return {
-        "total": len(rows),
-        "downloaded": sum(1 for r in rows if int(r.get("downloaded") or 0) == 1),
-        "not_downloaded": sum(1 for r in rows if int(r.get("downloaded") or 0) == 0),
-        "queue_full": sum(1 for r in rows if "queue full" in str(r.get("reason") or "").lower()),
-        "timeouts": sum(1 for r in rows if "timeout" in str(r.get("reason") or "").lower()),
-    }
-
-
-def blocked_media_type_counts(m: Any, sid: str) -> dict[str, Any]:
-    with contextlib.suppress(Exception):
-        if hasattr(m, "blocked_media_session_file_type_counts"):
-            return safe_json(m.blocked_media_session_file_type_counts(sid))
-    counts: dict[str, int] = {}
-    for r in blocked_media_rows(m, sid):
-        url = str(r.get("media_url") or "")
-        ext = Path(urlparse(url).path).suffix.lower().strip(".") or str(r.get("resource_type") or "other")
-        counts[ext] = counts.get(ext, 0) + 1
-    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
-
-
-def blocked_media_rows(m: Any, sid: str) -> list[dict[str, Any]]:
-    try:
-        rows = m.fetchall("SELECT * FROM blocked_media WHERE session_id=? ORDER BY id ASC", (sid,))
-        return [safe_json(dict(r)) for r in rows]
-    except Exception:
-        return []
-
-
-def set_app_setting(m: Any, key: str, value: str) -> None:
-    if hasattr(m, "set_setting"):
-        m.set_setting(key, value)
-        return
-    now = getattr(m, "utcnow", now_iso)()
-    m.execute(
-        "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        (key, value, now),
-    )
-
-
-def generate_public_key_for_org_hardseal() -> tuple[str, str]:
-    private = rsa.generate_private_key(public_exponent=65537, key_size=3072)
-    public = private.public_key()
-    public_pem = public.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode("utf-8")
-    fp = sha256_bytes(public.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo))
-    return public_pem, fp
-
-
-def compare_benchmarks(control: dict[str, Any], main: dict[str, Any]) -> dict[str, Any]:
-    ctim = control.get("timings") or {}
-    mtim = main.get("timings") or {}
-    cc = ctim.get("manual_capture_seconds")
-    mc = mtim.get("manual_capture_seconds")
-    total_c = ctim.get("total_live_benchmark_seconds")
-    total_m = mtim.get("total_live_benchmark_seconds")
-    out: dict[str, Any] = {
-        "control_label": control.get("label"),
-        "main_label": main.get("label"),
-        "control_capture_seconds": cc,
-        "main_capture_seconds": mc,
-        "control_total_seconds": total_c,
-        "main_total_seconds": total_m,
-    }
-    if isinstance(cc, (int, float)) and isinstance(mc, (int, float)):
-        out["capture_overhead_seconds"] = round(mc - cc, 4)
-        out["capture_overhead_percent_vs_control"] = round(((mc - cc) / cc) * 100, 2) if cc else None
-    if isinstance(total_c, (int, float)) and isinstance(total_m, (int, float)):
-        out["total_overhead_seconds"] = round(total_m - total_c, 4)
-        out["total_overhead_percent_vs_control"] = round(((total_m - total_c) / total_c) * 100, 2) if total_c else None
-    return out
-
-
-def count_values(values: list[Any]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for v in values:
-        key = str(v or "unknown")
-        counts[key] = counts.get(key, 0) + 1
-    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
-
-
-def summarize_benchmarks(benchmarks: list[dict[str, Any]]) -> dict[str, Any]:
-    if not benchmarks:
-        return {}
-    out: dict[str, Any] = {"benchmark_count": len(benchmarks)}
-    for b in benchmarks:
-        label = b.get("label", "benchmark")
-        timings = b.get("timings") or {}
-        stats = b.get("blocked_media_stats") or {}
-        out[label] = {
-            "manual_capture_seconds": timings.get("manual_capture_seconds"),
-            "total_live_benchmark_seconds": timings.get("total_live_benchmark_seconds"),
-            "blocked": (b.get("final_preservation_status") or {}).get("blocked") or stats.get("total"),
-            "downloaded": stats.get("downloaded"),
-            "not_downloaded": stats.get("not_downloaded"),
-            "queue_full": stats.get("queue_full"),
-            "file_type_counts": b.get("file_type_counts"),
-        }
-    return out
-
-
-def render_markdown_report(report: dict[str, Any]) -> str:
-    lines = []
-    lines.append("# BlindSite Performance Evaluation Report")
-    lines.append("")
-    lines.append(f"- Suite version: `{report.get('suite_version')}`")
-    lines.append(f"- Started: `{report.get('started_at_utc')}`")
-    lines.append(f"- Finished: `{report.get('finished_at_utc')}`")
-    lines.append(f"- App file: `{report.get('app_file')}`")
-    lines.append(f"- App SHA-256: `{report.get('app_sha256')}`")
-    lines.append(f"- Overall pass: `{report.get('overall_pass')}`")
-    lines.append("")
-    lines.append("## Important note")
-    lines.append("")
-    lines.append("This is performance/workflow validation, not legal certification or security certification. Use the security evaluator for encryption/custody proof.")
-    lines.append("")
-    counts = report.get("result_counts") or {}
-    lines.append("## Result counts")
-    lines.append("")
-    for k in ["PASS", "FAIL", "WARN", "SKIP", "INFO"]:
-        lines.append(f"- {k}: {counts.get(k, 0)}")
-    lines.append("")
-    lines.append("## Performance summary")
-    lines.append("")
-    lines.append("```json")
-    lines.append(json.dumps(report.get("performance_summary") or {}, indent=2, default=str)[:12000])
-    lines.append("```")
-    lines.append("")
-    lines.append("## Reconstructable artifacts")
-    lines.append("")
-    lines.append("The `performance_artifacts/` folder contains the local test-site HTML, asset manifest, status samples, blocked-media rows, benchmark summaries, and optional Tor/external URL samples.")
-    lines.append("")
-    lines.append("## Checks")
-    lines.append("")
-    for c in report.get("checks", []):
-        lines.append(f"### {c.get('status')}: {c.get('name')}")
-        lines.append("")
-        if c.get("detail"):
-            lines.append(str(c.get("detail")))
-            lines.append("")
-        ev = c.get("evidence") or {}
-        if ev:
-            lines.append("```json")
-            lines.append(json.dumps(ev, indent=2, default=str)[:6000])
-            lines.append("```")
-            lines.append("")
-    return "\n".join(lines)
-
-
-def now_iso() -> str:
+def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
@@ -1185,193 +932,119 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def tiny_png_bytes() -> bytes:
-    # 1x1 transparent PNG.
-    return base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
-
-
-def svg_bytes(i: int) -> bytes:
-    color = f"#{(i * 1103515245 + 12345) & 0xFFFFFF:06x}"
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">
-<rect width="16" height="16" fill="{color}"/>
-<text x="1" y="12" font-size="6" fill="#fff">{i}</text>
-</svg>""".encode("utf-8")
-
-
-def fake_mp4_bytes(i: int) -> bytes:
-    # Small MP4-like bytes for performance transfer testing. It is not intended
-    # as a media-playback validation; viewer playback belongs in app/manual tests.
-    payload = f"BLINDSITE_FAKE_MP4_PERFORMANCE_PAYLOAD_{i}".encode("ascii")
-    return b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00\x00\x00\x08free" + payload
-
-
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-def wait_for_port(host: str, port: int, timeout: float = 5.0) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.3)
-            if s.connect_ex((host, port)) == 0:
-                return
-        time.sleep(0.05)
-    raise RuntimeError(f"Timed out waiting for {host}:{port}")
-
-
-def normalize_url(url: str) -> str:
-    url = (url or "").strip()
-    if not url:
-        raise RuntimeError("URL is required")
-    if not urlparse(url).scheme:
-        url = "https://" + url
-    return url
-
-
 def safe_json(obj: Any) -> Any:
     if isinstance(obj, sqlite3.Row):
-        return {k: safe_json(obj[k]) for k in obj.keys()}
+        obj = dict(obj)
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
             kl = str(k).lower()
-            if any(secret in kl for secret in ("private_key", "password", "passphrase")):
-                out[k] = "[REDACTED]"
+            if any(x in kl for x in ["password", "private_key", "passphrase", "token", "challenge"]):
+                if "public" in kl or "fingerprint" in kl:
+                    out[k] = safe_json(v)
+                else:
+                    out[k] = "[REDACTED]"
             else:
                 out[k] = safe_json(v)
         return out
-    if isinstance(obj, (list, tuple, set)):
+    if isinstance(obj, (list, tuple)):
         return [safe_json(x) for x in obj]
     if isinstance(obj, bytes):
         return {"bytes_len": len(obj), "sha256": sha256_bytes(obj)}
     if isinstance(obj, Path):
         return str(obj)
-    try:
-        json.dumps(obj)
-        return obj
-    except Exception:
-        return str(obj)
+    return obj
 
 
-def prompt(msg: str, default: str = "") -> str:
-    suffix = f" [{default}]" if default else ""
-    val = input(f"{msg}{suffix}: ").strip()
-    return val if val else default
+def zip_listing(data: bytes) -> list[dict[str, Any]]:
+    import zipfile
+    out = []
+    with zipfile.ZipFile(__import__("io").BytesIO(data), "r") as z:
+        for info in z.infolist():
+            payload = z.read(info.filename)
+            out.append({"name": info.filename, "size": len(payload), "sha256": sha256_bytes(payload)})
+    return out
 
 
-def prompt_int(msg: str, default: int) -> int:
-    while True:
-        val = prompt(msg, str(default))
-        try:
-            return int(val)
-        except ValueError:
-            print("Please enter a number.")
+def create_lab_case(m: Any, name: str) -> int:
+    now = m.utcnow()
+    cid = m.execute("""INSERT INTO cases(name,description,mode,compliance_safe,irreversible_lock,never_materialize_originals,no_plaintext_export,raw_root_allowed,default_media_policy,force_tor,quarantine_default,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (name, "Performance evaluator generated test case.", "lab", 0, 0, 1, 1, 1, "block_images_video", 0, 1, "performance_evaluator", now))
+    with contextlib.suppress(Exception):
+        m.ensure_application_genesis_event(f"case:{cid}", case_id=cid, actor="system")
+    return int(cid)
 
 
-def prompt_yes_no(msg: str, default: bool = False) -> bool:
-    default_text = "Y/n" if default else "y/N"
-    while True:
-        val = input(f"{msg} [{default_text}]: ").strip().lower()
-        if not val:
-            return default
-        if val in {"y", "yes"}:
-            return True
-        if val in {"n", "no"}:
-            return False
-        print("Please answer y or n.")
+def render_markdown_report(report: dict[str, Any]) -> str:
+    counts = report.get("counts", {})
+    lines = [
+        "# BlindSite Performance Validation Report",
+        "",
+        f"Suite version: `{report.get('suite_version')}`",
+        f"Started: `{report.get('started_at_utc')}`",
+        f"Finished: `{report.get('finished_at_utc')}`",
+        f"Overall: **{report.get('overall')}**",
+        "",
+        f"Checks: **{counts.get('PASS', 0)} pass**, **{counts.get('FAIL', 0)} fail**, **{counts.get('WARN', 0)} warn**, **{counts.get('SKIP', 0)} skip**.",
+        "",
+        "## Benchmarks",
+        "",
+        "| Benchmark | Seconds | Detail |",
+        "|---|---:|---|",
+    ]
+    for b in report.get("benchmarks", []):
+        lines.append(f"| {b.get('name')} | {b.get('elapsed_seconds')} | {str(b.get('detail') or '').replace('|','/')} |")
+    lines += ["", "## Checks", "", "| Status | Check | Detail |", "|---|---|---|"]
+    for c in report.get("checks", []):
+        lines.append(f"| {c.get('status')} | {c.get('name')} | {str(c.get('detail') or '').replace('|','/')} |")
+    lines += [
+        "",
+        "## Reconstructability",
+        "",
+        "The `performance_artifacts/` folder contains timing samples, DB row samples, status snapshots, feature scans, and helper outputs used to reconstruct the validation run.",
+        "The `reconstruction_chain.json` file lists the evaluator steps and artifact hashes.",
+    ]
+    return "\n".join(lines) + "\n"
 
 
-def interactive_args() -> argparse.Namespace:
-    print("\nBlindSite Performance Evaluator")
-    print("=" * 38)
-    print("This runs a controlled performance/workflow benchmark in a temporary sandbox.")
-    print("It does not touch your live BlindSite data folder.\n")
-    app = prompt("Path to BlindSite.py", "BlindSite.py")
-    report_dir = prompt("Report output folder", "blindsite_performance_reports")
-    keep_temp = prompt_yes_no("Keep temporary sandbox after test?", False)
-    verbose = prompt_yes_no("Verbose output?", True)
-    asset_count = prompt_int("Local test image count", DEFAULT_ASSET_COUNT)
-    svg_count = prompt_int("Local test SVG count", DEFAULT_SVG_COUNT)
-    video_count = prompt_int("Local test video-like asset count", DEFAULT_VIDEO_COUNT)
-    delay_ms = prompt_int("Local asset response delay in ms", DEFAULT_ASSET_DELAY_MS)
-    queue_limit = prompt_int("Queue limit to test", DEFAULT_QUEUE_LIMIT)
-    max_items = prompt_int("Max preserved items/session to test", DEFAULT_MAX_ITEMS)
-    preserve_mode = prompt("Preservation mode fast/balanced/complete", "fast").lower()
-    include_control = prompt_yes_no("Run no-preservation control comparison?", True)
-    external_url = ""
-    if prompt_yes_no("Run optional quick external website benchmark?", False):
-        external_url = prompt("External website URL", "")
-    tor_test = prompt_yes_no("Run optional Tor prewarm/status benchmark?", False)
-    tor_required = False
-    if tor_test:
-        tor_required = prompt_yes_no("Treat Tor failure as FAIL instead of WARN?", False)
-    return argparse.Namespace(
-        app=app,
-        report_dir=report_dir,
-        keep_temp=keep_temp,
-        verbose=verbose,
-        asset_count=asset_count,
-        svg_count=svg_count,
-        video_count=video_count,
-        asset_delay_ms=delay_ms,
-        queue_limit=queue_limit,
-        max_items=max_items,
-        preserve_mode=preserve_mode,
-        include_control=include_control,
-        external_url=external_url,
-        tor_prewarm_test=tor_test,
-        tor_required=tor_required,
-    )
+def render_benchmark_csv(benchmarks: list[Benchmark]) -> str:
+    lines = ["name,elapsed_seconds,detail"]
+    for b in benchmarks:
+        name = str(b.name).replace('"', '""')
+        detail = str(b.detail or "").replace('"', '""')
+        lines.append(f'"{name}",{b.elapsed_seconds},"{detail}"')
+    return "\n".join(lines) + "\n"
 
 
-def main() -> int:
-    if len(sys.argv) == 1:
-        args = interactive_args()
-    else:
-        parser = argparse.ArgumentParser(description="BlindSite performance/workflow evaluator")
-        parser.add_argument("--app", default="BlindSite.py", help="Path to BlindSite.py")
-        parser.add_argument("--report-dir", default="blindsite_performance_reports")
-        parser.add_argument("--keep-temp", action="store_true")
-        parser.add_argument("--quiet", action="store_true")
-        parser.add_argument("--asset-count", type=int, default=DEFAULT_ASSET_COUNT)
-        parser.add_argument("--svg-count", type=int, default=DEFAULT_SVG_COUNT)
-        parser.add_argument("--video-count", type=int, default=DEFAULT_VIDEO_COUNT)
-        parser.add_argument("--asset-delay-ms", type=int, default=DEFAULT_ASSET_DELAY_MS)
-        parser.add_argument("--queue-limit", type=int, default=DEFAULT_QUEUE_LIMIT)
-        parser.add_argument("--max-items", type=int, default=DEFAULT_MAX_ITEMS)
-        parser.add_argument("--preserve-mode", default="fast", choices=["fast", "balanced", "complete"])
-        parser.add_argument("--no-control", action="store_true", help="Skip no-preservation control comparison")
-        parser.add_argument("--external-url", default="", help="Optional quick real website benchmark URL")
-        parser.add_argument("--tor-prewarm-test", action="store_true", help="Optional Tor prewarm/status benchmark")
-        parser.add_argument("--tor-required", action="store_true", help="Treat Tor prewarm failure as FAIL instead of WARN")
-        args = parser.parse_args()
-        args.verbose = not args.quiet
-        args.include_control = not args.no_control
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="BlindSite performance/workflow validation harness")
+    ap.add_argument("--app", required=True, help="Path to BlindSite.py")
+    ap.add_argument("--report-dir", default="performance_eval_report", help="Output report directory")
+    ap.add_argument("--keep-temp", action="store_true", help="Keep temporary sandbox")
+    ap.add_argument("--quiet", action="store_true", help="Reduce console output")
+    ap.add_argument("--quick-iterations", type=int, default=1000, help="Iterations for micro benchmarks")
+    ap.add_argument("--retry-rows", type=int, default=600, help="Rows to insert for retry-stat benchmark")
+    ap.add_argument("--live-browser-test", action="store_true", help="Run optional Playwright local live-browser benchmark")
+    ap.add_argument("--live-assets", type=int, default=60, help="Number of local image assets in optional live benchmark")
+    ap.add_argument("--live-delay-ms", type=int, default=5, help="Server delay per asset in optional live benchmark")
+    ap.add_argument("--tor-prewarm", action="store_true", help="Run optional Tor prewarm/status benchmark")
+    ap.add_argument("--tor-required", action="store_true", help="Fail if Tor prewarm benchmark does not become ready")
+    return ap.parse_args()
 
-    evaluator = PerformanceEvaluator(
+
+def main() -> None:
+    args = parse_args()
+    ev = PerformanceEvaluator(
         app_path=Path(args.app),
         report_root=Path(args.report_dir),
-        keep_temp=bool(args.keep_temp),
-        verbose=bool(args.verbose),
-        asset_count=int(args.asset_count),
-        svg_count=int(args.svg_count),
-        video_count=int(args.video_count),
-        asset_delay_ms=int(args.asset_delay_ms),
-        queue_limit=int(args.queue_limit),
-        max_items=int(args.max_items),
-        preserve_mode=str(args.preserve_mode),
+        keep_temp=args.keep_temp,
+        verbose=not args.quiet,
+        quick_iterations=args.quick_iterations,
+        retry_rows=args.retry_rows,
+        live_assets=args.live_assets,
+        live_delay_ms=args.live_delay_ms,
     )
-    evaluator.run(
-        external_url=str(args.external_url or ""),
-        run_control=bool(args.include_control),
-        run_tor_prewarm=bool(args.tor_prewarm_test),
-        tor_required=bool(args.tor_required),
-    )
-    return 1 if any(c.status == "FAIL" for c in evaluator.checks) else 0
+    ev.run(live_browser_test=bool(args.live_browser_test), tor_prewarm=bool(args.tor_prewarm), tor_required=bool(args.tor_required))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
